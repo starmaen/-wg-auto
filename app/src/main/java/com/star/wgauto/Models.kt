@@ -29,7 +29,7 @@ data class AppSettings(
     val selDnsId: String = "",
     val selMtu: Int = 1420,
     val reselectOnNetwork: Boolean = true,
-    val periodMin: Int = 30,
+    val periodMin: Int = 0,
     val useRoot: Boolean = false,
     val backgroundScan: Boolean = true,
     val applyRoot: Boolean = false
@@ -44,7 +44,9 @@ data class Status(
     val activeMtu: Int? = null,
     val latencyMs: Int? = null,
     val mbps: Double? = null,
-    val message: String = ""
+    val message: String = "",
+    val activeConfigId: String? = null,
+    val activeDnsId: String? = null
 )
 
 /** نتيجة فحص جهة واحدة (الشبكة الأصلية أو شبكة الـ VPN). */
@@ -52,6 +54,7 @@ data class SideInfo(
     val label: String = "",
     val iface: String = "",
     val bestDns: String = "",
+    val bestDnsId: String = "",
     val dnsMs: Int = -1,
     val latencyMs: Int = -1,
     val pathMtu: Int = 0,
@@ -64,6 +67,33 @@ data class NetInfo(
     val vpn: SideInfo? = null,
     val vpnOwner: String = "",
     val time: String = ""
+)
+
+/** صف نتيجة فحص كونفيج واحد. state: pending / testing / ok / fail */
+data class ConfigRow(
+    val id: String,
+    val name: String,
+    val state: String = "pending",
+    val latencyMs: Int = -1,
+    val mbps: Double? = null,
+    val mtu: Int = 0,
+    val pathMtu: Int = 0,
+    val dnsName: String = "",
+    val note: String = "",
+    val score: Double = 0.0
+)
+
+data class DnsRow(val id: String, val name: String, val ms: Int)
+
+/** تقرير الفحص الظاهر في الواجهة الرئيسية. */
+data class Report(
+    val rows: List<ConfigRow> = emptyList(),
+    val dnsRows: List<DnsRow> = emptyList(),
+    val chosenConfigId: String = "",
+    val chosenDnsId: String = "",
+    val chosenMtu: Int = 0,
+    val chosenPathMtu: Int = 0,
+    val progress: String = ""
 )
 
 object Defaults {

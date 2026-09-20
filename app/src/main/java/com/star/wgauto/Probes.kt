@@ -113,6 +113,44 @@ object Probes {
         return times[times.size / 2].toInt()
     }
 
+    private fun connectTime(host: String, port: Int, timeoutMs: Int, network: Network?): Int? = try {
+        Socket().use { s ->
+            network?.bindSocket(s)
+            val t0 = System.nanoTime()
+            s.connect(InetSocketAddress(host, port), timeoutMs)
+            ((System.nanoTime() - t0) / 1_000_000).toInt()
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * اختبار سريع لمرور البيانات عبر النفق: يحاول عدة وجهات لمدة قصيرة،
+     * وعند أول نجاح يأخذ أفضل قياسين. يعيد null إن لم يمر شيء.
+     */
+    fun quickAlive(network: Network? = null, budgetMs: Long = 3200): Int? {
+        val hosts = listOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222")
+        val t0 = System.nanoTime()
+        var i = 0
+        var first: Int? = null
+        var okHost = hosts[0]
+        while (first == null && (System.nanoTime() - t0) / 1_000_000 < budgetMs) {
+            val h = hosts[i % hosts.size]
+            i++
+            first = connectTime(h, 443, 1200, network)
+            if (first != null) okHost = h else Thread.sleep(150)
+        }
+        if (first == null) {
+            // احتياطي: استعلام DNS عبر UDP
+            return dnsLatency("1.1.1.1", tries = 1, timeoutMs = 1000, network = network)
+        }
+        var best: Int = first
+        repeat(2) {
+            connectTime(okHost, 443, 1200, network)?.let { if (it < best) best = it }
+        }
+        return best
+    }
+
     // ---------- السرعة ----------
     fun throughputMbps(maxMs: Long = 5000, network: Network? = null): Double? {
         return try {

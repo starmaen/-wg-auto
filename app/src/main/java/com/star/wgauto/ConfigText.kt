@@ -13,7 +13,8 @@ object ConfigText {
             }
             .joinToString("\n")
 
-    fun override(text: String, mtu: Int?, dns: List<String>): String {
+    /** onlyApp: يجعل النفق خاصاً بتطبيق واحد (للفحص) فلا يتأثر اتصال بقية التطبيقات. */
+    fun override(text: String, mtu: Int?, dns: List<String>, onlyApp: String? = null): String {
         val out = StringBuilder()
         var section = ""
         var injected = false
@@ -22,6 +23,7 @@ object ConfigText {
             if (injected) return
             if (mtu != null) out.append("MTU = ").append(mtu).append('\n')
             if (dns.isNotEmpty()) out.append("DNS = ").append(dns.joinToString(", ")).append('\n')
+            if (onlyApp != null) out.append("IncludedApplications = ").append(onlyApp).append('\n')
             injected = true
         }
 
@@ -36,6 +38,7 @@ object ConfigText {
             if (section == "interface") {
                 val key = line.substringBefore("=").trim().lowercase()
                 if ((key == "mtu" && mtu != null) || (key == "dns" && dns.isNotEmpty())) continue
+                if (onlyApp != null && (key == "includedapplications" || key == "excludedapplications")) continue
             }
             out.append(line).append('\n')
         }

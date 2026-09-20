@@ -88,7 +88,7 @@ class Store(ctx: Context) {
         val o = JSONObject()
             .put("autoConfig", s.autoConfig).put("autoDns", s.autoDns).put("autoMtu", s.autoMtu)
             .put("selConfigId", s.selConfigId).put("selDnsId", s.selDnsId).put("selMtu", s.selMtu)
-            .put("reselectOnNetwork", s.reselectOnNetwork).put("periodMin", s.periodMin)
+            .put("reselectOnNetwork", s.reselectOnNetwork).put("periodMinV2", s.periodMin)
             .put("useRoot", s.useRoot).put("backgroundScan", s.backgroundScan).put("applyRoot", s.applyRoot)
         sp.edit().putString("settings", o.toString()).apply()
     }
@@ -103,7 +103,7 @@ class Store(ctx: Context) {
                 o.optBoolean("autoMtu", d.autoMtu), o.optString("selConfigId", ""),
                 o.optString("selDnsId", ""), o.optInt("selMtu", d.selMtu),
                 o.optBoolean("reselectOnNetwork", d.reselectOnNetwork),
-                o.optInt("periodMin", d.periodMin), o.optBoolean("useRoot", d.useRoot),
+                o.optInt("periodMinV2", d.periodMin), o.optBoolean("useRoot", d.useRoot),
                 o.optBoolean("backgroundScan", d.backgroundScan),
                 o.optBoolean("applyRoot", d.applyRoot)
             )

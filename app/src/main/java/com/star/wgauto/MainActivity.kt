@@ -13,13 +13,22 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -74,7 +83,6 @@ class Actions(
     val toggle: () -> Unit,
     val importFiles: () -> Unit,
     val batteryExempt: () -> Unit,
-    val afterAdd: () -> Unit,
     val testAll: () -> Unit,
     val testOne: (String) -> Unit,
     val syncService: () -> Unit,
@@ -103,9 +111,8 @@ class MainActivity : ComponentActivity() {
                 fail += f
             }
             if (ok > 0 || fail > 0) {
-                toast("تم استيراد $ok كونفيج" + if (fail > 0) " • تعذّر $fail" else "")
+                toast("تم استيراد $ok كونفيج" + (if (fail > 0) " • تعذّر $fail" else "") + " — تُفحص عند تشغيل الـ VPN")
             }
-            if (ok > 0) afterAdd()
         }
 
     private val lightScheme = lightColorScheme(
@@ -126,7 +133,6 @@ class MainActivity : ComponentActivity() {
             toggle = { onToggle() },
             importFiles = { importLauncher.launch(arrayOf("*/*")) },
             batteryExempt = { batteryExempt() },
-            afterAdd = { afterAdd() },
             testAll = { withVpnPermission { app.engine.testAll() } },
             testOne = { id -> withVpnPermission { app.engine.testConfigs(listOf(id)) } },
             syncService = { syncService() },
@@ -152,11 +158,6 @@ class MainActivity : ComponentActivity() {
             pendingAfterPerm = action
             vpnPermLauncher.launch(i)
         }
-    }
-
-    /** بعد إضافة كونفيجات: فحص الجديد منها تلقائياً. */
-    private fun afterAdd() {
-        withVpnPermission { app.engine.testUntested() }
     }
 
     /** الخدمة تعمل إذا كان الـ VPN يعمل أو كان الفحص الخلفي مفعّلاً. */
@@ -268,12 +269,104 @@ fun Root(app: WgApp, a: Actions) {
     }
 }
 
+/** ضوء أحمر ناعم نابض يدل على العنصر الذي اختاره التطبيق. */
+@Composable
+fun GlowDot(modifier: Modifier = Modifier) {
+    val t = rememberInfiniteTransition(label = "glow")
+    val a by t.animateFloat(
+        initialValue = 0.25f,
+        targetValue = 0.9f,
+        animationSpec = infiniteRepeatable(tween(1400, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "alpha"
+    )
+    Box(modifier.size(18.dp), contentAlignment = Alignment.Center) {
+        Box(Modifier.size(18.dp).background(Color(0xFFE53935).copy(alpha = a * 0.35f), CircleShape))
+        Box(Modifier.size(9.dp).background(Color(0xFFE53935).copy(alpha = 0.55f + a * 0.4f), CircleShape))
+    }
+}
+
+@Composable
+fun MarkerSlot(chosen: Boolean) {
+    if (chosen) GlowDot() else Spacer(Modifier.width(18.dp))
+    Spacer(Modifier.width(8.dp))
+}
+
+private fun rowLine(r: ConfigRow): String = when (r.state) {
+    "pending" -> "بانتظار الفحص"
+    "testing" -> "جارٍ الفحص…"
+    "fail" -> "✗ ${r.note}"
+    else -> buildString {
+        append("${r.latencyMs} ms")
+        r.mbps?.let { append(" • %.1f Mbps".format(it)) }
+        if (r.mtu > 0) append(" • MTU ${r.mtu}")
+        if (r.dnsName.isNotEmpty()) append(" • ${r.dnsName}")
+    }
+}
+
+@Composable
+fun ResultsCard(rep: Report, st: Status) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("نتيجة الفحص", fontWeight = FontWeight.Bold)
+            if (rep.progress.isNotEmpty()) Text(rep.progress, fontSize = 12.sp)
+            val rows = rep.rows.sortedWith(
+                compareBy<ConfigRow>(
+                    { when (it.state) { "ok" -> 0; "testing" -> 1; "pending" -> 2; else -> 3 } },
+                    { -it.score },
+                    { if (it.latencyMs < 0) Int.MAX_VALUE else it.latencyMs }
+                )
+            )
+            rows.forEach { r ->
+                val chosen = st.connected && r.id == rep.chosenConfigId
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    MarkerSlot(chosen)
+                    Column(Modifier.weight(1f)) {
+                        Text(r.name, fontWeight = if (chosen) FontWeight.Bold else FontWeight.Normal)
+                        Text(
+                            rowLine(r), fontSize = 12.sp,
+                            color = if (r.state == "fail") MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            if (rep.dnsRows.isNotEmpty()) {
+                HorizontalDivider()
+                Text("DNS (الأسرع أولاً)", fontWeight = FontWeight.Bold)
+                rep.dnsRows.take(6).forEach { d ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        MarkerSlot(st.connected && d.id == rep.chosenDnsId)
+                        Text(
+                            "${d.name}: " + if (d.ms < 0) "لا استجابة" else "${d.ms} ms",
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+            }
+            if (rep.chosenMtu > 0) {
+                HorizontalDivider()
+                Text("MTU المختار: ${rep.chosenMtu}", fontWeight = FontWeight.Bold)
+                Text(
+                    if (rep.chosenPathMtu > 0)
+                        "أقصى حزمة تصل للخادم ${rep.chosenPathMtu} − ${rep.chosenPathMtu - rep.chosenMtu} (رأس WireGuard) = ${rep.chosenMtu}"
+                    else "قيمة افتراضية/يدوية (لم يُقَس مسار الخادم)",
+                    fontSize = 12.sp
+                )
+            }
+        }
+    }
+}
+
 @Composable
 fun HomeTab(app: WgApp, a: Actions) {
     val st by app.engine.status.collectAsState()
     val logs by app.engine.logs.collectAsState()
     val ni by app.engine.netInfo.collectAsState()
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    val rep by app.engine.report.collectAsState()
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Box(
                 Modifier.size(48.dp).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp)),
@@ -294,24 +387,37 @@ fun HomeTab(app: WgApp, a: Actions) {
                 else MaterialTheme.colorScheme.primary
             )
         ) {
-            Text(if (st.running) "إيقاف" else "تشغيل", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Text(
+                when {
+                    st.running && st.busy -> "جارٍ الفحص… (إيقاف)"
+                    st.running -> "إيقاف"
+                    else -> "تشغيل"
+                },
+                fontSize = 22.sp, fontWeight = FontWeight.Bold
+            )
         }
         Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(st.message.ifEmpty { "متوقف" }, fontWeight = FontWeight.Bold)
                 if (st.connected) {
-                    Text("الكونفيج: ${st.activeConfig}")
-                    Text("DNS: ${st.activeDns}")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        MarkerSlot(true)
+                        Text("الكونفيج: ${st.activeConfig}", fontWeight = FontWeight.Bold)
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        MarkerSlot(true)
+                        Text("DNS: ${st.activeDns}", fontWeight = FontWeight.Bold)
+                    }
                     Text("MTU: ${st.activeMtu}")
                     Text("التأخر: ${st.latencyMs} ms")
                     Text("السرعة: ${st.mbps?.let { "%.1f Mbps".format(it) } ?: "—"}")
                 }
             }
         }
-        if (st.running) {
+        if (rep.rows.isNotEmpty() || rep.progress.isNotEmpty()) ResultsCard(rep, st)
+        if (st.running && !st.busy) {
             OutlinedButton(
                 onClick = { app.engine.reselect("يدوي") },
-                enabled = !st.busy,
                 modifier = Modifier.fillMaxWidth()
             ) { Text("فحص وإعادة اختيار الكونفيج الآن") }
         }
@@ -337,9 +443,7 @@ fun HomeTab(app: WgApp, a: Actions) {
             }
         }
         Text("السجل", fontWeight = FontWeight.Bold)
-        LazyColumn(Modifier.weight(1f)) {
-            items(logs.reversed()) { Text(it, fontSize = 12.sp) }
-        }
+        logs.reversed().take(60).forEach { Text(it, fontSize = 12.sp) }
     }
 }
 
@@ -365,6 +469,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
     val list by app.store.configs.collectAsState()
     val s by app.store.settings.collectAsState()
     val results by app.engine.configResults.collectAsState()
+    val st by app.engine.status.collectAsState()
     var showPaste by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -374,7 +479,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             OutlinedButton(onClick = a.testAll, modifier = Modifier.weight(1f)) { Text("فحص الكل", maxLines = 1) }
         }
         Text(
-            "يدعم ملفات .conf وملف .zip يحوي عدة كونفيجات. يُفحص كل كونفيج جديد تلقائياً.",
+            "يدعم ملفات .conf وملف .zip يحوي عدة كونفيجات. تُفحص الكونفيجات تلقائياً عند تشغيل الـ VPN فقط.",
             fontSize = 12.sp
         )
         if (list.isEmpty()) Text("لا توجد كونفيجات بعد.")
@@ -389,6 +494,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                                     onClick = { app.store.updateSettings { it.copy(selConfigId = c.id) } }
                                 )
                             }
+                            MarkerSlot(st.connected && st.activeConfigId == c.id)
                             Column(Modifier.weight(1f)) {
                                 Text(c.name, fontWeight = FontWeight.Bold)
                                 val ep = Probes.parseEndpoint(c.text)
@@ -433,7 +539,6 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                     val e = app.engine.addConfig(name, text)
                     if (e == null) {
                         showPaste = false
-                        a.afterAdd()
                     } else {
                         err = e
                     }
@@ -457,6 +562,9 @@ fun DnsTab(app: WgApp) {
     val list by app.store.dns.collectAsState()
     val s by app.store.settings.collectAsState()
     val res by app.engine.dnsResults.collectAsState()
+    val st by app.engine.status.collectAsState()
+    val ni by app.engine.netInfo.collectAsState()
+    val chosenDns = if (st.connected) st.activeDnsId else ni.direct?.bestDnsId
     var showAdd by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -475,6 +583,7 @@ fun DnsTab(app: WgApp) {
                                 onClick = { app.store.updateSettings { it.copy(selDnsId = d.id) } }
                             )
                         }
+                        MarkerSlot(!chosenDns.isNullOrEmpty() && chosenDns == d.id)
                         Column(Modifier.weight(1f)) {
                             Text(d.name, fontWeight = FontWeight.Bold)
                             Text(d.ips().joinToString("  "), fontSize = 12.sp)
@@ -586,7 +695,7 @@ fun SettingsTab(app: WgApp, a: Actions) {
         Text("إعادة الاختيار", fontWeight = FontWeight.Bold)
         SwitchRow("عند تبدّل الشبكة أو تغيّر IP", s.reselectOnNetwork) { v -> upd { it.copy(reselectOnNetwork = v) } }
         Picker(
-            "فحص دوري", if (s.periodMin == 0) "إيقاف" else "كل ${s.periodMin} دقيقة",
+            "إعادة الفحص الكاملة دورياً", if (s.periodMin == 0) "إيقاف" else "كل ${s.periodMin} دقيقة",
             listOf(0 to "إيقاف", 15 to "كل 15 دقيقة", 30 to "كل 30 دقيقة", 60 to "كل 60 دقيقة", 120 to "كل 120 دقيقة")
         ) { v -> upd { it.copy(periodMin = v) } }
 
