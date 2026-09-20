@@ -15,12 +15,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
-/** خدمة أمامية تُبقي التطبيق حياً وتراقب الشبكة وتجري الفحص الدوري. */
+/**
+ * خدمة أمامية: تراقب الشبكة وتفحص DNS/MTU في الخلفية (مع الـ VPN أو بدونه)
+ * وتعيد الاختيار تلقائياً عند تبدّل الشبكة.
+ */
 class AutoService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var monitor: NetMonitor? = null
+    private var lastText = "مراقبة الشبكة"
     private val app get() = application as WgApp
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -31,28 +36,45 @@ class AutoService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL, "WG Auto", NotificationManager.IMPORTANCE_LOW)
         )
-        ServiceCompat.startForeground(
-            this, NOTIF_ID, buildNotif("جارٍ التشغيل…"),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        )
-        monitor = NetMonitor(this) { app.engine.onNetworkChanged() }.also { it.start() }
+        promote()
+        monitor = NetMonitor(this) { kind -> app.engine.onNetworkChanged(kind) }.also { it.start() }
         scope.launch {
-            app.engine.status.collect { st ->
-                val text = if (st.connected)
-                    "متصل • ${st.activeConfig} • DNS ${st.activeDns} • MTU ${st.activeMtu}"
-                else st.message.ifEmpty { "متوقف" }
+            combine(app.engine.status, app.engine.netInfo) { st, ni ->
+                val d = ni.direct
+                when {
+                    st.connected -> "متصل • ${st.activeConfig} • DNS ${st.activeDns} • MTU ${st.activeMtu}"
+                    st.running -> st.message.ifEmpty { "جارٍ التشغيل…" }
+                    d != null && d.dnsMs >= 0 -> {
+                        val vpnPart = if (ni.vpn != null) " • VPN ${ni.vpnOwner}" else ""
+                        "${d.label} • أسرع DNS ${d.bestDns} • MTU مقترح ${d.suggestedMtu}$vpnPart"
+                    }
+                    else -> "مراقبة الشبكة"
+                }
+            }.collect { text ->
+                lastText = text
                 nm.notify(NOTIF_ID, buildNotif(text))
             }
         }
         scope.launch { periodicLoop() }
+        if (!app.engine.status.value.running) app.engine.scanNetwork("بدء الخدمة")
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        promote()
+        return START_STICKY
+    }
 
     override fun onDestroy() {
         monitor?.stop()
         scope.cancel()
         super.onDestroy()
+    }
+
+    private fun promote() {
+        ServiceCompat.startForeground(
+            this, NOTIF_ID, buildNotif(lastText),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        )
     }
 
     private suspend fun periodicLoop() {
@@ -61,11 +83,8 @@ class AutoService : Service() {
             delay(60_000)
             val st = app.engine.status.value
             val s = app.store.settings.value
-            if (!st.running || st.busy) {
-                minutes = 0
-                continue
-            }
-            if (!st.connected) {
+            if (st.busy) continue
+            if (st.running && !st.connected) {
                 minutes = 0
                 app.engine.reselect("إعادة محاولة")
                 continue
@@ -73,7 +92,8 @@ class AutoService : Service() {
             minutes++
             if (s.periodMin > 0 && minutes >= s.periodMin) {
                 minutes = 0
-                app.engine.reselect("فحص دوري")
+                if (st.running) app.engine.reselect("فحص دوري")
+                else if (s.backgroundScan) app.engine.scanNetwork("فحص دوري")
             }
         }
     }

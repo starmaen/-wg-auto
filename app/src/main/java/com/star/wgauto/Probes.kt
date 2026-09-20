@@ -1,5 +1,6 @@
 package com.star.wgauto
 
+import android.net.Network
 import java.io.ByteArrayOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -12,8 +13,13 @@ import java.net.URL
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
-/** فحوصات الشبكة: DNS، زمن الاتصال، السرعة، وأقصى MTU للمسار. */
+/**
+ * فحوصات الشبكة: DNS، زمن الاتصال، السرعة، وأقصى MTU للمسار.
+ * المعامل network يربط الاتصال بشبكة محددة (مثلاً الشبكة الأصلية متجاوزاً أي VPN).
+ */
 object Probes {
+
+    private val ifaceRe = Regex("[A-Za-z0-9_.-]{1,15}")
 
     // ---------- endpoint ----------
     fun parseEndpoint(text: String): Pair<String, Int>? {
@@ -54,9 +60,10 @@ object Probes {
         return bos.toByteArray()
     }
 
-    private fun queryOnce(server: String, timeoutMs: Int): Long? = try {
+    private fun queryOnce(server: String, timeoutMs: Int, network: Network?): Long? = try {
         val q = buildQuery("www.google.com")
         DatagramSocket().use { s ->
+            network?.bindSocket(s)
             s.soTimeout = timeoutMs
             val addr = InetAddress.getByName(server)
             val t0 = System.nanoTime()
@@ -71,25 +78,27 @@ object Probes {
     }
 
     /** وسيط زمن الاستجابة بالمللي ثانية، أو null إذا لم يستجب الخادم. */
-    fun dnsLatency(server: String, tries: Int = 3, timeoutMs: Int = 1500): Int? {
+    fun dnsLatency(server: String, tries: Int = 3, timeoutMs: Int = 1500, network: Network? = null): Int? {
         val times = ArrayList<Long>()
-        repeat(tries) { queryOnce(server, timeoutMs)?.let { times.add(it) } }
+        repeat(tries) { queryOnce(server, timeoutMs, network)?.let { times.add(it) } }
         if (times.isEmpty()) return null
         times.sort()
         return times[times.size / 2].toInt()
     }
 
-    // ---------- زمن الاتصال عبر النفق ----------
+    // ---------- زمن الاتصال ----------
     fun tcpLatency(
         targets: List<Pair<String, Int>> = listOf("1.1.1.1" to 443, "8.8.8.8" to 443),
         tries: Int = 3,
-        timeoutMs: Int = 2500
+        timeoutMs: Int = 2500,
+        network: Network? = null
     ): Int? {
         val times = ArrayList<Long>()
         for ((host, port) in targets) {
             repeat(tries) {
                 try {
                     Socket().use { s ->
+                        network?.bindSocket(s)
                         val t0 = System.nanoTime()
                         s.connect(InetSocketAddress(host, port), timeoutMs)
                         times.add((System.nanoTime() - t0) / 1_000_000)
@@ -105,9 +114,10 @@ object Probes {
     }
 
     // ---------- السرعة ----------
-    fun throughputMbps(maxMs: Long = 5000): Double? {
+    fun throughputMbps(maxMs: Long = 5000, network: Network? = null): Double? {
         return try {
-            val c = URL("https://speed.cloudflare.com/__down?bytes=3000000").openConnection() as HttpURLConnection
+            val url = URL("https://speed.cloudflare.com/__down?bytes=3000000")
+            val c = (if (network != null) network.openConnection(url) else url.openConnection()) as HttpURLConnection
             c.connectTimeout = 4000
             c.readTimeout = 4000
             var total = 0L
@@ -134,9 +144,10 @@ object Probes {
 
     // ---------- MTU ----------
     /** true = مرّت الحزمة، false = فشلت، null = أمر ping غير صالح للاستخدام. */
-    private fun ping(host: String, packetSize: Int, ipv6: Boolean, root: Boolean): Boolean? {
+    private fun ping(host: String, packetSize: Int, ipv6: Boolean, root: Boolean, iface: String?): Boolean? {
         val payload = packetSize - if (ipv6) 48 else 28
-        val cmd = "ping ${if (ipv6) "-6 " else ""}-c 1 -W 2 -M do -s $payload $host"
+        val cmd = "ping ${if (ipv6) "-6 " else ""}${if (iface != null) "-I $iface " else ""}" +
+            "-c 1 -W 2 -M do -s $payload $host"
         return try {
             val pb = if (root) ProcessBuilder("su", "-c", cmd) else ProcessBuilder("sh", "-c", cmd)
             pb.redirectErrorStream(true)
@@ -157,19 +168,27 @@ object Probes {
         }
     }
 
-    /** أكبر حزمة IP (بالبايت) تصل إلى الخادم دون تجزئة، بين 1000 و1500. */
-    fun pathMtu(addr: InetAddress, allowRoot: Boolean): Int? {
+    /**
+     * أكبر حزمة IP (بالبايت) تصل دون تجزئة، بين 1000 و1500.
+     * iface: فحص عبر واجهة محددة (يتطلب روت) — يُستخدم لقياس الشبكة الأصلية أثناء عمل VPN.
+     */
+    fun pathMtu(addr: InetAddress, allowRoot: Boolean, iface: String? = null): Int? {
+        if (iface != null && !ifaceRe.matches(iface)) return null
         val v6 = addr is Inet6Address
         val host = addr.hostAddress ?: return null
-        val modes = if (allowRoot) listOf(false, true) else listOf(false)
+        val modes = when {
+            iface != null -> if (allowRoot) listOf(true) else emptyList()
+            allowRoot -> listOf(false, true)
+            else -> listOf(false)
+        }
         for (root in modes) {
-            val first = ping(host, 1000, v6, root) ?: continue
+            val first = ping(host, 1000, v6, root, iface) ?: continue
             if (!first) continue
             var lo = 1000
             var hi = 1500
             while (lo < hi) {
                 val mid = (lo + hi + 1) / 2
-                if (ping(host, mid, v6, root) == true) lo = mid else hi = mid - 1
+                if (ping(host, mid, v6, root, iface) == true) lo = mid else hi = mid - 1
             }
             return lo
         }

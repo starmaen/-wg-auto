@@ -13,14 +13,18 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -31,6 +35,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -54,32 +59,65 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import java.io.ByteArrayInputStream
+import java.util.zip.ZipInputStream
 
 class Actions(
     val toggle: () -> Unit,
     val importFiles: () -> Unit,
-    val batteryExempt: () -> Unit
+    val batteryExempt: () -> Unit,
+    val afterAdd: () -> Unit,
+    val testAll: () -> Unit,
+    val testOne: (String) -> Unit,
+    val syncService: () -> Unit,
+    val restoreSystem: () -> Unit
 )
 
 class MainActivity : ComponentActivity() {
     private val app get() = application as WgApp
+    private var pendingAfterPerm: (() -> Unit)? = null
 
     private val vpnPermLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
-            if (res.resultCode == RESULT_OK) startVpn() else toast("لم يتم منح إذن VPN")
+            val action = pendingAfterPerm
+            pendingAfterPerm = null
+            if (res.resultCode == RESULT_OK) action?.invoke() else toast("لم يتم منح إذن VPN")
         }
     private val notifLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
     private val importLauncher =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-            uris.forEach { importUri(it) }
+            var ok = 0
+            var fail = 0
+            uris.forEach {
+                val (o, f) = importUri(it)
+                ok += o
+                fail += f
+            }
+            if (ok > 0 || fail > 0) {
+                toast("تم استيراد $ok كونفيج" + if (fail > 0) " • تعذّر $fail" else "")
+            }
+            if (ok > 0) afterAdd()
         }
+
+    private val lightScheme = lightColorScheme(
+        primary = Color(0xFF1565C0), onPrimary = Color.White,
+        primaryContainer = Color(0xFFD6E4FF), onPrimaryContainer = Color(0xFF0B2A5B),
+        secondary = Color(0xFF3F6FB5)
+    )
+    private val darkScheme = darkColorScheme(
+        primary = Color(0xFF90CAF9), onPrimary = Color(0xFF0D2B57),
+        primaryContainer = Color(0xFF1B3F73), onPrimaryContainer = Color(0xFFD6E4FF),
+        secondary = Color(0xFF9DB8E6)
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -87,10 +125,16 @@ class MainActivity : ComponentActivity() {
         val actions = Actions(
             toggle = { onToggle() },
             importFiles = { importLauncher.launch(arrayOf("*/*")) },
-            batteryExempt = { batteryExempt() }
+            batteryExempt = { batteryExempt() },
+            afterAdd = { afterAdd() },
+            testAll = { withVpnPermission { app.engine.testAll() } },
+            testOne = { id -> withVpnPermission { app.engine.testConfigs(listOf(id)) } },
+            syncService = { syncService() },
+            restoreSystem = { app.engine.restoreSystemDns() }
         )
+        syncService()
         setContent {
-            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+            MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkScheme else lightScheme) {
                 CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                     Root(app, actions)
                 }
@@ -100,17 +144,38 @@ class MainActivity : ComponentActivity() {
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 
+    private fun withVpnPermission(action: () -> Unit) {
+        val i = VpnService.prepare(this)
+        if (i == null) {
+            action()
+        } else {
+            pendingAfterPerm = action
+            vpnPermLauncher.launch(i)
+        }
+    }
+
+    /** بعد إضافة كونفيجات: فحص الجديد منها تلقائياً. */
+    private fun afterAdd() {
+        withVpnPermission { app.engine.testUntested() }
+    }
+
+    /** الخدمة تعمل إذا كان الـ VPN يعمل أو كان الفحص الخلفي مفعّلاً. */
+    private fun syncService() {
+        val need = app.engine.status.value.running || app.store.settings.value.backgroundScan
+        val i = Intent(this, AutoService::class.java)
+        if (need) ContextCompat.startForegroundService(this, i) else stopService(i)
+    }
+
     private fun onToggle() {
         if (app.engine.status.value.running) {
             app.engine.stop()
-            stopService(Intent(this, AutoService::class.java))
+            if (!app.store.settings.value.backgroundScan) stopService(Intent(this, AutoService::class.java))
         } else {
             if (app.store.configs.value.none { it.enabled }) {
                 toast("أضف كونفيجاً واحداً على الأقل وفعّله")
                 return
             }
-            val i = VpnService.prepare(this)
-            if (i != null) vpnPermLauncher.launch(i) else startVpn()
+            withVpnPermission { startVpn() }
         }
     }
 
@@ -119,18 +184,50 @@ class MainActivity : ComponentActivity() {
         app.engine.start()
     }
 
-    private fun importUri(uri: Uri) {
+    private fun displayName(uri: Uri): String =
+        contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (c.moveToFirst() && idx >= 0) c.getString(idx) else null
+        } ?: "config"
+
+    /** يستورد ملف .conf أو ملف .zip يحوي عدة كونفيجات. يعيد (نجح, فشل). */
+    private fun importUri(uri: Uri): Pair<Int, Int> {
+        var ok = 0
+        var fail = 0
         try {
-            val name = contentResolver.query(uri, null, null, null, null)?.use { c ->
-                val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (c.moveToFirst() && idx >= 0) c.getString(idx) else null
-            } ?: "config"
-            val text = contentResolver.openInputStream(uri)!!.bufferedReader().use { it.readText() }
-            val err = app.engine.addConfig(name.removeSuffix(".conf"), text)
-            toast(if (err == null) "تم استيراد $name" else "$name: $err")
+            val name = displayName(uri)
+            val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+            val isZip = name.endsWith(".zip", true) ||
+                (bytes.size > 4 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte())
+            if (isZip) {
+                ZipInputStream(ByteArrayInputStream(bytes)).use { zin ->
+                    var e = zin.nextEntry
+                    while (e != null) {
+                        if (!e.isDirectory) {
+                            val base = e.name.substringAfterLast('/').substringAfterLast('\\')
+                            if (!base.startsWith(".") && !e.name.startsWith("__MACOSX")) {
+                                val data = zin.readBytes()
+                                if (data.size < 200_000) {
+                                    val text = data.toString(Charsets.UTF_8)
+                                    if (text.contains("[Interface]", true) && text.contains("[Peer]", true)) {
+                                        val n = base.substringBeforeLast('.')
+                                        if (app.engine.addConfig(n, text) == null) ok++ else fail++
+                                    }
+                                }
+                            }
+                        }
+                        zin.closeEntry()
+                        e = zin.nextEntry
+                    }
+                }
+            } else {
+                val text = bytes.toString(Charsets.UTF_8)
+                if (app.engine.addConfig(name.removeSuffix(".conf"), text) == null) ok++ else fail++
+            }
         } catch (e: Exception) {
-            toast("فشل الاستيراد: ${e.message}")
+            fail++
         }
+        return ok to fail
     }
 
     private fun batteryExempt() {
@@ -175,7 +272,20 @@ fun Root(app: WgApp, a: Actions) {
 fun HomeTab(app: WgApp, a: Actions) {
     val st by app.engine.status.collectAsState()
     val logs by app.engine.logs.collectAsState()
+    val ni by app.engine.netInfo.collectAsState()
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box(
+                Modifier.size(48.dp).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(12.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("WG", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+            }
+            Column {
+                Text("WG Auto", fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                Text("اختيار تلقائي للكونفيج وDNS وMTU", fontSize = 12.sp)
+            }
+        }
         Button(
             onClick = a.toggle,
             modifier = Modifier.fillMaxWidth().height(64.dp),
@@ -198,11 +308,34 @@ fun HomeTab(app: WgApp, a: Actions) {
                 }
             }
         }
-        OutlinedButton(
-            onClick = { app.engine.reselect("يدوي") },
-            enabled = st.running && !st.busy,
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("فحص وإعادة الاختيار الآن") }
+        if (st.running) {
+            OutlinedButton(
+                onClick = { app.engine.reselect("يدوي") },
+                enabled = !st.busy,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("فحص وإعادة اختيار الكونفيج الآن") }
+        }
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("فحص الشبكة (مستقل عن الـ VPN)", fontWeight = FontWeight.Bold)
+                val d = ni.direct
+                if (d == null) {
+                    Text("لم يُفحص بعد")
+                } else {
+                    SideView("الشبكة الأصلية", d, false)
+                    ni.vpn?.let { v ->
+                        HorizontalDivider()
+                        SideView("عبر VPN (${ni.vpnOwner})", v, true)
+                    }
+                    if (ni.time.isNotEmpty()) Text("آخر فحص: ${ni.time}", fontSize = 12.sp)
+                }
+                OutlinedButton(
+                    onClick = { app.engine.scanNetwork("يدوي") },
+                    enabled = !st.busy,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("فحص الشبكة الآن") }
+            }
+        }
         Text("السجل", fontWeight = FontWeight.Bold)
         LazyColumn(Modifier.weight(1f)) {
             items(logs.reversed()) { Text(it, fontSize = 12.sp) }
@@ -211,40 +344,69 @@ fun HomeTab(app: WgApp, a: Actions) {
 }
 
 @Composable
+fun SideView(title: String, sd: SideInfo, vpnSide: Boolean) {
+    Text(title, fontWeight = FontWeight.Bold)
+    Text(sd.label + if (sd.iface.isNotEmpty()) " (${sd.iface})" else "")
+    if (sd.dnsMs >= 0) Text("أسرع DNS: ${sd.bestDns} (${sd.dnsMs} ms)") else Text("أسرع DNS: —")
+    if (sd.latencyMs >= 0) Text("التأخر: ${sd.latencyMs} ms")
+    if (sd.pathMtu > 0) {
+        if (vpnSide) {
+            Text("أقصى حزمة تمر: ${sd.pathMtu}" + if (sd.ifaceMtu > 0) " • MTU الواجهة: ${sd.ifaceMtu}" else "")
+        } else {
+            Text("أقصى حزمة للمسار: ${sd.pathMtu} • MTU مقترح: ${sd.suggestedMtu}")
+        }
+    } else {
+        Text(if (vpnSide) "MTU: تعذّر الفحص" else "MTU: يحتاج ping أو روت أثناء وجود VPN")
+    }
+}
+
+@Composable
 fun ConfigsTab(app: WgApp, a: Actions) {
     val list by app.store.configs.collectAsState()
     val s by app.store.settings.collectAsState()
+    val results by app.engine.configResults.collectAsState()
     var showPaste by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = a.importFiles, modifier = Modifier.weight(1f)) { Text("استيراد ملفات", maxLines = 1) }
-            OutlinedButton(onClick = { showPaste = true }, modifier = Modifier.weight(1f)) { Text("لصق كونفيج", maxLines = 1) }
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Button(onClick = a.importFiles, modifier = Modifier.weight(1f)) { Text("استيراد", maxLines = 1) }
+            OutlinedButton(onClick = { showPaste = true }, modifier = Modifier.weight(1f)) { Text("لصق", maxLines = 1) }
+            OutlinedButton(onClick = a.testAll, modifier = Modifier.weight(1f)) { Text("فحص الكل", maxLines = 1) }
         }
-        if (list.isEmpty()) Text("لا توجد كونفيجات. استورد ملف .conf أو الصق النص.")
+        Text(
+            "يدعم ملفات .conf وملف .zip يحوي عدة كونفيجات. يُفحص كل كونفيج جديد تلقائياً.",
+            fontSize = 12.sp
+        )
+        if (list.isEmpty()) Text("لا توجد كونفيجات بعد.")
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(list, key = { it.id }) { c ->
                 Card(Modifier.fillMaxWidth()) {
-                    Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        if (!s.autoConfig) {
-                            RadioButton(
-                                selected = s.selConfigId == c.id,
-                                onClick = { app.store.updateSettings { it.copy(selConfigId = c.id) } }
+                    Column(Modifier.padding(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (!s.autoConfig) {
+                                RadioButton(
+                                    selected = s.selConfigId == c.id,
+                                    onClick = { app.store.updateSettings { it.copy(selConfigId = c.id) } }
+                                )
+                            }
+                            Column(Modifier.weight(1f)) {
+                                Text(c.name, fontWeight = FontWeight.Bold)
+                                val ep = Probes.parseEndpoint(c.text)
+                                Text(ep?.let { "${it.first}:${it.second}" } ?: "—", fontSize = 12.sp)
+                            }
+                            Switch(
+                                checked = c.enabled,
+                                onCheckedChange = { v ->
+                                    app.store.updateConfigs { l -> l.map { if (it.id == c.id) it.copy(enabled = v) else it } }
+                                }
                             )
                         }
-                        Column(Modifier.weight(1f)) {
-                            Text(c.name, fontWeight = FontWeight.Bold)
-                            val ep = Probes.parseEndpoint(c.text)
-                            Text(ep?.let { "${it.first}:${it.second}" } ?: "—", fontSize = 12.sp)
-                        }
-                        Switch(
-                            checked = c.enabled,
-                            onCheckedChange = { v ->
-                                app.store.updateConfigs { l -> l.map { if (it.id == c.id) it.copy(enabled = v) else it } }
+                        results[c.id]?.let { Text(it, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 8.dp)) }
+                        Row {
+                            TextButton(onClick = { a.testOne(c.id) }) { Text("فحص") }
+                            TextButton(onClick = { app.store.updateConfigs { l -> l.filter { it.id != c.id } } }) {
+                                Text("حذف", color = MaterialTheme.colorScheme.error)
                             }
-                        )
-                        TextButton(onClick = { app.store.updateConfigs { l -> l.filter { it.id != c.id } } }) {
-                            Text("حذف", color = MaterialTheme.colorScheme.error)
                         }
                     }
                 }
@@ -269,7 +431,12 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             confirmButton = {
                 TextButton(onClick = {
                     val e = app.engine.addConfig(name, text)
-                    if (e == null) showPaste = false else err = e
+                    if (e == null) {
+                        showPaste = false
+                        a.afterAdd()
+                    } else {
+                        err = e
+                    }
                 }) { Text("حفظ") }
             },
             dismissButton = { TextButton(onClick = { showPaste = false }) { Text("إلغاء") } }
@@ -311,6 +478,7 @@ fun DnsTab(app: WgApp) {
                         Column(Modifier.weight(1f)) {
                             Text(d.name, fontWeight = FontWeight.Bold)
                             Text(d.ips().joinToString("  "), fontSize = 12.sp)
+                            if (d.dot.isNotEmpty()) Text("DoT: ${d.dot}", fontSize = 11.sp)
                             res[d.id]?.let { Text(if (it < 0) "لا استجابة" else "$it ms", fontSize = 12.sp) }
                         }
                         Switch(
@@ -332,6 +500,7 @@ fun DnsTab(app: WgApp) {
         var name by remember { mutableStateOf("") }
         var p1 by remember { mutableStateOf("") }
         var p2 by remember { mutableStateOf("") }
+        var p3 by remember { mutableStateOf("") }
         var err by remember { mutableStateOf<String?>(null) }
         AlertDialog(
             onDismissRequest = { showAdd = false },
@@ -341,6 +510,7 @@ fun DnsTab(app: WgApp) {
                     OutlinedTextField(name, { name = it }, label = { Text("الاسم") }, singleLine = true)
                     OutlinedTextField(p1, { p1 = it }, label = { Text("العنوان الأساسي") }, singleLine = true)
                     OutlinedTextField(p2, { p2 = it }, label = { Text("العنوان الثانوي (اختياري)") }, singleLine = true)
+                    OutlinedTextField(p3, { p3 = it }, label = { Text("مضيف DoT (اختياري، للتثبيت بالروت)") }, singleLine = true)
                     err?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp) }
                 }
             },
@@ -349,7 +519,7 @@ fun DnsTab(app: WgApp) {
                     if (!validIp(p1) || (p2.isNotBlank() && !validIp(p2))) {
                         err = "عنوان IP غير صالح"
                     } else {
-                        app.store.updateDns { it + DnsServer(name = name.ifBlank { p1.trim() }, primary = p1.trim(), secondary = p2.trim()) }
+                        app.store.updateDns { it + DnsServer(name = name.ifBlank { p1.trim() }, primary = p1.trim(), secondary = p2.trim(), dot = p3.trim()) }
                         showAdd = false
                     }
                 }) { Text("حفظ") }
@@ -406,6 +576,13 @@ fun SettingsTab(app: WgApp, a: Actions) {
             ) { v -> upd { it.copy(selMtu = v) } }
         }
 
+        Text("الفحص في الخلفية", fontWeight = FontWeight.Bold)
+        SwitchRow("فحص DNS وMTU تلقائياً بدون تشغيل VPN", s.backgroundScan) { v ->
+            upd { it.copy(backgroundScan = v) }
+            a.syncService()
+        }
+        Text("يعمل عند فتح التطبيق وعند تبدّل الشبكة، ويعرض أفضل DNS وMTU للشبكة الحالية.", fontSize = 12.sp)
+
         Text("إعادة الاختيار", fontWeight = FontWeight.Bold)
         SwitchRow("عند تبدّل الشبكة أو تغيّر IP", s.reselectOnNetwork) { v -> upd { it.copy(reselectOnNetwork = v) } }
         Picker(
@@ -415,6 +592,15 @@ fun SettingsTab(app: WgApp, a: Actions) {
 
         Text("متقدم", fontWeight = FontWeight.Bold)
         SwitchRow("استخدام الروت لفحص MTU (su)", s.useRoot) { v -> upd { it.copy(useRoot = v) } }
+        SwitchRow("تثبيت القيم المثلى بالروت", s.applyRoot) { v ->
+            upd { it.copy(applyRoot = v) }
+            if (!v) a.restoreSystem()
+        }
+        Text(
+            "يخفض MTU واجهة أي VPN خارجي إلى أكبر حزمة تمر فعلاً، ويضبط DNS النظام (Private DNS) على أسرع خادم يدعم DoT. " +
+                "عند الإيقاف يُعاد DNS إلى وضعه الأصلي.",
+            fontSize = 12.sp
+        )
         OutlinedButton(onClick = a.batteryExempt, modifier = Modifier.fillMaxWidth()) {
             Text("استثناء التطبيق من توفير الطاقة")
         }
@@ -422,5 +608,25 @@ fun SettingsTab(app: WgApp, a: Actions) {
             "MTU النفق = أقصى حزمة تصل للخادم − 60 بايت (IPv4) أو − 80 بايت (IPv6).",
             fontSize = 12.sp
         )
+
+        val ctx = LocalContext.current
+        val ver = remember {
+            try {
+                ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: ""
+            } catch (e: Exception) {
+                ""
+            }
+        }
+        HorizontalDivider()
+        Text("حول التطبيق", fontWeight = FontWeight.Bold)
+        Text("الإصدار: $ver")
+        Text("Star Syria")
+        TextButton(onClick = {
+            try {
+                ctx.startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:starsyria2500@gmail.com")))
+            } catch (e: Exception) {
+                // لا يوجد تطبيق بريد
+            }
+        }) { Text("starsyria2500@gmail.com") }
     }
 }

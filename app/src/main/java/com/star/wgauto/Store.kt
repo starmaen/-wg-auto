@@ -56,7 +56,7 @@ class Store(ctx: Context) {
         dns.value.forEach {
             a.put(
                 JSONObject().put("id", it.id).put("name", it.name).put("primary", it.primary)
-                    .put("secondary", it.secondary).put("enabled", it.enabled)
+                    .put("secondary", it.secondary).put("enabled", it.enabled).put("dot", it.dot)
             )
         }
         sp.edit().putString("dns", a.toString()).apply()
@@ -66,11 +66,14 @@ class Store(ctx: Context) {
         val s = sp.getString("dns", null) ?: return Defaults.dns
         return try {
             val a = JSONArray(s)
+            val defDot = Defaults.dns.associate { d -> d.id to d.dot }
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
+                val id = o.getString("id")
                 DnsServer(
-                    o.getString("id"), o.getString("name"), o.getString("primary"),
-                    o.optString("secondary", ""), o.optBoolean("enabled", true)
+                    id, o.getString("name"), o.getString("primary"),
+                    o.optString("secondary", ""), o.optBoolean("enabled", true),
+                    o.optString("dot", "").ifEmpty { defDot[id] ?: "" }
                 )
             }
         } catch (e: Exception) {
@@ -86,7 +89,7 @@ class Store(ctx: Context) {
             .put("autoConfig", s.autoConfig).put("autoDns", s.autoDns).put("autoMtu", s.autoMtu)
             .put("selConfigId", s.selConfigId).put("selDnsId", s.selDnsId).put("selMtu", s.selMtu)
             .put("reselectOnNetwork", s.reselectOnNetwork).put("periodMin", s.periodMin)
-            .put("useRoot", s.useRoot)
+            .put("useRoot", s.useRoot).put("backgroundScan", s.backgroundScan).put("applyRoot", s.applyRoot)
         sp.edit().putString("settings", o.toString()).apply()
     }
 
@@ -100,10 +103,18 @@ class Store(ctx: Context) {
                 o.optBoolean("autoMtu", d.autoMtu), o.optString("selConfigId", ""),
                 o.optString("selDnsId", ""), o.optInt("selMtu", d.selMtu),
                 o.optBoolean("reselectOnNetwork", d.reselectOnNetwork),
-                o.optInt("periodMin", d.periodMin), o.optBoolean("useRoot", d.useRoot)
+                o.optInt("periodMin", d.periodMin), o.optBoolean("useRoot", d.useRoot),
+                o.optBoolean("backgroundScan", d.backgroundScan),
+                o.optBoolean("applyRoot", d.applyRoot)
             )
         } catch (e: Exception) {
             AppSettings()
         }
+    }
+
+    // ---------- قيم بسيطة مساعدة ----------
+    fun prefGet(key: String): String? = sp.getString(key, null)
+    fun prefPut(key: String, value: String?) {
+        sp.edit().putString(key, value).apply()
     }
 }
