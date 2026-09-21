@@ -297,9 +297,11 @@ private fun rowLine(r: ConfigRow): String = when (r.state) {
     "fail" -> "✗ ${r.note}"
     else -> buildString {
         append("${r.latencyMs} ms")
+        if (r.jitter > 0) append(" ±${r.jitter}")
+        if (r.score > 0) append(" • فقد ${r.loss}%")
         r.mbps?.let { append(" • %.1f Mbps".format(it)) }
         if (r.mtu > 0) append(" • MTU ${r.mtu}")
-        if (r.dnsName.isNotEmpty()) append(" • ${r.dnsName}")
+        if (r.exitIp.isNotEmpty()) append(" • ${r.exitIp} ${r.exitLoc}")
     }
 }
 
@@ -332,12 +334,13 @@ fun ResultsCard(rep: Report, st: Status) {
             }
             if (rep.dnsRows.isNotEmpty()) {
                 HorizontalDivider()
-                Text("DNS (الأسرع أولاً)", fontWeight = FontWeight.Bold)
+                Text("DNS عبر النفق (الأفضل جودةً أولاً)", fontWeight = FontWeight.Bold)
                 rep.dnsRows.take(6).forEach { d ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         MarkerSlot(st.connected && d.id == rep.chosenDnsId)
                         Text(
-                            "${d.name}: " + if (d.ms < 0) "لا استجابة" else "${d.ms} ms",
+                            "${d.name}: " + if (d.ms < 0) "لا استجابة (0%)"
+                            else "${d.ms} ms ±${d.jitter} • فقد ${d.loss}%",
                             fontSize = 13.sp
                         )
                     }
@@ -352,6 +355,16 @@ fun ResultsCard(rep: Report, st: Status) {
                     else "قيمة افتراضية/يدوية (لم يُقَس مسار الخادم)",
                     fontSize = 12.sp
                 )
+                if (rep.mtuRows.isNotEmpty()) {
+                    Text("تجربة فعلية (سرعة عبر النفق لكل MTU):", fontSize = 12.sp)
+                    rep.mtuRows.forEach { m ->
+                        Text(
+                            "  MTU ${m.mtu}: " + (m.mbps?.let { "%.1f Mbps".format(it) } ?: "فشل") +
+                                if (m.mtu == rep.chosenMtu) "  ← المختار" else "",
+                            fontSize = 12.sp
+                        )
+                    }
+                }
             }
         }
     }
@@ -409,8 +422,19 @@ fun HomeTab(app: WgApp, a: Actions) {
                         Text("DNS: ${st.activeDns}", fontWeight = FontWeight.Bold)
                     }
                     Text("MTU: ${st.activeMtu}")
-                    Text("التأخر: ${st.latencyMs} ms")
-                    Text("السرعة: ${st.mbps?.let { "%.1f Mbps".format(it) } ?: "—"}")
+                    Text("التأخر عبر النفق: ${st.latencyMs} ms")
+                    if (st.mbps != null) Text("السرعة: ${"%.1f Mbps".format(st.mbps)}")
+                    HorizontalDivider()
+                    Text("دليل أن النفق حقيقي", fontWeight = FontWeight.Bold)
+                    if (st.vpnIface.isNotEmpty()) Text("واجهة VPN: ${st.vpnIface}", fontSize = 13.sp)
+                    if (st.exitIp.isNotEmpty()) Text("IP عبر النفق: ${st.exitIp} ${st.exitLoc}", fontSize = 13.sp)
+                    if (st.directIp.isNotEmpty()) Text("IP المباشر: ${st.directIp} ${st.directLoc}", fontSize = 13.sp)
+                    Text(
+                        if (st.verified) "✔ تغيّر الـ IP: الحركة تمر فعلاً عبر النفق"
+                        else "⚠ لم يُتحقق من تغيّر الـ IP (تحقق بنفسك من موقع فحص IP)",
+                        fontSize = 13.sp,
+                        color = if (st.verified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                    )
                 }
             }
         }
@@ -451,13 +475,18 @@ fun HomeTab(app: WgApp, a: Actions) {
 fun SideView(title: String, sd: SideInfo, vpnSide: Boolean) {
     Text(title, fontWeight = FontWeight.Bold)
     Text(sd.label + if (sd.iface.isNotEmpty()) " (${sd.iface})" else "")
-    if (sd.dnsMs >= 0) Text("أسرع DNS: ${sd.bestDns} (${sd.dnsMs} ms)") else Text("أسرع DNS: —")
+    if (sd.dnsMs >= 0) {
+        Text("أسرع DNS: ${sd.bestDns} — ${sd.dnsMs} ms (${sd.dnsProto}، فقد ${sd.dnsLoss}%)")
+    } else {
+        Text("DNS: لا استجابة من أي خادم (المنفذ 53 قد يكون محجوباً من مزودك)")
+    }
+    if (sd.sysDnsMs >= 0) Text("DNS الحالي للنظام: ${sd.sysDnsMs} ms", fontSize = 13.sp)
     if (sd.latencyMs >= 0) Text("التأخر: ${sd.latencyMs} ms")
     if (sd.pathMtu > 0) {
         if (vpnSide) {
             Text("أقصى حزمة تمر: ${sd.pathMtu}" + if (sd.ifaceMtu > 0) " • MTU الواجهة: ${sd.ifaceMtu}" else "")
         } else {
-            Text("أقصى حزمة للمسار: ${sd.pathMtu} • MTU مقترح: ${sd.suggestedMtu}")
+            Text("أقصى حزمة للمسار (ICMP): ${sd.pathMtu} • مقترح مبدئي: ${sd.suggestedMtu}")
         }
     } else {
         Text(if (vpnSide) "MTU: تعذّر الفحص" else "MTU: يحتاج ping أو روت أثناء وجود VPN")
@@ -549,6 +578,17 @@ fun ConfigsTab(app: WgApp, a: Actions) {
     }
 }
 
+private fun statText(name: String, st: Stat?): String =
+    if (st == null) "$name: —" else "$name: ${st.median} ms ±${st.jitter} فقد ${st.loss}%"
+
+private fun dnsMeasureLine(m: DnsMeasure): String {
+    val parts = ArrayList<String>()
+    parts += if (m.udp == null) "UDP: لا استجابة" else statText("UDP", m.udp)
+    m.dot?.let { parts += statText("DoT", it) }
+    m.doh?.let { parts += statText("DoH", it) }
+    return parts.joinToString(" • ")
+}
+
 private fun validIp(v: String): Boolean {
     val x = v.trim()
     if (x.isEmpty()) return false
@@ -588,7 +628,13 @@ fun DnsTab(app: WgApp) {
                             Text(d.name, fontWeight = FontWeight.Bold)
                             Text(d.ips().joinToString("  "), fontSize = 12.sp)
                             if (d.dot.isNotEmpty()) Text("DoT: ${d.dot}", fontSize = 11.sp)
-                            res[d.id]?.let { Text(if (it < 0) "لا استجابة" else "$it ms", fontSize = 12.sp) }
+                            if (d.filtered) {
+                                Text(
+                                    "مُرشِّح (يحجب مواقع) — لا يُختار تلقائياً إلا بإذن من الإعدادات",
+                                    fontSize = 11.sp, color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                            res[d.id]?.let { m -> Text(dnsMeasureLine(m), fontSize = 12.sp) }
                         }
                         Switch(
                             checked = d.enabled,
@@ -672,7 +718,10 @@ fun SettingsTab(app: WgApp, a: Actions) {
     ) {
         Text("الاختيار التلقائي", fontWeight = FontWeight.Bold)
         SwitchRow("اختيار أفضل كونفيج تلقائياً", s.autoConfig) { v -> upd { it.copy(autoConfig = v) } }
-        SwitchRow("اختيار أسرع DNS تلقائياً", s.autoDns) { v -> upd { it.copy(autoDns = v) } }
+        SwitchRow("اختيار أفضل DNS تلقائياً", s.autoDns) { v -> upd { it.copy(autoDns = v) } }
+        SwitchRow("السماح باختيار DNS المُرشِّحة (تحجب مواقع)", s.allowFilteredDns) { v ->
+            upd { it.copy(allowFilteredDns = v) }
+        }
         SwitchRow("فحص MTU المسار تلقائياً", s.autoMtu) { v -> upd { it.copy(autoMtu = v) } }
         Text(
             "عند إيقاف الاختيار التلقائي لكونفيج أو DNS يظهر زر اختيار بجانب كل عنصر في تبويبه.",
@@ -706,10 +755,13 @@ fun SettingsTab(app: WgApp, a: Actions) {
             if (!v) a.restoreSystem()
         }
         Text(
-            "يخفض MTU واجهة أي VPN خارجي إلى أكبر حزمة تمر فعلاً، ويضبط DNS النظام (Private DNS) على أسرع خادم يدعم DoT. " +
-                "عند الإيقاف يُعاد DNS إلى وضعه الأصلي.",
+            "يخفض MTU واجهة أي VPN خارجي إلى أكبر حزمة تمر فعلاً. ولا يغيّر DNS النظام (Private DNS) " +
+                "إلا لخادم DoT مقاس بفقد 0% وأفضل بوضوح من الحالي، ثم يتحقق من الحل بعد التطبيق ويتراجع تلقائياً إن ساء.",
             fontSize = 12.sp
         )
+        OutlinedButton(onClick = a.restoreSystem, modifier = Modifier.fillMaxWidth()) {
+            Text("استعادة إعداد DNS الخاص الأصلي للنظام")
+        }
         OutlinedButton(onClick = a.batteryExempt, modifier = Modifier.fillMaxWidth()) {
             Text("استثناء التطبيق من توفير الطاقة")
         }

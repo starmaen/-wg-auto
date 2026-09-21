@@ -57,6 +57,7 @@ class Store(ctx: Context) {
             a.put(
                 JSONObject().put("id", it.id).put("name", it.name).put("primary", it.primary)
                     .put("secondary", it.secondary).put("enabled", it.enabled).put("dot", it.dot)
+                    .put("filtered", it.filtered)
             )
         }
         sp.edit().putString("dns", a.toString()).apply()
@@ -67,13 +68,15 @@ class Store(ctx: Context) {
         return try {
             val a = JSONArray(s)
             val defDot = Defaults.dns.associate { d -> d.id to d.dot }
+            val defFiltered = Defaults.dns.associate { d -> d.id to d.filtered }
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
                 val id = o.getString("id")
                 DnsServer(
                     id, o.getString("name"), o.getString("primary"),
                     o.optString("secondary", ""), o.optBoolean("enabled", true),
-                    o.optString("dot", "").ifEmpty { defDot[id] ?: "" }
+                    o.optString("dot", "").ifEmpty { defDot[id] ?: "" },
+                    o.optBoolean("filtered", defFiltered[id] ?: false)
                 )
             }
         } catch (e: Exception) {
@@ -90,6 +93,7 @@ class Store(ctx: Context) {
             .put("selConfigId", s.selConfigId).put("selDnsId", s.selDnsId).put("selMtu", s.selMtu)
             .put("reselectOnNetwork", s.reselectOnNetwork).put("periodMinV2", s.periodMin)
             .put("useRoot", s.useRoot).put("backgroundScan", s.backgroundScan).put("applyRoot", s.applyRoot)
+            .put("allowFilteredDns", s.allowFilteredDns)
         sp.edit().putString("settings", o.toString()).apply()
     }
 
@@ -105,7 +109,8 @@ class Store(ctx: Context) {
                 o.optBoolean("reselectOnNetwork", d.reselectOnNetwork),
                 o.optInt("periodMinV2", d.periodMin), o.optBoolean("useRoot", d.useRoot),
                 o.optBoolean("backgroundScan", d.backgroundScan),
-                o.optBoolean("applyRoot", d.applyRoot)
+                o.optBoolean("applyRoot", d.applyRoot),
+                o.optBoolean("allowFilteredDns", d.allowFilteredDns)
             )
         } catch (e: Exception) {
             AppSettings()

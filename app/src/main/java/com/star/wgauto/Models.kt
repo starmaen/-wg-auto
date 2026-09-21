@@ -16,7 +16,9 @@ data class DnsServer(
     val secondary: String = "",
     val enabled: Boolean = true,
     /** اسم مضيف DNS-over-TLS (لتثبيت DNS النظام بالروت). */
-    val dot: String = ""
+    val dot: String = "",
+    /** خادم يحجب مواقع (برمجيات خبيثة/إعلانات/محتوى). لا يُختار تلقائياً إلا بإذن. */
+    val filtered: Boolean = false
 ) {
     fun ips(): List<String> = listOf(primary, secondary).filter { it.isNotBlank() }
 }
@@ -32,7 +34,8 @@ data class AppSettings(
     val periodMin: Int = 0,
     val useRoot: Boolean = false,
     val backgroundScan: Boolean = true,
-    val applyRoot: Boolean = false
+    val applyRoot: Boolean = false,
+    val allowFilteredDns: Boolean = false
 )
 
 data class Status(
@@ -46,7 +49,13 @@ data class Status(
     val mbps: Double? = null,
     val message: String = "",
     val activeConfigId: String? = null,
-    val activeDnsId: String? = null
+    val activeDnsId: String? = null,
+    val verified: Boolean = false,
+    val exitIp: String = "",
+    val exitLoc: String = "",
+    val directIp: String = "",
+    val directLoc: String = "",
+    val vpnIface: String = ""
 )
 
 /** نتيجة فحص جهة واحدة (الشبكة الأصلية أو شبكة الـ VPN). */
@@ -56,6 +65,9 @@ data class SideInfo(
     val bestDns: String = "",
     val bestDnsId: String = "",
     val dnsMs: Int = -1,
+    val dnsProto: String = "",
+    val dnsLoss: Int = 100,
+    val sysDnsMs: Int = -1,
     val latencyMs: Int = -1,
     val pathMtu: Int = 0,
     val suggestedMtu: Int = 0,
@@ -80,10 +92,34 @@ data class ConfigRow(
     val pathMtu: Int = 0,
     val dnsName: String = "",
     val note: String = "",
-    val score: Double = 0.0
+    val score: Double = 0.0,
+    val jitter: Int = 0,
+    val loss: Int = 0,
+    val exitIp: String = "",
+    val exitLoc: String = ""
 )
 
-data class DnsRow(val id: String, val name: String, val ms: Int)
+data class DnsRow(
+    val id: String, val name: String, val ms: Int,
+    val proto: String = "", val jitter: Int = 0, val loss: Int = 0
+)
+
+data class MtuRow(val mtu: Int, val mbps: Double?)
+
+/** إحصاءات قياس: الوسيط والتذبذب (متوسط الانحراف) ونسبة الفقد. */
+data class Stat(val median: Int, val jitter: Int, val loss: Int) {
+    /** درجة أقل = أفضل. */
+    val score: Int get() = median + jitter / 2 + loss * 4
+}
+
+/** قياس خادم DNS بالبروتوكولات القياسية الثلاثة. */
+data class DnsMeasure(val udp: Stat? = null, val dot: Stat? = null, val doh: Stat? = null) {
+    fun best(): Pair<String, Stat>? =
+        listOfNotNull(udp?.let { "UDP" to it }, dot?.let { "DoT" to it }, doh?.let { "DoH" to it })
+            .minByOrNull { it.second.score }
+}
+
+data class ExitInfo(val ip: String, val loc: String, val ms: Int)
 
 /** تقرير الفحص الظاهر في الواجهة الرئيسية. */
 data class Report(
@@ -91,28 +127,30 @@ data class Report(
     val dnsRows: List<DnsRow> = emptyList(),
     val chosenConfigId: String = "",
     val chosenDnsId: String = "",
+    val chosenDnsProto: String = "",
     val chosenMtu: Int = 0,
     val chosenPathMtu: Int = 0,
+    val mtuRows: List<MtuRow> = emptyList(),
     val progress: String = ""
 )
 
 object Defaults {
     val dns: List<DnsServer> = listOf(
         DnsServer("def-cloudflare", "Cloudflare", "1.1.1.1", "1.0.0.1", dot = "one.one.one.one"),
-        DnsServer("def-cloudflare-sec", "Cloudflare (حماية)", "1.1.1.2", "1.0.0.2", dot = "security.cloudflare-dns.com"),
+        DnsServer("def-cloudflare-sec", "Cloudflare (حماية)", "1.1.1.2", "1.0.0.2", dot = "security.cloudflare-dns.com", filtered = true),
         DnsServer("def-google", "Google", "8.8.8.8", "8.8.4.4", dot = "dns.google"),
-        DnsServer("def-quad9", "Quad9", "9.9.9.9", "149.112.112.112", dot = "dns.quad9.net"),
+        DnsServer("def-quad9", "Quad9", "9.9.9.9", "149.112.112.112", dot = "dns.quad9.net", filtered = true),
         DnsServer("def-opendns", "OpenDNS", "208.67.222.222", "208.67.220.220"),
-        DnsServer("def-adguard", "AdGuard", "94.140.14.14", "94.140.15.15", dot = "dns.adguard-dns.com"),
-        DnsServer("def-cleanbrowsing", "CleanBrowsing", "185.228.168.9", "185.228.169.9", dot = "security-filter-dns.cleanbrowsing.org"),
+        DnsServer("def-adguard", "AdGuard", "94.140.14.14", "94.140.15.15", dot = "dns.adguard-dns.com", filtered = true),
+        DnsServer("def-cleanbrowsing", "CleanBrowsing", "185.228.168.9", "185.228.169.9", dot = "security-filter-dns.cleanbrowsing.org", filtered = true),
         DnsServer("def-controld", "Control D", "76.76.2.0", "76.76.10.0"),
         DnsServer("def-nextdns", "NextDNS", "45.90.28.0", "45.90.30.0", dot = "dns.nextdns.io"),
-        DnsServer("def-comodo", "Comodo Secure", "8.26.56.26", "8.20.247.20"),
+        DnsServer("def-comodo", "Comodo Secure", "8.26.56.26", "8.20.247.20", filtered = true),
         DnsServer("def-yandex", "Yandex", "77.88.8.8", "77.88.8.1"),
         DnsServer("def-verisign", "Verisign", "64.6.64.6", "64.6.65.6"),
         DnsServer("def-level3", "Level3", "4.2.2.1", "4.2.2.2"),
         DnsServer("def-dnswatch", "DNS.WATCH", "84.200.69.80", "84.200.70.40"),
-        DnsServer("def-alternate", "Alternate DNS", "76.76.19.19", "76.223.122.150"),
+        DnsServer("def-alternate", "Alternate DNS", "76.76.19.19", "76.223.122.150", filtered = true),
         DnsServer("def-dnssb", "DNS.SB", "185.222.222.222", "45.11.45.11", dot = "dot.sb"),
         DnsServer("def-mullvad", "Mullvad", "194.242.2.2", "", dot = "dns.mullvad.net")
     )

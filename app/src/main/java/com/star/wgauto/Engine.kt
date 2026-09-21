@@ -2,6 +2,7 @@ package com.star.wgauto
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Network
 import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
@@ -31,17 +32,24 @@ import java.util.Locale
 /**
  * محرك الاختيار التلقائي.
  *
- * الفحص يجري في الخلفية بأنفاق تجريبية خاصة بهذا التطبيق وحده (IncludedApplications)،
- * فلا ينقطع اتصال بقية التطبيقات أثناء الفحص. بعد اختيار الأفضل يُثبَّت نفق واحد لكل التطبيقات.
+ * مبادئ التصميم:
+ * 1) لا نُعلن "متصل" إلا بعد دليل: واجهة VPN موجودة فعلاً، ومرور البيانات مربوط بها،
+ *    والـ IP الخارجي تغيّر عن الـ IP المباشر.
+ * 2) الفحص في الخلفية بأنفاق تجريبية خاصة بهذا التطبيق (IncludedApplications) فلا ينقطع اتصال بقية التطبيقات.
+ * 3) القياس بمعايير الجودة المعتمدة: الوسيط والتذبذب والفقد، لا زمن عينة واحدة.
+ * 4) لا يُطبَّق أي تغيير على DNS النظام دون قياس مقارن، ويُتراجع عنه إن تدهور الحل.
  */
 class Engine(ctx: Context, private val store: Store) {
 
     private class Result(
-        val cfg: WgConfig, val mtu: Int, val pathMtu: Int, val dns: DnsServer,
-        val dnsRows: List<DnsRow>, val lat: Int, val mbps: Double?, val score: Double
+        val cfg: WgConfig, val mtu: Int, val pathMtu: Int, val dns: DnsServer?,
+        val dnsRows: List<DnsRow>, val stat: Stat, val mbps: Double?, val score: Double,
+        val exit: ExitInfo?, val mtuRows: List<MtuRow>
     )
 
     private class LastBest(val cfgId: String, val mtu: Int, val pathMtu: Int, val dnsId: String, val time: Long)
+    private class Verified(val vpn: NetUtil.Info, val exit: ExitInfo?, val lat: Int)
+    private class SideScan(val info: SideInfo, val measures: List<Pair<DnsServer, DnsMeasure>>, val sys: Stat?)
 
     private val appCtx = ctx.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -55,7 +63,7 @@ class Engine(ctx: Context, private val store: Store) {
 
     val status = MutableStateFlow(Status())
     val logs = MutableStateFlow<List<String>>(emptyList())
-    val dnsResults = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val dnsResults = MutableStateFlow<Map<String, DnsMeasure>>(emptyMap())
     val netInfo = MutableStateFlow(NetInfo())
     val configResults = MutableStateFlow<Map<String, String>>(emptyMap())
     val report = MutableStateFlow(Report())
@@ -100,6 +108,8 @@ class Engine(ctx: Context, private val store: Store) {
         false
     }
 
+    private fun vpnInfo(): NetUtil.Info? = NetUtil.all(cm).lastOrNull { it.isVpn }
+
     private fun networkLabel(): String = NetUtil.underlying(NetUtil.all(cm))?.label ?: "غير متصل"
 
     // ---------- إدارة الكونفيجات ----------
@@ -137,7 +147,7 @@ class Engine(ctx: Context, private val store: Store) {
         scope.launch {
             netJob?.cancelAndJoin()
             runJob?.cancelAndJoin()
-            mutex.withLock { down() }
+            mutex.withLock { downSafe() }
             status.value = Status(running = false, message = "متوقف")
             report.update { it.copy(progress = "", chosenConfigId = "", chosenDnsId = "") }
             log("تم الإيقاف")
@@ -184,8 +194,13 @@ class Engine(ctx: Context, private val store: Store) {
                     if (!status.value.connected || tunnelIsUp()) return@launch
                     delay(2500)
                     if (status.value.busy || tunnelIsUp()) return@launch
-                    log("⚠ VPN آخر استبدل نفق التطبيق")
-                    status.value = Status(running = false, message = "أوقفه VPN آخر")
+                    if (vpnInfo() != null) {
+                        log("⚠ VPN آخر استبدل نفق التطبيق")
+                        status.value = Status(running = false, message = "أوقفه VPN آخر")
+                    } else {
+                        mutex.withLock { recover("اختفى النفق") }
+                        return@launch
+                    }
                 }
                 if (s.backgroundScan) {
                     scanNetwork(if (hasExternalVpn()) "اكتُشف تشغيل VPN خارجي" else "تغيّرت حالة الـ VPN")
@@ -215,11 +230,11 @@ class Engine(ctx: Context, private val store: Store) {
                     reselect("تبدّل الشبكة إلى $label", allowFast = true)
                 }
                 else -> mutex.withLock {
-                    // نفس نوع الشبكة (تغيّر IP فقط): نتحقق أن الاتصال سليم
-                    val lat = Probes.quickAlive()
+                    // نفس نوع الشبكة (تغيّر IP فقط): نتحقق أن النفق سليم فعلاً
+                    val lat = aliveNow()
                     if (lat != null) {
                         status.update { it.copy(latencyMs = lat) }
-                        log("الاتصال سليم بعد تغيّر الشبكة (${lat}ms)")
+                        log("النفق سليم بعد تغيّر الشبكة (${lat}ms)")
                     } else {
                         recover("تغيّر الشبكة")
                     }
@@ -230,7 +245,14 @@ class Engine(ctx: Context, private val store: Store) {
 
     private fun hasExternalVpn(): Boolean = NetUtil.all(cm).any { it.isVpn } && !tunnelIsUp()
 
-    /** فحص صحة دوري خفيف: لا يقطع النفق ولا يغيّر شيئاً إلا بعد 3 إخفاقات متتالية. */
+    /** مرور حقيقي عبر واجهة الـ VPN (وليس عبر الشبكة الأصلية). null إن لم يوجد نفق أو لم يمر شيء. */
+    private fun aliveNow(): Int? {
+        val v = vpnInfo() ?: return null
+        if (!tunnelIsUp()) return null
+        return Probes.quickAlive(v.network)
+    }
+
+    /** فحص صحة دوري خفيف: يتحقق أن النفق موجود فعلاً وأن البيانات تمر عبره. */
     fun healthCheck() {
         val st = status.value
         if (!st.running || st.busy || !st.connected) return
@@ -240,13 +262,19 @@ class Engine(ctx: Context, private val store: Store) {
                 val s2 = status.value
                 if (!s2.running || s2.busy || !s2.connected) return@withLock
                 if (NetUtil.underlying(NetUtil.all(cm)) == null) return@withLock   // لا شبكة أصلاً
-                val lat = Probes.quickAlive()
+                val v = vpnInfo()
+                if (v == null || !tunnelIsUp()) {
+                    log("⚠ لا توجد واجهة VPN فعلية رغم الحالة «متصل»")
+                    recover("النفق غير موجود")
+                    return@withLock
+                }
+                val lat = Probes.quickAlive(v.network)
                 if (lat != null) {
                     healthFails = 0
                     status.update { it.copy(latencyMs = lat) }
                 } else {
                     healthFails++
-                    log("⚠ الاتصال لا يمر ($healthFails/3)")
+                    log("⚠ لا تمر بيانات عبر النفق ($healthFails/3)")
                     if (healthFails >= 3) {
                         healthFails = 0
                         recover("انقطاع الاتصال")
@@ -256,21 +284,29 @@ class Engine(ctx: Context, private val store: Store) {
         }
     }
 
-    /** يُستدعى داخل القفل: يعيد تشغيل نفس النفق، فإن فشل يجري اختياراً كاملاً. */
+    /** يُستدعى داخل القفل: يعيد بناء نفس النفق مع التحقق، فإن فشل يجري اختياراً كاملاً. */
     private suspend fun recover(reason: String) {
+        if (!tunnelIsUp() && NetUtil.all(cm).any { it.isVpn }) {
+            log("⚠ VPN آخر استلم الاتصال — أوقف التطبيق نفقه")
+            status.value = Status(running = false, message = "أوقفه VPN آخر")
+            return
+        }
         val st = status.value
         val cfg = store.configs.value.firstOrNull { it.id == st.activeConfigId }
         val dns = store.dns.value.firstOrNull { it.id == st.activeDnsId }
-        if (cfg != null && dns != null) {
-            log("إعادة تشغيل النفق ($reason)")
-            if (up(cfg, st.activeMtu, dns.ips(), appOnly = false)) {
-                delay(800)
-                val lat = Probes.quickAlive()
-                if (lat != null) {
-                    status.update { it.copy(latencyMs = lat) }
-                    log("✔ عاد الاتصال")
-                    return
+        if (cfg != null) {
+            log("إعادة بناء النفق ($reason)")
+            val direct = if (st.directIp.isNotEmpty()) ExitInfo(st.directIp, st.directLoc, 0) else null
+            val ver = connectAndVerify(cfg, st.activeMtu, dns?.ips() ?: emptyList(), direct)
+            if (ver != null) {
+                status.update {
+                    it.copy(
+                        latencyMs = ver.lat, exitIp = ver.exit?.ip ?: it.exitIp,
+                        exitLoc = ver.exit?.loc ?: it.exitLoc, vpnIface = ver.vpn.iface
+                    )
                 }
+                log("✔ عاد النفق")
+                return
             }
         }
         try {
@@ -282,18 +318,23 @@ class Engine(ctx: Context, private val store: Store) {
     }
 
     // ---------- فحص الشبكة (مستقل عن أي VPN) ----------
-    private class SideScan(val info: SideInfo, val dns: List<Pair<DnsServer, Int?>>)
-
     /** يفحص جهة واحدة مربوطة بشبكة محددة. mtuIface: واجهة الفحص (روت) أو null للفحص العادي. */
     private suspend fun scanSide(
         n: NetUtil.Info, dnsList: List<DnsServer>, doMtu: Boolean,
-        root: Boolean, mtuIface: String?, vpnSide: Boolean
+        root: Boolean, mtuIface: String?, vpnSide: Boolean, encrypted: Boolean, allowFiltered: Boolean
     ): SideScan {
-        val res = coroutineScope {
-            dnsList.map { d -> async { d to Probes.dnsLatency(d.primary, network = n.network) } }.awaitAll()
+        val (res, sys) = coroutineScope {
+            val sysJob = async { Probes.systemResolveStat(n.network) }
+            val list = dnsList.map { d -> async { d to Probes.dnsMeasure(d, n.network, encrypted) } }.awaitAll()
+            list to sysJob.await()
         }
-        val best = res.filter { it.second != null }.minByOrNull { it.second!! }
-        val lat = Probes.tcpLatency(network = n.network)
+        // الأفضل: أدنى درجة (وسيط + نصف التذبذب + 4×الفقد) بين الخوادم المسموح باختيارها
+        val best = res
+            .filter { allowFiltered || !it.first.filtered }
+            .mapNotNull { (d, m) -> m.best()?.let { Triple(d, it.first, it.second) } }
+            .filter { it.third.loss <= 50 }
+            .minByOrNull { it.third.score }
+        val lat = Probes.tcpStat(n.network, 4)?.median
         currentCoroutineContext().ensureActive()
         val p = if (doMtu) Probes.pathMtu(InetAddress.getByName("1.1.1.1"), root, mtuIface) else null
         val suggested = when {
@@ -304,17 +345,18 @@ class Engine(ctx: Context, private val store: Store) {
         return SideScan(
             SideInfo(
                 label = n.label, iface = n.iface, bestDns = best?.first?.name ?: "—",
-                bestDnsId = best?.first?.id ?: "",
-                dnsMs = best?.second ?: -1, latencyMs = lat ?: -1,
+                bestDnsId = best?.first?.id ?: "", dnsMs = best?.third?.median ?: -1,
+                dnsProto = best?.second ?: "", dnsLoss = best?.third?.loss ?: 100,
+                sysDnsMs = sys?.median ?: -1, latencyMs = lat ?: -1,
                 pathMtu = p ?: 0, suggestedMtu = suggested, ifaceMtu = n.mtu
             ),
-            res
+            res, sys
         )
     }
 
     /**
      * يفحص الجهتين: الشبكة الأصلية مباشرة (متجاوزاً أي VPN)، وشبكة الـ VPN إن وُجد
-     * (تطبيقنا أو تطبيق آخر). ثم يثبّت القيم المثلى بالروت إن فُعّل الخيار.
+     * (تطبيقنا أو تطبيق آخر). ثم يثبّت القيم المثلى بالروت إن فُعّل الخيار وثبت التحسّن قياساً.
      */
     fun scanNetwork(reason: String) {
         if (status.value.busy) return
@@ -343,11 +385,15 @@ class Engine(ctx: Context, private val store: Store) {
                     doMtu = vpn == null || root,
                     root = root,
                     mtuIface = if (vpn == null) null else under.iface,
-                    vpnSide = false
+                    vpnSide = false,
+                    encrypted = s.applyRoot,
+                    allowFiltered = s.allowFilteredDns
                 )
-                dnsResults.value = direct.dns.associate { it.first.id to (it.second ?: -1) }
+                dnsResults.value = direct.measures.associate { it.first.id to it.second }
 
-                val viaVpn = if (vpn != null) scanSide(vpn, dnsList, true, false, null, true) else null
+                val viaVpn = if (vpn != null) {
+                    scanSide(vpn, dnsList, true, false, null, true, false, s.allowFilteredDns)
+                } else null
 
                 netInfo.value = NetInfo(
                     direct = direct.info,
@@ -356,17 +402,22 @@ class Engine(ctx: Context, private val store: Store) {
                     time = SimpleDateFormat("HH:mm", Locale.US).format(Date())
                 )
                 log(
-                    "الأصلية (${direct.info.label}): DNS ${direct.info.bestDns} • MTU ${direct.info.pathMtu}" +
+                    "الأصلية (${direct.info.label}): DNS ${direct.info.bestDns} ${direct.info.dnsMs}ms" +
+                        (if (direct.info.sysDnsMs >= 0) " (الحالي ${direct.info.sysDnsMs}ms)" else "") +
+                        " • MTU ${direct.info.pathMtu}" +
                         (viaVpn?.let { " | VPN ($owner): MTU ${it.info.pathMtu}" } ?: "")
                 )
 
-                if (s.applyRoot) applyValues(direct, viaVpn, owner, vpn?.iface ?: "")
+                if (s.applyRoot) applyValues(direct, viaVpn, owner, vpn?.iface ?: "", under, s.allowFilteredDns)
             }
         }
     }
 
-    // ---------- تثبيت القيم بالروت ----------
-    private fun applyValues(direct: SideScan, viaVpn: SideScan?, owner: String, vpnIface: String) {
+    // ---------- تثبيت القيم بالروت (بعد قياس مقارن، مع تراجع تلقائي) ----------
+    private suspend fun applyValues(
+        direct: SideScan, viaVpn: SideScan?, owner: String, vpnIface: String,
+        under: NetUtil.Info, allowFiltered: Boolean
+    ) {
         // 1) MTU لواجهة VPN خارجي: نخفضه إلى أكبر حزمة تمر فعلاً (لا نرفعه أبداً)
         if (owner == "خارجي" && vpnIface.isNotEmpty() && viaVpn != null && viaVpn.info.pathMtu in 1000..1500) {
             val cur = RootTools.getIfaceMtu(vpnIface)
@@ -378,269 +429,79 @@ class Engine(ctx: Context, private val store: Store) {
                 )
             }
         }
-        // 2) DNS النظام (Private DNS): أسرع خادم يدعم DoT
-        val cand = direct.dns
-            .filter { it.second != null && it.first.dot.isNotEmpty() }
-            .minByOrNull { it.second!! }?.first
-        if (cand != null && store.prefGet("appliedDot") != cand.dot) {
-            if (store.prefGet("prevDnsSaved") == null) {
-                val (mode, spec) = RootTools.getPrivateDns()
-                store.prefPut("prevMode", mode)
-                store.prefPut("prevSpec", spec)
-                store.prefPut("prevDnsSaved", "1")
-            }
-            val ok = RootTools.setPrivateDns(cand.dot)
-            if (ok) store.prefPut("appliedDot", cand.dot)
-            log(if (ok) "✔ DNS النظام: ${cand.name} (${cand.dot})" else "✗ تعذّر ضبط DNS النظام")
+
+        // 2) DNS النظام (Private DNS): خادم DoT مقاس فعلاً وبفقد 0% وأفضل من الحالي بوضوح
+        val cand = direct.measures
+            .filter { allowFiltered || !it.first.filtered }
+            .mapNotNull { (d, m) -> m.dot?.takeIf { it.loss == 0 && d.dot.isNotEmpty() }?.let { d to it } }
+            .minByOrNull { it.second.score }
+        if (cand == null) {
+            log("DNS النظام: لا يوجد خادم DoT مقاس بنجاح كامل — لم يُغيَّر شيء")
+            return
         }
+        val base = direct.sys
+        if (base != null && cand.second.score >= base.score * 0.85) {
+            log("DNS النظام: الحالي (${base.median}ms) قريب من ${cand.first.name} (${cand.second.median}ms) — لم يُغيَّر")
+            return
+        }
+        if (store.prefGet("appliedDot") == cand.first.dot) return
+
+        if (store.prefGet("prevDnsSaved") == null) {
+            val (mode, spec) = RootTools.getPrivateDns()
+            store.prefPut("prevMode", mode)
+            store.prefPut("prevSpec", spec)
+            store.prefPut("prevDnsSaved", "1")
+        }
+        if (!RootTools.setPrivateDns(cand.first.dot)) {
+            log("✗ تعذّر ضبط DNS النظام")
+            return
+        }
+        delay(1500)
+        val after = Probes.systemResolveStat(under.network)
+        if (after == null || after.loss > 25) {
+            log("✗ فشل الحل بعد تطبيق ${cand.first.name} — تراجعتُ عن التغيير")
+            restoreNow()
+        } else {
+            store.prefPut("appliedDot", cand.first.dot)
+            log(
+                "✔ DNS النظام: ${cand.first.name} (${cand.first.dot}) — DoT ${cand.second.median}ms " +
+                    "مقابل الحالي ${base?.median ?: "؟"}ms، وبعد التطبيق ${after.median}ms"
+            )
+        }
+    }
+
+    private fun restoreNow(): Boolean {
+        if (store.prefGet("prevDnsSaved") == null) return true
+        val ok = RootTools.restorePrivateDns(store.prefGet("prevMode") ?: "", store.prefGet("prevSpec") ?: "")
+        store.prefPut("appliedDot", null)
+        store.prefPut("prevDnsSaved", null)
+        return ok
     }
 
     /** يعيد إعداد Private DNS إلى ما كان قبل تدخل التطبيق. */
     fun restoreSystemDns() {
         scope.launch {
-            if (store.prefGet("prevDnsSaved") == null) return@launch
-            val ok = RootTools.restorePrivateDns(store.prefGet("prevMode") ?: "", store.prefGet("prevSpec") ?: "")
-            store.prefPut("appliedDot", null)
-            store.prefPut("prevDnsSaved", null)
-            log(if (ok) "تمت استعادة إعداد DNS الأصلي للنظام" else "تعذّرت استعادة DNS")
+            if (store.prefGet("prevDnsSaved") == null) {
+                log("لا يوجد إعداد DNS سابق محفوظ للاستعادة")
+                return@launch
+            }
+            log(if (restoreNow()) "تمت استعادة إعداد DNS الأصلي للنظام" else "تعذّرت استعادة DNS")
         }
     }
 
+    /** اختبار DNS يدوي: كل الخوادم بالبروتوكولات الثلاثة على الشبكة الأصلية. */
     fun testDnsNow() {
         scope.launch {
+            val under = NetUtil.underlying(NetUtil.all(cm)) ?: return@launch
             val list = store.dns.value
-            val res = list.map { d -> async { d.id to (Probes.dnsLatency(d.primary) ?: -1) } }.awaitAll()
+            val res = coroutineScope {
+                list.map { d -> async { d.id to Probes.dnsMeasure(d, under.network, true) } }.awaitAll()
+            }
             dnsResults.value = res.toMap()
         }
     }
 
-    // ---------- فحص يدوي لكونفيج (بنفق تجريبي، بلا سجل) ----------
-    fun testAll() = testConfigs(store.configs.value.filter { it.enabled }.map { it.id })
-
-    fun testConfigs(ids: List<String>) {
-        if (ids.isEmpty()) return
-        if (status.value.running) {
-            ids.forEach { setResult(it, "سيُفحص عند إعادة الفحص (الـ VPN يعمل)") }
-            return
-        }
-        ids.forEach { setResult(it, "بانتظار الفحص…") }
-        scope.launch {
-            mutex.withLock {
-                if (status.value.running) return@withLock
-                val dns = store.dns.value.filter { it.enabled }.ifEmpty { listOf(Defaults.dns.first()) }.first()
-                for (id in ids) {
-                    val c = store.configs.value.firstOrNull { it.id == id } ?: continue
-                    setResult(id, "جارٍ الفحص…")
-                    val ok = up(c, 1420, dns.ips(), appOnly = true, quiet = true)
-                    val lat = if (ok) Probes.quickAlive() else null
-                    val mbps = if (lat != null) Probes.throughputMbps() else null
-                    setResult(
-                        id,
-                        if (lat == null) "✗ لا يعمل"
-                        else "✓ ${lat}ms • ${mbps?.let { "%.1f".format(it) } ?: "?"}Mbps"
-                    )
-                }
-                down()
-            }
-        }
-    }
-
-    // ---------- الاختيار عند التشغيل ----------
-    private fun readLastBest(label: String): LastBest? {
-        val p = store.prefGet("lastBest_$label")?.split("|") ?: return null
-        if (p.size < 5) return null
-        return LastBest(p[0], p[1].toIntOrNull() ?: return null, p[2].toIntOrNull() ?: 0, p[3], p[4].toLongOrNull() ?: 0L)
-    }
-
-    private fun saveLastBest(label: String, cfgId: String, mtu: Int, pathMtu: Int, dnsId: String) {
-        store.prefPut("lastBest_$label", "$cfgId|$mtu|$pathMtu|$dnsId|${now()}")
-    }
-
-    private fun markConnected(
-        cfg: WgConfig, mtu: Int, pathMtu: Int, dns: DnsServer, dnsRows: List<DnsRow>,
-        lat: Int, mbps: Double?, label: String
-    ) {
-        status.update {
-            it.copy(
-                connected = true, activeConfig = cfg.name, activeConfigId = cfg.id,
-                activeDns = dns.name, activeDnsId = dns.id, activeMtu = mtu,
-                latencyMs = lat, mbps = mbps, message = "متصل"
-            )
-        }
-        report.update {
-            it.copy(
-                chosenConfigId = cfg.id, chosenDnsId = dns.id, chosenMtu = mtu, chosenPathMtu = pathMtu,
-                dnsRows = dnsRows.ifEmpty { it.dnsRows }, progress = "تم الاتصال"
-            )
-        }
-        saveLastBest(label, cfg.id, mtu, pathMtu, dns.id)
-        healthFails = 0
-    }
-
-    private suspend fun selectAndConnect(reason: String, allowFast: Boolean) {
-        val s = store.settings.value
-        val allCfg = store.configs.value.filter { it.enabled }
-        if (allCfg.isEmpty()) {
-            log("لا توجد كونفيجات مفعّلة")
-            status.update { it.copy(connected = false, busy = false, message = "أضف كونفيجاً وفعّله") }
-            return
-        }
-        val dnsAll = store.dns.value.filter { it.enabled }.ifEmpty { listOf(Defaults.dns.first()) }
-        val defDns =
-            if (s.autoDns) dnsAll.first()
-            else store.dns.value.firstOrNull { it.id == s.selDnsId } ?: dnsAll.first()
-        val label = networkLabel()
-
-        status.update { it.copy(busy = true, connected = false, message = "جارٍ الفحص ($reason)…") }
-
-        // ---- مسار سريع: آخر كونفيج نجح على هذا النوع من الشبكات
-        if (allowFast) {
-            val lb = readLastBest(label)
-            val cfg = lb?.let { l -> allCfg.firstOrNull { it.id == l.cfgId } }
-            val dns = lb?.let { l -> store.dns.value.firstOrNull { it.id == l.dnsId } }
-            if (lb != null && cfg != null && dns != null &&
-                now() - lb.time < 6 * 3600 * 1000L && (s.autoConfig || cfg.id == s.selConfigId)
-            ) {
-                setProgress("اتصال سريع: ${cfg.name}")
-                log("اتصال سريع بآخر كونفيج ناجح على $label: ${cfg.name}")
-                if (up(cfg, lb.mtu, dns.ips(), appOnly = false)) {
-                    delay(700)
-                    val lat = Probes.quickAlive()
-                    if (lat != null) {
-                        markConnected(cfg, lb.mtu, lb.pathMtu, dns, emptyList(), lat, null, label)
-                        log("✔ متصل: ${cfg.name} • ${lat}ms — اضغط «فحص وإعادة الاختيار» لإجراء فحص كامل")
-                        return
-                    }
-                }
-                log("✗ فشل الاتصال السريع، سيجري فحص كامل")
-            }
-        }
-
-        val candidates =
-            if (s.autoConfig) allCfg
-            else listOf(allCfg.firstOrNull { it.id == s.selConfigId } ?: allCfg.first())
-
-        report.value = Report(
-            rows = candidates.map { ConfigRow(it.id, it.name) },
-            progress = "الفحص في الخلفية — اتصال بقية التطبيقات لا يتأثر"
-        )
-        log("بدء الفحص: $reason (${candidates.size} كونفيج)")
-        down()
-
-        val defaultMtu =
-            if (s.autoMtu) (netInfo.value.direct?.suggestedMtu?.takeIf { it in 1000..1500 } ?: 1420)
-            else s.selMtu
-
-        // ---- المرحلة أ: فحص سريع لكل كونفيج (هل يمر الاتصال؟ وما التأخر؟)
-        val alive = ArrayList<Pair<WgConfig, Int>>()
-        for ((i, c) in candidates.withIndex()) {
-            currentCoroutineContext().ensureActive()
-            setProgress("فحص سريع ${i + 1}/${candidates.size}: ${c.name}")
-            updateRow(c.id) { it.copy(state = "testing") }
-            if (!up(c, defaultMtu, defDns.ips(), appOnly = true)) {
-                updateRow(c.id) { it.copy(state = "fail", note = "فشل التشغيل") }
-                continue
-            }
-            val lat = Probes.quickAlive()
-            if (lat == null) {
-                updateRow(c.id) { it.copy(state = "fail", note = "لا يمر اتصال") }
-                log("✗ ${c.name}: لا يمر اتصال")
-                continue
-            }
-            updateRow(c.id) { it.copy(state = "ok", latencyMs = lat, mtu = defaultMtu) }
-            log("✓ ${c.name}: ${lat}ms")
-            alive += c to lat
-        }
-        down()
-
-        if (alive.isEmpty()) {
-            setProgress("لم ينجح أي كونفيج")
-            status.update { it.copy(connected = false, message = "لا يوجد كونفيج يعمل — إعادة المحاولة بعد دقيقة") }
-            log("لم ينجح أي كونفيج من ${candidates.size}")
-            return
-        }
-
-        // ---- المرحلة ب: فحص دقيق لأسرع 3 (MTU + DNS + سرعة)
-        val top = alive.sortedBy { it.second }.take(if (s.autoConfig) 3 else 1)
-        val results = ArrayList<Result>()
-        for ((i, pair) in top.withIndex()) {
-            currentCoroutineContext().ensureActive()
-            val c = pair.first
-            setProgress("فحص دقيق ${i + 1}/${top.size}: ${c.name}")
-            down()   // نفحص MTU للخادم مباشرة وبدون نفق
-            val (mtu, pathMtu) = if (s.autoMtu) probeMtu(c, s) else (s.selMtu to 0)
-            if (!up(c, mtu, defDns.ips(), appOnly = true)) continue
-            delay(700)
-            val lat = Probes.tcpLatency() ?: pair.second
-            val (dns, dnsRows) = if (s.autoDns) pickDns(dnsAll) else (defDns to emptyList())
-            val mbps = Probes.throughputMbps()
-            val score = (mbps ?: 0.5) / (1 + lat / 100.0)
-            results += Result(c, mtu, pathMtu, dns, dnsRows, lat, mbps, score)
-            updateRow(c.id) {
-                it.copy(
-                    state = "ok", latencyMs = lat, mbps = mbps, mtu = mtu, pathMtu = pathMtu,
-                    dnsName = dns.name, score = score
-                )
-            }
-            log("★ ${c.name}: ${lat}ms • ${mbps?.let { "%.1f".format(it) } ?: "?"}Mbps • MTU $mtu • ${dns.name}")
-        }
-        down()
-
-        // إن فشلت المرحلة ب لكل المرشحين نعتمد نتائج المرحلة أ
-        val ordered: List<Result> =
-            if (results.isNotEmpty()) results.sortedByDescending { it.score }
-            else alive.sortedBy { it.second }.map {
-                Result(it.first, defaultMtu, 0, defDns, emptyList(), it.second, null, 0.0)
-            }
-
-        // ---- التثبيت: نفق واحد لكل التطبيقات، مع التحقق منه
-        for (r in ordered) {
-            currentCoroutineContext().ensureActive()
-            setProgress("تثبيت الاتصال: ${r.cfg.name}")
-            if (!up(r.cfg, r.mtu, r.dns.ips(), appOnly = false)) continue
-            delay(700)
-            val lat = Probes.quickAlive()
-            if (lat != null) {
-                markConnected(r.cfg, r.mtu, r.pathMtu, r.dns, r.dnsRows, lat, r.mbps, label)
-                log("★ الأفضل: ${r.cfg.name} • MTU ${r.mtu} • ${r.dns.name}")
-                return
-            }
-            log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name}")
-        }
-        down()
-        setProgress("تعذّر تثبيت الاتصال")
-        status.update { it.copy(connected = false, message = "تعذّر تثبيت الاتصال — إعادة المحاولة بعد دقيقة") }
-    }
-
-    /** يعيد (MTU النفق، أقصى حزمة للخادم أو 0). */
-    private fun probeMtu(c: WgConfig, s: AppSettings): Pair<Int, Int> {
-        val ep = Probes.parseEndpoint(c.text) ?: return 1420 to 0
-        val addr = try {
-            InetAddress.getByName(ep.first)
-        } catch (e: Exception) {
-            log("تعذّر حل العنوان ${ep.first}")
-            return 1420 to 0
-        }
-        val p = Probes.pathMtu(addr, s.useRoot)
-        if (p == null) {
-            log("${c.name}: تعذّر فحص MTU، استُخدمت 1420")
-            return 1420 to 0
-        }
-        val m = MtuCatalog.tunnelMtuFromPath(p, addr is Inet6Address)
-        log("${c.name}: أقصى حزمة $p → MTU $m")
-        return m to p
-    }
-
-    private suspend fun pickDns(list: List<DnsServer>): Pair<DnsServer, List<DnsRow>> = coroutineScope {
-        val res = list.map { d -> async(Dispatchers.IO) { d to Probes.dnsLatency(d.primary) } }.awaitAll()
-        dnsResults.value = res.associate { it.first.id to (it.second ?: -1) }
-        val rows = res.map { DnsRow(it.first.id, it.first.name, it.second ?: -1) }
-            .sortedBy { if (it.ms < 0) Int.MAX_VALUE else it.ms }
-        val best = res.filter { it.second != null }.minByOrNull { it.second!! }?.first ?: list.first()
-        best to rows
-    }
-
-    // ---------- التحكم بالنفق ----------
+    // ---------- التحكم بالنفق: رفع وإنزال آمن مع التحقق ----------
     /** appOnly = true: نفق تجريبي خاص بهذا التطبيق فقط (لا يقطع بقية التطبيقات). */
     private fun up(c: WgConfig, mtu: Int?, dns: List<String>, appOnly: Boolean, quiet: Boolean = false): Boolean {
         lastOwnChange = now()
@@ -666,4 +527,354 @@ class Engine(ctx: Context, private val store: Store) {
         }
         lastOwnChange = now()
     }
+
+    /**
+     * ينزل النفق وينتظر زوال واجهة الـ VPN فعلاً. هذا ضروري: رفع نفق جديد قبل اكتمال إغلاق
+     * خدمة الـ VPN السابقة يجعل النظام يهدم النفق الجديد بعد لحظات (نفق «وهمي»).
+     */
+    private suspend fun downSafe() {
+        val wasUp = tunnelIsUp()
+        down()
+        if (wasUp) {
+            val t0 = now()
+            while (now() - t0 < 4000 && NetUtil.all(cm).any { it.isVpn }) delay(150)
+            delay(250)
+        }
+        lastOwnChange = now()
+    }
+
+    private suspend fun waitVpnUp(maxMs: Long = 3500): NetUtil.Info? {
+        val t0 = now()
+        while (now() - t0 < maxMs) {
+            val v = vpnInfo()
+            if (v != null && tunnelIsUp()) return v
+            delay(150)
+        }
+        return null
+    }
+
+    /** يرفع نفقاً ويتأكد أن واجهة VPN أُنشئت فعلاً (بمحاولتين). */
+    private suspend fun bringUp(
+        c: WgConfig, mtu: Int?, dns: List<String>, appOnly: Boolean, quiet: Boolean = false
+    ): NetUtil.Info? {
+        downSafe()
+        for (attempt in 1..2) {
+            if (!up(c, mtu, dns, appOnly, quiet)) return null
+            val v = waitVpnUp()
+            if (v != null) {
+                lastOwnChange = now()
+                return v
+            }
+            if (!quiet) log("⚠ لم تُنشأ واجهة VPN (محاولة $attempt)")
+            downSafe()
+        }
+        return null
+    }
+
+    /** يرفع النفق الكامل ويتحقق: مرور عبر الواجهة + تغيّر الـ IP الخارجي عن المباشر. */
+    private suspend fun connectAndVerify(cfg: WgConfig, mtu: Int?, dns: List<String>, direct: ExitInfo?): Verified? {
+        val v = bringUp(cfg, mtu, dns, appOnly = false) ?: return null
+        delay(400)
+        val lat = Probes.quickAlive(v.network) ?: run {
+            log("✗ لا تمر بيانات عبر النفق")
+            return null
+        }
+        val exit = Probes.exitInfo(v.network)
+        if (exit != null && direct != null && exit.ip == direct.ip) {
+            log("✗ الـ IP لم يتغيّر (${exit.ip}) — النفق لا يحمل الحركة")
+            return null
+        }
+        return Verified(v, exit, lat)
+    }
+
+    // ---------- فحص يدوي لكونفيج (بنفق تجريبي، بلا سجل) ----------
+    fun testAll() = testConfigs(store.configs.value.filter { it.enabled }.map { it.id })
+
+    fun testConfigs(ids: List<String>) {
+        if (ids.isEmpty()) return
+        if (status.value.running) {
+            ids.forEach { setResult(it, "سيُفحص عند إعادة الفحص (الـ VPN يعمل)") }
+            return
+        }
+        ids.forEach { setResult(it, "بانتظار الفحص…") }
+        scope.launch {
+            mutex.withLock {
+                if (status.value.running) return@withLock
+                val dns = store.dns.value.filter { it.enabled && !it.filtered }.firstOrNull()
+                for (id in ids) {
+                    val c = store.configs.value.firstOrNull { it.id == id } ?: continue
+                    setResult(id, "جارٍ الفحص…")
+                    val v = bringUp(c, 1420, dns?.ips() ?: emptyList(), appOnly = true, quiet = true)
+                    val st = v?.let { Probes.tcpStat(it.network, 6) }
+                    val exit = v?.let { Probes.exitInfo(it.network) }
+                    val mbps = if (st != null) v?.let { Probes.throughputMbps(network = it.network) } else null
+                    setResult(
+                        id,
+                        if (st == null) "✗ لا يعمل"
+                        else "✓ ${st.median}ms ±${st.jitter} • فقد ${st.loss}% • " +
+                            "${mbps?.let { "%.1f".format(it) } ?: "?"}Mbps" +
+                            (exit?.let { " • ${it.ip} ${it.loc}" } ?: "")
+                    )
+                }
+                downSafe()
+            }
+        }
+    }
+
+    // ---------- الاختيار عند التشغيل ----------
+    private fun readLastBest(label: String): LastBest? {
+        val p = store.prefGet("lastBest_$label")?.split("|") ?: return null
+        if (p.size < 5) return null
+        return LastBest(p[0], p[1].toIntOrNull() ?: return null, p[2].toIntOrNull() ?: 0, p[3], p[4].toLongOrNull() ?: 0L)
+    }
+
+    private fun saveLastBest(label: String, cfgId: String, mtu: Int, pathMtu: Int, dnsId: String) {
+        store.prefPut("lastBest_$label", "$cfgId|$mtu|$pathMtu|$dnsId|${now()}")
+    }
+
+    private fun markConnected(
+        cfg: WgConfig, mtu: Int, pathMtu: Int, dns: DnsServer?, dnsRows: List<DnsRow>,
+        ver: Verified, mbps: Double?, label: String, direct: ExitInfo?, mtuRows: List<MtuRow>
+    ) {
+        val verified = ver.exit != null && direct != null && ver.exit.ip != direct.ip
+        status.update {
+            it.copy(
+                connected = true, activeConfig = cfg.name, activeConfigId = cfg.id,
+                activeDns = dns?.name ?: "حسب الكونفيج", activeDnsId = dns?.id,
+                activeMtu = mtu, latencyMs = ver.lat, mbps = mbps,
+                message = if (verified) "متصل ✔ (تم التحقق من الـ IP)" else "متصل (لم يُتحقق من الـ IP)",
+                verified = verified, exitIp = ver.exit?.ip ?: "", exitLoc = ver.exit?.loc ?: "",
+                directIp = direct?.ip ?: "", directLoc = direct?.loc ?: "", vpnIface = ver.vpn.iface
+            )
+        }
+        report.update {
+            it.copy(
+                chosenConfigId = cfg.id, chosenDnsId = dns?.id ?: "", chosenDnsProto = "UDP",
+                chosenMtu = mtu, chosenPathMtu = pathMtu,
+                dnsRows = dnsRows.ifEmpty { it.dnsRows },
+                mtuRows = mtuRows.ifEmpty { it.mtuRows }, progress = "تم الاتصال"
+            )
+        }
+        saveLastBest(label, cfg.id, mtu, pathMtu, dns?.id ?: "")
+        healthFails = 0
+    }
+
+    private suspend fun selectAndConnect(reason: String, allowFast: Boolean) {
+        val s = store.settings.value
+        val allCfg = store.configs.value.filter { it.enabled }
+        if (allCfg.isEmpty()) {
+            log("لا توجد كونفيجات مفعّلة")
+            status.update { it.copy(connected = false, busy = false, message = "أضف كونفيجاً وفعّله") }
+            return
+        }
+        // خوادم DNS المسموح باختيارها تلقائياً (المُرشِّحة/الحاجبة تحتاج إذناً صريحاً)
+        val dnsAll = store.dns.value.filter { it.enabled && (!it.filtered || s.allowFilteredDns) }
+        val defDns: DnsServer? =
+            if (s.autoDns) null else store.dns.value.firstOrNull { it.id == s.selDnsId }
+        val testDns: DnsServer? = defDns ?: dnsAll.firstOrNull()
+        val label = networkLabel()
+        val under = NetUtil.underlying(NetUtil.all(cm))
+
+        status.update { it.copy(busy = true, connected = false, message = "جارٍ الفحص ($reason)…") }
+
+        // الـ IP المباشر (مرجع التحقق): عبر الشبكة الأصلية متجاوزاً أي نفق
+        val direct = under?.let { Probes.exitInfo(it.network) }
+        if (direct != null) status.update { it.copy(directIp = direct.ip, directLoc = direct.loc) }
+
+        // ---- مسار سريع: آخر كونفيج نجح على هذا النوع من الشبكات
+        if (allowFast) {
+            val lb = readLastBest(label)
+            val cfg = lb?.let { l -> allCfg.firstOrNull { it.id == l.cfgId } }
+            val dns = lb?.let { l -> store.dns.value.firstOrNull { it.id == l.dnsId } }
+            if (lb != null && cfg != null && now() - lb.time < 6 * 3600 * 1000L &&
+                (s.autoConfig || cfg.id == s.selConfigId)
+            ) {
+                setProgress("اتصال سريع: ${cfg.name}")
+                log("اتصال سريع بآخر كونفيج ناجح على $label: ${cfg.name}")
+                val ver = connectAndVerify(cfg, lb.mtu, dns?.ips() ?: emptyList(), direct)
+                if (ver != null) {
+                    markConnected(cfg, lb.mtu, lb.pathMtu, dns, emptyList(), ver, null, label, direct, emptyList())
+                    log("✔ متصل: ${cfg.name} • IP ${ver.exit?.ip ?: "؟"} ${ver.exit?.loc ?: ""} — اضغط «فحص وإعادة الاختيار» لفحص كامل")
+                    return
+                }
+                log("✗ فشل الاتصال السريع، سيجري فحص كامل")
+            }
+        }
+
+        val candidates =
+            if (s.autoConfig) allCfg
+            else listOf(allCfg.firstOrNull { it.id == s.selConfigId } ?: allCfg.first())
+
+        report.value = Report(
+            rows = candidates.map { ConfigRow(it.id, it.name) },
+            progress = "الفحص في الخلفية — اتصال بقية التطبيقات لا يتأثر"
+        )
+        log("بدء الفحص: $reason (${candidates.size} كونفيج)")
+        downSafe()
+
+        val defaultMtu =
+            if (s.autoMtu) 1420 else s.selMtu
+
+        // ---- المرحلة أ: فحص سريع (هل تمر بيانات فعلاً عبر واجهة النفق؟ وما التأخر؟)
+        val alive = ArrayList<Pair<WgConfig, Int>>()
+        for ((i, c) in candidates.withIndex()) {
+            currentCoroutineContext().ensureActive()
+            setProgress("فحص سريع ${i + 1}/${candidates.size}: ${c.name}")
+            updateRow(c.id) { it.copy(state = "testing") }
+            val v = bringUp(c, defaultMtu, testDns?.ips() ?: emptyList(), appOnly = true)
+            if (v == null) {
+                updateRow(c.id) { it.copy(state = "fail", note = "لم تُنشأ واجهة النفق") }
+                log("✗ ${c.name}: لم تُنشأ واجهة النفق")
+                continue
+            }
+            val lat = Probes.quickAlive(v.network)
+            if (lat == null) {
+                updateRow(c.id) { it.copy(state = "fail", note = "لا تمر بيانات (الخادم لا يستجيب)") }
+                log("✗ ${c.name}: لا تمر بيانات عبر النفق")
+                continue
+            }
+            updateRow(c.id) { it.copy(state = "ok", latencyMs = lat, mtu = defaultMtu) }
+            log("✓ ${c.name}: ${lat}ms")
+            alive += c to lat
+        }
+        downSafe()
+
+        if (alive.isEmpty()) {
+            setProgress("لم ينجح أي كونفيج")
+            status.update { it.copy(connected = false, message = "لا يوجد كونفيج يعمل — إعادة المحاولة بعد دقيقة") }
+            log("لم ينجح أي كونفيج من ${candidates.size}")
+            return
+        }
+
+        // ---- المرحلة ب: فحص دقيق لأسرع 3 (جودة TCP: وسيط/تذبذب/فقد + IP + DNS + سرعة)
+        val top = alive.sortedBy { it.second }.take(if (s.autoConfig) 3 else 1)
+        val results = ArrayList<Result>()
+        for ((i, pair) in top.withIndex()) {
+            currentCoroutineContext().ensureActive()
+            val c = pair.first
+            setProgress("فحص دقيق ${i + 1}/${top.size}: ${c.name}")
+            downSafe()   // نفحص MTU للخادم مباشرة وبدون نفق
+            val (mtu, pathMtu) = if (s.autoMtu) probeMtu(c, s) else (s.selMtu to 0)
+            val v = bringUp(c, mtu, testDns?.ips() ?: emptyList(), appOnly = true) ?: continue
+            val st = Probes.tcpStat(v.network, 6)
+            if (st == null) {
+                updateRow(c.id) { it.copy(state = "fail", note = "انقطع أثناء الفحص الدقيق") }
+                continue
+            }
+            val exit = Probes.exitInfo(v.network)
+            if (exit != null && direct != null && exit.ip == direct.ip) {
+                updateRow(c.id) { it.copy(state = "fail", note = "الـ IP لم يتغيّر — لا يحمل الحركة") }
+                log("✗ ${c.name}: الـ IP الخارجي ${exit.ip} نفس المباشر (نفق وهمي)")
+                continue
+            }
+            val (dns, dnsRows) = if (s.autoDns) pickDns(dnsAll, v.network) else (defDns to emptyList())
+            val mbps = Probes.throughputMbps(network = v.network)
+            val score = (mbps ?: 0.5) / (1 + st.score / 100.0)
+            results += Result(c, mtu, pathMtu, dns, dnsRows, st, mbps, score, exit, emptyList())
+            updateRow(c.id) {
+                it.copy(
+                    state = "ok", latencyMs = st.median, jitter = st.jitter, loss = st.loss, mbps = mbps,
+                    mtu = mtu, pathMtu = pathMtu, dnsName = dns?.name ?: "", score = score,
+                    exitIp = exit?.ip ?: "", exitLoc = exit?.loc ?: ""
+                )
+            }
+            log(
+                "★ ${c.name}: ${st.median}ms ±${st.jitter} • فقد ${st.loss}% • " +
+                    "${mbps?.let { "%.1f".format(it) } ?: "?"}Mbps • ${exit?.ip ?: "؟"} ${exit?.loc ?: ""}"
+            )
+        }
+        downSafe()
+
+        if (results.isEmpty()) {
+            setProgress("فشل الفحص الدقيق لكل المرشحين")
+            status.update { it.copy(connected = false, message = "لا يوجد كونفيج يحمل الحركة فعلاً — إعادة المحاولة بعد دقيقة") }
+            log("لم ينجح أي كونفيج في الفحص الدقيق (تحقق الـ IP/الجودة)")
+            return
+        }
+        var ordered = results.sortedByDescending { it.score }
+
+        // ---- المرحلة ج: ضبط MTU تجريبياً على الفائز (سرعة فعلية لكل قيمة)
+        if (s.autoMtu) {
+            val w = ordered.first()
+            setProgress("ضبط MTU للكونفيج ${w.cfg.name}")
+            val (bestMtu, rows) = tuneMtu(w, testDns)
+            if (rows.isNotEmpty()) {
+                ordered = listOf(
+                    Result(w.cfg, bestMtu, w.pathMtu, w.dns, w.dnsRows, w.stat, w.mbps, w.score, w.exit, rows)
+                ) + ordered.drop(1)
+                updateRow(w.cfg.id) { it.copy(mtu = bestMtu) }
+            }
+        }
+
+        // ---- التثبيت: نفق واحد لكل التطبيقات، مع التحقق منه
+        for (r in ordered) {
+            currentCoroutineContext().ensureActive()
+            setProgress("تثبيت الاتصال: ${r.cfg.name}")
+            val ver = connectAndVerify(r.cfg, r.mtu, r.dns?.ips() ?: emptyList(), direct)
+            if (ver != null) {
+                markConnected(r.cfg, r.mtu, r.pathMtu, r.dns, r.dnsRows, ver, r.mbps, label, direct, r.mtuRows)
+                log("★ الأفضل: ${r.cfg.name} • MTU ${r.mtu} • DNS ${r.dns?.name ?: "حسب الكونفيج"} • IP ${ver.exit?.ip ?: "؟"}")
+                return
+            }
+            log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name}")
+        }
+        downSafe()
+        setProgress("تعذّر تثبيت الاتصال")
+        status.update { it.copy(connected = false, message = "تعذّر تثبيت الاتصال — إعادة المحاولة بعد دقيقة") }
+    }
+
+    /**
+     * ضبط MTU تجريبياً: نجرّب قيماً معيارية ونقيس السرعة الفعلية عبر النفق لكل منها،
+     * ثم نختار الأعلى MTU بين ما يقارب أفضل سرعة (±8%). فحص ICMP وحده متحيّز نحو قيم أقل من اللازم.
+     */
+    private suspend fun tuneMtu(r: Result, dns: DnsServer?): Pair<Int, List<MtuRow>> {
+        val cands = listOf(1420, 1380, 1340, 1280, r.mtu).filter { it in 1000..1500 }.distinct()
+            .sortedDescending().take(4)
+        val rows = ArrayList<MtuRow>()
+        for (m in cands) {
+            currentCoroutineContext().ensureActive()
+            val v = bringUp(r.cfg, m, dns?.ips() ?: emptyList(), appOnly = true, quiet = true)
+            val mbps = v?.let { Probes.throughputMbps(4000, it.network) }
+            rows += MtuRow(m, mbps)
+            log("MTU $m: ${mbps?.let { "%.1f".format(it) } ?: "فشل"} Mbps")
+        }
+        downSafe()
+        val best = rows.mapNotNull { it.mbps }.maxOrNull() ?: return r.mtu to emptyList()
+        val chosen = rows.filter { (it.mbps ?: 0.0) >= best * 0.92 }.maxOf { it.mtu }
+        return chosen to rows
+    }
+
+    /** يعيد (MTU النفق، أقصى حزمة للخادم أو 0). قيمة أولية تُصحَّح لاحقاً بالتجربة. */
+    private fun probeMtu(c: WgConfig, s: AppSettings): Pair<Int, Int> {
+        val ep = Probes.parseEndpoint(c.text) ?: return 1420 to 0
+        val addr = try {
+            InetAddress.getByName(ep.first)
+        } catch (e: Exception) {
+            log("تعذّر حل العنوان ${ep.first}")
+            return 1420 to 0
+        }
+        val p = Probes.pathMtu(addr, s.useRoot)
+        if (p == null) {
+            log("${c.name}: تعذّر فحص MTU بـ ICMP، استُخدمت 1420")
+            return 1420 to 0
+        }
+        val m = MtuCatalog.tunnelMtuFromPath(p, addr is Inet6Address)
+        log("${c.name}: أقصى حزمة ICMP $p → MTU مبدئي $m")
+        return m to p
+    }
+
+    /** يقيس DNS عبر النفق نفسه (UDP، وهو ما يستخدمه WireGuard) ويختار الأفضل بالوسيط والتذبذب والفقد. */
+    private suspend fun pickDns(list: List<DnsServer>, network: Network?): Pair<DnsServer?, List<DnsRow>> =
+        coroutineScope {
+            val res = list.map { d -> async(Dispatchers.IO) { d to Probes.dnsMeasure(d, network, false) } }.awaitAll()
+            dnsResults.value = dnsResults.value + res.associate { it.first.id to it.second }
+            val rows = res
+                .sortedBy { it.second.udp?.score ?: Int.MAX_VALUE }
+                .map { (d, m) ->
+                    DnsRow(d.id, d.name, m.udp?.median ?: -1, "UDP", m.udp?.jitter ?: 0, m.udp?.loss ?: 100)
+                }
+            val best = res.filter { (it.second.udp?.loss ?: 100) <= 50 }
+                .minByOrNull { it.second.udp?.score ?: Int.MAX_VALUE }?.first
+            best to rows
+        }
 }
