@@ -299,33 +299,103 @@ object Probes {
         return best
     }
 
-    // ---------- الـ IP الخارجي (دليل أن النفق حقيقي) ----------
-    fun exitInfo(network: Network?): ExitInfo? {
-        val urls = listOf(
+    // ---------- الـ IP الخارجي (دليل أن النفق حقيقي) + أخطاء صريحة ----------
+    private fun errText(e: Exception): String =
+        e.javaClass.simpleName + (e.message?.let { ": " + it.take(45) } ?: "")
+
+    /** طلب HTTPS إلى صفحة trace. يعيد المعلومات أو نص الخطأ الفعلي (مهلة/رفض/مصافحة...). */
+    private fun httpTrace(u: String, network: Network?, timeoutMs: Int = 3500): Pair<ExitInfo?, String> = try {
+        val url = URL(u)
+        val c = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+        c.connectTimeout = timeoutMs
+        c.readTimeout = timeoutMs
+        val t0 = System.nanoTime()
+        val text = c.inputStream.bufferedReader().use { it.readText() }
+        val ms = ((System.nanoTime() - t0) / 1_000_000).toInt()
+        c.disconnect()
+        val map = text.lines()
+            .mapNotNull { l -> l.split("=", limit = 2).takeIf { it.size == 2 } }
+            .associate { it[0].trim() to it[1].trim() }
+        val ip = map["ip"] ?: text.trim().takeIf { ipRe.matches(it) }
+        if (ip != null) Pair(ExitInfo(ip, map["loc"] ?: "", ms), "") else Pair(null, "رد غير متوقع")
+    } catch (e: Exception) {
+        Pair(null, errText(e))
+    }
+
+    /** fast=true: محاولة واحدة سريعة (تُستخدم أثناء تجربة قيم MTU). fast=false: يجرّب عدة خدمات. */
+    fun exitInfo(network: Network?, fast: Boolean = false): ExitInfo? {
+        val urls = if (fast) listOf("https://1.1.1.1/cdn-cgi/trace") else listOf(
             "https://1.1.1.1/cdn-cgi/trace",
             "https://www.cloudflare.com/cdn-cgi/trace",
             "https://api64.ipify.org"
         )
+        for (u in urls) httpTrace(u, network, if (fast) 2500 else 3500).first?.let { return it }
+        return null
+    }
+
+    /**
+     * فحص تصفّح عام: يحاول تحميل صفحة من نطاق مختلف تماماً عن نطاقات التحقق (Cloudflare/Google)
+     * ليكشف حالة شائعة مع الخوادم المجانية/المشتركة: تمرّ الحزم الصغيرة (DNS وTCP وحتى Cloudflare)
+     * بينما تحجب بعض المواقع الأخرى IP الخروج نفسه بصفته عنوان VPN معروفاً.
+     */
+    fun generalBrowsingOk(network: Network?): Boolean =
+        httpTrace("https://www.wikipedia.org", network, 4000).first != null ||
+            httpsFetchOk(network, 4000)
+
+    /** فحص تصفّح سريع عبر النفق: HTTPS بالعنوان المباشر. */
+    fun httpsAlive(network: Network?): Int? = httpTrace("https://1.1.1.1/cdn-cgi/trace", network, 3000).first?.ms
+
+    /** حلّ اسم فعلي عبر DNS الخاص بالشبكة/النفق (ما تستخدمه التطبيقات فعلاً). */
+    private fun resolveOnce(network: Network?, name: String): Pair<Int?, String> {
+        val out = AtomicLong(-1)
+        var err = "مهلة"
+        val th = Thread {
+            val t0 = System.nanoTime()
+            try {
+                if (network != null) network.getAllByName(name) else InetAddress.getAllByName(name)
+                out.set((System.nanoTime() - t0) / 1_000_000)
+            } catch (e: Exception) {
+                err = errText(e)
+            }
+        }
+        th.start()
+        th.join(3500)
+        return if (out.get() >= 0) Pair(out.get().toInt(), "") else Pair(null, err)
+    }
+
+    /** حزمة IP بحجم معيّن بدون تجزئة عبر المسار الافتراضي (يمرّ بالنفق إن كان هو الافتراضي لهذا التطبيق). */
+    fun dfPing(size: Int): Boolean? = ping("1.1.1.1", size, false, false, null)
+
+    fun diagnose(network: Network?): Diag {
+        val tcp = connectTime("1.1.1.1", 443, 2000, network) ?: connectTime("8.8.8.8", 443, 2000, network)
+        val (dnsMs, dnsErr) = resolveOnce(network, "www.cloudflare.com")
+        val ip = httpTrace("https://1.1.1.1/cdn-cgi/trace", network)
+        val nm = if (dnsMs != null) httpTrace("https://www.cloudflare.com/cdn-cgi/trace", network)
+        else Pair<ExitInfo?, String>(null, "لا DNS")
+        return Diag(tcp, dnsMs, dnsErr, ip.first, ip.second, nm.first != null, nm.second, dfPing(1280))
+    }
+
+    /**
+     * تحقّق حقيقي: طلب صفحة HTTPS كاملة (وليس مجرد اتصال أو أول بايتات).
+     * هذا يكشف اختناق أو حجب الحزم الكبيرة عند قيم MTU منخفضة، وهو ما لا يظهره فحص DNS أو TCP وحدهما.
+     */
+    fun httpsFetchOk(network: Network?, timeoutMs: Int = 5000): Boolean {
+        val urls = listOf("https://www.gstatic.com/generate_204", "https://cp.cloudflare.com/generate_204")
         for (u in urls) {
             try {
                 val url = URL(u)
                 val c = (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
-                c.connectTimeout = 3500
-                c.readTimeout = 3500
-                val t0 = System.nanoTime()
-                val text = c.inputStream.bufferedReader().use { it.readText() }
-                val ms = ((System.nanoTime() - t0) / 1_000_000).toInt()
+                c.connectTimeout = timeoutMs
+                c.readTimeout = timeoutMs
+                val code = c.responseCode
+                val ok = code in 200..399
                 c.disconnect()
-                val map = text.lines()
-                    .mapNotNull { l -> l.split("=", limit = 2).takeIf { it.size == 2 } }
-                    .associate { it[0].trim() to it[1].trim() }
-                val ip = map["ip"] ?: text.trim().takeIf { ipRe.matches(it) } ?: continue
-                return ExitInfo(ip, map["loc"] ?: "", ms)
+                if (ok) return true
             } catch (e: Exception) {
-                // نجرّب الوجهة التالية
+                // نجرّب الرابط التالي
             }
         }
-        return null
+        return false
     }
 
     // ---------- السرعة ----------
@@ -399,7 +469,7 @@ object Probes {
         for (root in modes) {
             val first = ping(host, 1000, v6, root, iface) ?: continue
             if (!first) continue
-            var lo = 1000
+            var lo = 576
             var hi = 1500
             while (lo < hi) {
                 val mid = (lo + hi + 1) / 2

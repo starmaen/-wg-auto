@@ -45,4 +45,16 @@ object ConfigText {
         if (section == "interface") inject()
         return out.toString()
     }
+
+    /** يستخرج قيمة MTU المكتوبة في الكونفيج نفسها إن وُجدت. */
+    fun configuredMtu(text: String): Int? {
+        for (raw in text.lines()) {
+            val line = raw.substringBefore('#').trim()
+            if (line.substringBefore("=").trim().equals("mtu", ignoreCase = true)) {
+                return line.substringAfter("=").trim().toIntOrNull()
+            }
+        }
+        return null
+    }
 }
+

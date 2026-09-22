@@ -55,7 +55,8 @@ data class Status(
     val exitLoc: String = "",
     val directIp: String = "",
     val directLoc: String = "",
-    val vpnIface: String = ""
+    val vpnIface: String = "",
+    val diag: String = ""
 )
 
 /** نتيجة فحص جهة واحدة (الشبكة الأصلية أو شبكة الـ VPN). */
@@ -121,6 +122,42 @@ data class DnsMeasure(val udp: Stat? = null, val dot: Stat? = null, val doh: Sta
 
 data class ExitInfo(val ip: String, val loc: String, val ms: Int)
 
+/**
+ * تشخيص النفق طبقة بطبقة (مثل أدوات فحص الشبكة المعتمدة):
+ * TCP → DNS → HTTPS بالعنوان → HTTPS بالاسم → حزمة كبيرة بدون تجزئة.
+ * النفق «صالح للتصفح» فقط إذا نجحت TCP وDNS وHTTPS بالعنوان.
+ */
+data class Diag(
+    val tcpMs: Int?,
+    val dnsMs: Int?,
+    val dnsErr: String,
+    val ipHttps: ExitInfo?,
+    val ipHttpsErr: String,
+    val nameHttps: Boolean,
+    val nameHttpsErr: String,
+    val bigPing: Boolean?
+) {
+    val usable: Boolean get() = tcpMs != null && dnsMs != null && ipHttps != null
+
+    fun summary(): String = buildString {
+        append(if (tcpMs != null) "TCP ✔ ${tcpMs}ms" else "TCP ✘")
+        append("\n")
+        append(if (dnsMs != null) "DNS ✔ ${dnsMs}ms" else "DNS ✘ ($dnsErr)")
+        append("\n")
+        append(if (ipHttps != null) "HTTPS/عنوان ✔ ${ipHttps.ms}ms" else "HTTPS/عنوان ✘ ($ipHttpsErr)")
+        append("\n")
+        append(if (nameHttps) "HTTPS/اسم ✔" else "HTTPS/اسم ✘ ($nameHttpsErr)")
+        append("\n")
+        append(
+            when (bigPing) {
+                true -> "حزمة 1280 بلا تجزئة ✔"
+                false -> "حزمة 1280 بلا تجزئة ✘"
+                null -> "حزمة 1280: لم تُفحص"
+            }
+        )
+    }
+}
+
 /** تقرير الفحص الظاهر في الواجهة الرئيسية. */
 data class Report(
     val rows: List<ConfigRow> = emptyList(),
@@ -159,7 +196,7 @@ object Defaults {
 /** قيم MTU من 1000 إلى 1500 بخطوة 10، مع القيم التقنية المعروفة. */
 object MtuCatalog {
     private val notes = mapOf(
-        1000 to "حد أدنى تجريبي",
+        1000 to "⚠ أقل من 1280 يكسر IPv6 وQUIC (تجريبي)",
         1280 to "الحد الأدنى لـ IPv6 (RFC 8200)",
         1400 to "آمن للشبكات الخلوية",
         1412 to "WireGuard فوق PPPoE (IPv6) = 1492-80",
@@ -174,9 +211,9 @@ object MtuCatalog {
     val values: List<Int> =
         ((1000..1500 step 10).toList() + listOf(1412, 1432, 1492)).distinct().sorted()
 
-    fun label(v: Int): String = notes[v]?.let { "$v — $it" } ?: v.toString()
+    fun label(v: Int): String = notes[v]?.let { "$v — $it" } ?: if (v < 1280) "$v ⚠" else v.toString()
 
     /** WireGuard يضيف 60 بايت (IPv4) أو 80 بايت (IPv6) فوق الحزمة. */
     fun tunnelMtuFromPath(pathMtu: Int, ipv6: Boolean): Int =
-        (pathMtu - if (ipv6) 80 else 60).coerceIn(1000, 1500)
+        (pathMtu - if (ipv6) 80 else 60).coerceIn(576, 1500)
 }

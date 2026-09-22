@@ -350,13 +350,12 @@ fun ResultsCard(rep: Report, st: Status) {
                 HorizontalDivider()
                 Text("MTU المختار: ${rep.chosenMtu}", fontWeight = FontWeight.Bold)
                 Text(
-                    if (rep.chosenPathMtu > 0)
-                        "أقصى حزمة تصل للخادم ${rep.chosenPathMtu} − ${rep.chosenPathMtu - rep.chosenMtu} (رأس WireGuard) = ${rep.chosenMtu}"
-                    else "قيمة افتراضية/يدوية (لم يُقَس مسار الخادم)",
+                    "اختير بالتجربة الفعلية: أعلى MTU تمرّ عبره مصافحة HTTPS بنجاح وتبقى سرعته ≥ 92% من القيمة الآمنة " +
+                        "(لا نعتمد على ICMP لأنه يعطي أرقاماً أقل من الحقيقة في كثير من الشبكات).",
                     fontSize = 12.sp
                 )
                 if (rep.mtuRows.isNotEmpty()) {
-                    Text("تجربة فعلية (سرعة عبر النفق لكل MTU):", fontSize = 12.sp)
+                    Text("نتائج التجربة (سرعة عبر النفق لكل MTU، «فشل» = لا يمر HTTPS):", fontSize = 12.sp)
                     rep.mtuRows.forEach { m ->
                         Text(
                             "  MTU ${m.mtu}: " + (m.mbps?.let { "%.1f Mbps".format(it) } ?: "فشل") +
@@ -426,6 +425,7 @@ fun HomeTab(app: WgApp, a: Actions) {
                     if (st.mbps != null) Text("السرعة: ${"%.1f Mbps".format(st.mbps)}")
                     HorizontalDivider()
                     Text("دليل أن النفق حقيقي", fontWeight = FontWeight.Bold)
+                    if (st.diag.isNotEmpty()) Text(st.diag, fontSize = 13.sp)
                     if (st.vpnIface.isNotEmpty()) Text("واجهة VPN: ${st.vpnIface}", fontSize = 13.sp)
                     if (st.exitIp.isNotEmpty()) Text("IP عبر النفق: ${st.exitIp} ${st.exitLoc}", fontSize = 13.sp)
                     if (st.directIp.isNotEmpty()) Text("IP المباشر: ${st.directIp} ${st.directLoc}", fontSize = 13.sp)
