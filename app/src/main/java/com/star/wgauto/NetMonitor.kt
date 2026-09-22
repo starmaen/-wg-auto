@@ -71,7 +71,7 @@ class NetMonitor(ctx: Context, private val onChange: (String) -> Unit) {
 
     private fun signatures(): Pair<String, String> {
         val nets = NetUtil.all(cm)
-        val under = nets.filter { !it.isVpn }.map { "${it.label}:${it.ips}" }.sorted().joinToString("|")
+        val under = nets.filter { !it.isVpn }.map { "${it.label}:${it.ips}:${it.hasProxy}" }.sorted().joinToString("|")
         val vpn = nets.filter { it.isVpn }.map { it.iface }.sorted().joinToString("|")
         return under to vpn
     }

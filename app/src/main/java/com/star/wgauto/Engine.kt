@@ -79,6 +79,10 @@ class Engine(ctx: Context, private val store: Store) {
     private var healthFails = 0
     private var lastNetLabel = ""
 
+    /** حالة قاطع الطوارئ الفعلية (مستقلة عن الـ Status لتفادي تسرّبها عند إعادة ضبط الحالة). */
+    @Volatile
+    private var killSwitchApplied = false
+
     /** وقت آخر تغيير أجراه التطبيق نفسه على النفق، لتجاهل أحداث الشبكة الناتجة عنه. */
     @Volatile
     private var lastOwnChange = 0L
@@ -145,6 +149,16 @@ class Engine(ctx: Context, private val store: Store) {
         healthFails = 0
         lastNetLabel = networkLabel()
         status.value = Status(running = true, busy = true, message = "جارٍ الفحص…")
+        if (store.settings.value.killSwitch) {
+            scope.launch {
+                if (RootTools.killSwitchEnable()) {
+                    killSwitchApplied = true
+                    status.update { it.copy(killSwitchOn = true) }
+                } else {
+                    log("✗ تعذّر تفعيل قاطع الطوارئ (يتطلب روت)")
+                }
+            }
+        }
         reselect("تشغيل", allowFast = true)
     }
 
@@ -153,10 +167,40 @@ class Engine(ctx: Context, private val store: Store) {
             netJob?.cancelAndJoin()
             runJob?.cancelAndJoin()
             mutex.withLock { downSafe() }
+            if (killSwitchApplied) {
+                RootTools.killSwitchDisable()
+                killSwitchApplied = false
+            }
             status.value = Status(running = false, message = "متوقف")
             report.update { it.copy(progress = "", chosenConfigId = "", chosenDnsId = "") }
             log("تم الإيقاف")
             if (store.settings.value.backgroundScan) scanNetwork("بعد الإيقاف")
+        }
+    }
+
+    /**
+     * إغلاق شامل نهائي: إيقاف النفق، إلغاء قاطع الطوارئ، إيقاف الفحص الدوري في الخلفية،
+     * واستعادة DNS الخاص للنظام إلى ما كان عليه قبل أي تدخّل من التطبيق.
+     */
+    fun shutdownAll(onDone: () -> Unit) {
+        scope.launch {
+            netJob?.cancelAndJoin()
+            runJob?.cancelAndJoin()
+            scanJob?.cancelAndJoin()
+            mutex.withLock {
+                downSafe()
+                if (killSwitchApplied || RootTools.killSwitchActive()) {
+                    RootTools.killSwitchDisable()
+                    killSwitchApplied = false
+                }
+                if (store.prefGet("prevDnsSaved") != null) restoreNow()
+                store.updateSettings { it.copy(backgroundScan = false) }
+                status.value = Status(running = false, message = "أُغلق التطبيق بالكامل")
+                report.value = Report()
+                netInfo.value = NetInfo()
+                log("إغلاق شامل: أُوقف كل شيء واستُعيدت إعدادات النظام")
+            }
+            onDone()
         }
     }
 
@@ -238,7 +282,7 @@ class Engine(ctx: Context, private val store: Store) {
                     // نفس نوع الشبكة (تغيّر IP فقط): نتحقق أن النفق سليم فعلاً
                     val lat = aliveNow()
                     if (lat != null) {
-                        status.update { it.copy(latencyMs = lat) }
+                        status.update { it.copy(latencyMs = lat, lastScanAt = now()) }
                         log("النفق سليم بعد تغيّر الشبكة (${lat}ms)")
                     } else {
                         recover("تغيّر الشبكة")
@@ -276,7 +320,7 @@ class Engine(ctx: Context, private val store: Store) {
                 val lat = Probes.quickAlive(v.network)
                 if (lat != null) {
                     healthFails = 0
-                    status.update { it.copy(latencyMs = lat) }
+                    status.update { it.copy(latencyMs = lat, lastScanAt = now()) }
                 } else {
                     healthFails++
                     log("⚠ لا تمر بيانات عبر النفق ($healthFails/3)")
@@ -293,6 +337,11 @@ class Engine(ctx: Context, private val store: Store) {
     private suspend fun recover(reason: String) {
         if (!tunnelIsUp() && NetUtil.all(cm).any { it.isVpn }) {
             log("⚠ VPN آخر استلم الاتصال — أوقف التطبيق نفقه")
+            if (killSwitchApplied) {
+                RootTools.killSwitchDisable()
+                killSwitchApplied = false
+                log("قاطع الطوارئ أُوقف تلقائياً (لم يعد التطبيق يتحكم بالنفق)")
+            }
             status.value = Status(running = false, message = "أوقفه VPN آخر")
             return
         }
@@ -407,6 +456,7 @@ class Engine(ctx: Context, private val store: Store) {
                     vpnOwner = owner,
                     time = SimpleDateFormat("HH:mm", Locale.US).format(Date())
                 )
+                status.update { it.copy(lastScanAt = now()) }
                 log(
                     "الأصلية (${direct.info.label}): DNS ${direct.info.bestDns} ${direct.info.dnsMs}ms" +
                         (if (direct.info.sysDnsMs >= 0) " (الحالي ${direct.info.sysDnsMs}ms)" else "") +
@@ -616,9 +666,11 @@ class Engine(ctx: Context, private val store: Store) {
                         continue
                     }
                 }
-                val diag = "TCP ✔ ${lat}ms • HTTPS ✔ ${exit.ms}ms • DNS " +
+                // متوسط 3 محاولات لنفس المرجع (1.1.1.1) لعرض عادل يُقارَن بزمن TCP بلا تحيّز أول اتصال
+                val httpsAvg = Probes.httpsLatencyAvg(v.network) ?: exit.ms
+                val diag = "TCP ✔ ${lat}ms • HTTPS ✔ ${httpsAvg}ms • DNS " +
                     (dnsStat?.let { "✔ ${it.median}ms" } ?: "✗ (لا يحل الأسماء)") + " • MTU $label"
-                return Verified(v, exit, lat, m ?: 1280, ips, diag)
+                return Verified(v, exit.copy(ms = httpsAvg), lat, m ?: 1280, ips, diag)
             }
         }
         return null
@@ -707,7 +759,7 @@ class Engine(ctx: Context, private val store: Store) {
                 message = if (verified) "متصل ✔ (تم التحقق من الـ IP)" else "متصل (لم يُتحقق من الـ IP)",
                 verified = verified, exitIp = ver.exit?.ip ?: "", exitLoc = ver.exit?.loc ?: "",
                 directIp = direct?.ip ?: "", directLoc = direct?.loc ?: "", vpnIface = ver.vpn.iface,
-                diag = ver.diag
+                diag = ver.diag, lastScanAt = now()
             )
         }
         report.update {
@@ -820,6 +872,11 @@ class Engine(ctx: Context, private val store: Store) {
             val st = Probes.tcpStat(v.network, 6)
             if (st == null) {
                 updateRow(c.id) { it.copy(state = "fail", note = "انقطع أثناء الفحص الدقيق") }
+                continue
+            }
+            if (st.loss > 40) {
+                updateRow(c.id) { it.copy(state = "fail", note = "فقد حزم مرتفع (${st.loss}%) — مستبعَد") }
+                log("✗ ${c.name}: فقد حزم ${st.loss}% — مستبعَد تلقائياً")
                 continue
             }
             val exit = Probes.exitInfo(v.network, fast = true)

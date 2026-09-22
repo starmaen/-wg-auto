@@ -35,7 +35,8 @@ data class AppSettings(
     val useRoot: Boolean = false,
     val backgroundScan: Boolean = true,
     val applyRoot: Boolean = false,
-    val allowFilteredDns: Boolean = false
+    val allowFilteredDns: Boolean = false,
+    val killSwitch: Boolean = false
 )
 
 data class Status(
@@ -56,7 +57,9 @@ data class Status(
     val directIp: String = "",
     val directLoc: String = "",
     val vpnIface: String = "",
-    val diag: String = ""
+    val diag: String = "",
+    val lastScanAt: Long = 0L,
+    val killSwitchOn: Boolean = false
 )
 
 /** نتيجة فحص جهة واحدة (الشبكة الأصلية أو شبكة الـ VPN). */

@@ -93,7 +93,7 @@ class Store(ctx: Context) {
             .put("selConfigId", s.selConfigId).put("selDnsId", s.selDnsId).put("selMtu", s.selMtu)
             .put("reselectOnNetwork", s.reselectOnNetwork).put("periodMinV2", s.periodMin)
             .put("useRoot", s.useRoot).put("backgroundScan", s.backgroundScan).put("applyRoot", s.applyRoot)
-            .put("allowFilteredDns", s.allowFilteredDns)
+            .put("allowFilteredDns", s.allowFilteredDns).put("killSwitch", s.killSwitch)
         sp.edit().putString("settings", o.toString()).apply()
     }
 
@@ -110,7 +110,8 @@ class Store(ctx: Context) {
                 o.optInt("periodMinV2", d.periodMin), o.optBoolean("useRoot", d.useRoot),
                 o.optBoolean("backgroundScan", d.backgroundScan),
                 o.optBoolean("applyRoot", d.applyRoot),
-                o.optBoolean("allowFilteredDns", d.allowFilteredDns)
+                o.optBoolean("allowFilteredDns", d.allowFilteredDns),
+                o.optBoolean("killSwitch", d.killSwitch)
             )
         } catch (e: Exception) {
             AppSettings()

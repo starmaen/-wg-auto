@@ -53,4 +53,35 @@ object RootTools {
         else "settings delete global private_dns_specifier"
         return su("$s; $m").first == 0
     }
+
+    // ---------- قاطع الطوارئ (Kill Switch) ----------
+    // يمنع أي حركة تخرج خارج نفق WireGuard (tun+) أو المحلي (lo) طالما هو مفعّل،
+    // بصرف النظر عن حالة النفق — إن سقط النفق تنقطع الشبكة كلها بدل تسريب IP الحقيقي.
+    private const val CHAIN = "wgauto_ks"
+
+    fun killSwitchEnable(): Boolean {
+        val cmds = listOf(
+            "iptables -D OUTPUT -j $CHAIN 2>/dev/null",
+            "iptables -F $CHAIN 2>/dev/null",
+            "iptables -N $CHAIN 2>/dev/null",
+            "iptables -A $CHAIN -o lo -j RETURN",
+            "iptables -A $CHAIN -o tun+ -j RETURN",
+            "iptables -A $CHAIN -p udp --dport 53 -j RETURN",   // يسمح بحلّ الأسماء أثناء التبديل بين الكونفيجات
+            "iptables -A $CHAIN -j DROP",
+            "iptables -I OUTPUT 1 -j $CHAIN"
+        )
+        return su(cmds.joinToString(" ; ")).first == 0
+    }
+
+    fun killSwitchDisable(): Boolean {
+        val cmds = listOf(
+            "iptables -D OUTPUT -j $CHAIN 2>/dev/null",
+            "iptables -F $CHAIN 2>/dev/null",
+            "iptables -X $CHAIN 2>/dev/null"
+        )
+        su(cmds.joinToString(" ; "))
+        return true   // تنظيف؛ لا نفشل حتى لو لم تكن القواعد موجودة أصلاً
+    }
+
+    fun killSwitchActive(): Boolean = su("iptables -L OUTPUT -n | grep -q $CHAIN").first == 0
 }

@@ -15,7 +15,8 @@ object NetUtil {
         val label: String,
         val isVpn: Boolean,
         val validated: Boolean,
-        val ips: String
+        val ips: String,
+        val hasProxy: Boolean
     )
 
     @Suppress("DEPRECATION")
@@ -40,7 +41,8 @@ object NetUtil {
             ?.joinToString(",") ?: ""
         Info(
             n, lp?.interfaceName ?: "", mtu, label, isVpn,
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED), ips
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED), ips,
+            lp?.httpProxy != null
         )
     }
 

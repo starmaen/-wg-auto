@@ -345,6 +345,16 @@ object Probes {
     /** فحص تصفّح سريع عبر النفق: HTTPS بالعنوان المباشر. */
     fun httpsAlive(network: Network?): Int? = httpTrace("https://1.1.1.1/cdn-cgi/trace", network, 3000).first?.ms
 
+    /**
+     * زمن HTTPS الموحَّد للعرض: نفس المرجع دائماً (1.1.1.1) ومتوسط عدة محاولات،
+     * حتى يقارَن بعدل مع زمن TCP بدل الاعتماد على محاولة واحدة قد تتضمن بطء DNS/TLS الأول.
+     */
+    fun httpsLatencyAvg(network: Network?, tries: Int = 3): Int? {
+        val t = ArrayList<Int>()
+        repeat(tries) { httpTrace("https://1.1.1.1/cdn-cgi/trace", network, 3000).first?.ms?.let { t.add(it) } }
+        return if (t.isEmpty()) null else t.average().toInt()
+    }
+
     /** حلّ اسم فعلي عبر DNS الخاص بالشبكة/النفق (ما تستخدمه التطبيقات فعلاً). */
     private fun resolveOnce(network: Network?, name: String): Pair<Int?, String> {
         val out = AtomicLong(-1)

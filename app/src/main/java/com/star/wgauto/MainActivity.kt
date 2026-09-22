@@ -86,7 +86,9 @@ class Actions(
     val testAll: () -> Unit,
     val testOne: (String) -> Unit,
     val syncService: () -> Unit,
-    val restoreSystem: () -> Unit
+    val restoreSystem: () -> Unit,
+    val shutdownAll: () -> Unit,
+    val openVpnSettings: () -> Unit
 )
 
 class MainActivity : ComponentActivity() {
@@ -136,7 +138,20 @@ class MainActivity : ComponentActivity() {
             testAll = { withVpnPermission { app.engine.testAll() } },
             testOne = { id -> withVpnPermission { app.engine.testConfigs(listOf(id)) } },
             syncService = { syncService() },
-            restoreSystem = { app.engine.restoreSystemDns() }
+            restoreSystem = { app.engine.restoreSystemDns() },
+            shutdownAll = {
+                app.engine.shutdownAll {
+                    stopService(Intent(this, AutoService::class.java))
+                    toast("أُغلق التطبيق بالكامل — لن يعمل شيء حتى تشغّله يدوياً")
+                }
+            },
+            openVpnSettings = {
+                try {
+                    startActivity(Intent(AndroidSettings.ACTION_VPN_SETTINGS))
+                } catch (e: Exception) {
+                    toast("تعذّر فتح إعدادات VPN في هذا الجهاز")
+                }
+            }
         )
         syncService()
         setContent {
@@ -146,6 +161,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // فحص خفيف عند فتح التطبيق: لا يُسقط النفق العامل، فقط يحدّث الأرقام المعروضة
+        val st = app.engine.status.value
+        if (st.running && st.connected) app.engine.healthCheck()
+        else if (!st.running && app.store.settings.value.backgroundScan) app.engine.scanNetwork("فتح التطبيق")
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
@@ -291,6 +314,27 @@ fun MarkerSlot(chosen: Boolean) {
     Spacer(Modifier.width(8.dp))
 }
 
+/** عمر آخر فحص، بلون يدل على مدى حداثته: أخضر حديث، أصفر متوسط، أحمر قديم. */
+@Composable
+fun ScanAgeLine(lastScanAt: Long) {
+    if (lastScanAt <= 0L) {
+        Text("آخر فحص: لم يُجرَ بعد", fontSize = 12.sp)
+        return
+    }
+    val ageMs = System.currentTimeMillis() - lastScanAt
+    val text = when {
+        ageMs < 60_000 -> "آخر فحص: قبل ${(ageMs / 1000).coerceAtLeast(1)} ثانية"
+        ageMs < 3_600_000 -> "آخر فحص: قبل ${ageMs / 60_000} دقيقة"
+        else -> "آخر فحص: قبل ${ageMs / 3_600_000} ساعة"
+    }
+    val color = when {
+        ageMs < 2 * 60_000 -> Color(0xFF2E7D32)
+        ageMs < 20 * 60_000 -> Color(0xFFF9A825)
+        else -> MaterialTheme.colorScheme.error
+    }
+    Text(text, fontSize = 12.sp, color = color)
+}
+
 private fun rowLine(r: ConfigRow): String = when (r.state) {
     "pending" -> "بانتظار الفحص"
     "testing" -> "جارٍ الفحص…"
@@ -411,6 +455,10 @@ fun HomeTab(app: WgApp, a: Actions) {
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(st.message.ifEmpty { "متوقف" }, fontWeight = FontWeight.Bold)
+                ScanAgeLine(st.lastScanAt)
+                if (st.killSwitchOn) {
+                    Text("🔒 قاطع الطوارئ مفعّل — لا إنترنت خارج النفق", fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                }
                 if (st.connected) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         MarkerSlot(true)
@@ -465,6 +513,30 @@ fun HomeTab(app: WgApp, a: Actions) {
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("فحص الشبكة الآن") }
             }
+        }
+        var showShutdown by remember { mutableStateOf(false) }
+        OutlinedButton(
+            onClick = { showShutdown = true },
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("⛔ إغلاق نهائي شامل") }
+        if (showShutdown) {
+            AlertDialog(
+                onDismissRequest = { showShutdown = false },
+                title = { Text("إغلاق نهائي شامل") },
+                text = {
+                    Text(
+                        "سيوقف النفق وقاطع الطوارئ والفحص التلقائي في الخلفية، ويستعيد إعداد DNS الأصلي للنظام. " +
+                            "لن يعمل شيء بعدها حتى تفتح التطبيق وتضغط تشغيل يدوياً."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { showShutdown = false; a.shutdownAll() }) {
+                        Text("إغلاق", color = MaterialTheme.colorScheme.error)
+                    }
+                },
+                dismissButton = { TextButton(onClick = { showShutdown = false }) { Text("إلغاء") } }
+            )
         }
         Text("السجل", fontWeight = FontWeight.Bold)
         logs.reversed().take(60).forEach { Text(it, fontSize = 12.sp) }
@@ -767,6 +839,23 @@ fun SettingsTab(app: WgApp, a: Actions) {
         }
         Text(
             "MTU النفق = أقصى حزمة تصل للخادم − 60 بايت (IPv4) أو − 80 بايت (IPv6).",
+            fontSize = 12.sp
+        )
+
+        HorizontalDivider()
+        Text("قاطع الطوارئ (Kill Switch)", fontWeight = FontWeight.Bold)
+        SwitchRow("منع أي إنترنت خارج النفق (يتطلب روت)", s.killSwitch) { v -> upd { it.copy(killSwitch = v) } }
+        Text(
+            "يحجب كل حركة الشبكة إلا عبر واجهة النفق (tun+) طالما التطبيق يعمل. إن سقط النفق يبقى الإنترنت مقطوعاً " +
+                "بدل تسريب IP الحقيقي، حتى يعود النفق أو تضغط إيقاف. لا يعمل بلا روت.",
+            fontSize = 12.sp
+        )
+        OutlinedButton(onClick = a.openVpnSettings, modifier = Modifier.fillMaxWidth()) {
+            Text("فتح إعدادات Always-on VPN بالنظام")
+        }
+        Text(
+            "إضافياً، تفعيل \"Always-on VPN\" و\"Block connections without VPN\" لهذا التطبيق من إعدادات أندرويد " +
+                "يمنع أي تسريب حتى بلا روت، ويبقى فعّالاً حتى لو أُغلق التطبيق تماماً.",
             fontSize = 12.sp
         )
 
