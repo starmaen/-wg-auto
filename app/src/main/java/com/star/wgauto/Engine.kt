@@ -71,6 +71,7 @@ class Engine(ctx: Context, private val store: Store) {
     val dnsResults = MutableStateFlow<Map<String, DnsMeasure>>(emptyMap())
     val netInfo = MutableStateFlow(NetInfo())
     val configResults = MutableStateFlow<Map<String, String>>(emptyMap())
+    val warpStatus = MutableStateFlow("")
     val report = MutableStateFlow(Report())
 
     private var runJob: Job? = null
@@ -141,6 +142,28 @@ class Engine(ctx: Context, private val store: Store) {
             list + WgConfig(name = n, text = clean)
         }
         return null
+    }
+
+    /** يسجّل حساب Cloudflare WARP مجانياً محلياً ويضيف الكونفيج الناتج تلقائياً. */
+    fun generateWarp() {
+        warpStatus.value = "جارٍ التسجيل في WARP…"
+        scope.launch {
+            try {
+                val r = WarpGenerator.register()
+                val base = "WARP"
+                var n = base
+                var i = 2
+                while (store.configs.value.any { it.name == n }) {
+                    n = "$base-$i"
+                    i++
+                }
+                val err = addConfig(n, r.configText)
+                warpStatus.value = if (err == null) "✔ أُضيف $n" else "✗ $err"
+            } catch (e: Exception) {
+                warpStatus.value = "✗ فشل تسجيل WARP: ${e.message ?: e.javaClass.simpleName}"
+                log("WARP: ${e.message}")
+            }
+        }
     }
 
     // ---------- تشغيل / إيقاف ----------

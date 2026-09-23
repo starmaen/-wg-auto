@@ -10,6 +10,9 @@ import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings as AndroidSettings
 import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,6 +23,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -157,7 +161,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkScheme else lightScheme) {
                 CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-                    Root(app, actions)
+                    LicenseGate(app) { Root(app, actions) }
                 }
             }
         }
@@ -270,6 +274,101 @@ class MainActivity : ComponentActivity() {
 }
 
 // ============================================================ UI
+
+/** بوابة الترخيص: تعرض شاشة تفعيل حتى يكون الجهاز مرخَّصاً، ثم تعرض محتوى التطبيق. */
+@Composable
+fun LicenseGate(app: WgApp, content: @Composable () -> Unit) {
+    val ctx = LocalContext.current
+    val deviceId = remember { License.deviceId(ctx) }
+    var status by remember { mutableStateOf(License.status(app.store)) }
+
+    if (status.valid) {
+        content()
+        return
+    }
+
+    var tapCount by remember { mutableIntStateOf(0) }
+    var showOwner by remember { mutableStateOf(false) }
+    var code by remember { mutableStateOf("") }
+    var ownerPhrase by remember { mutableStateOf("") }
+    var msg by remember { mutableStateOf("") }
+    val clipboard = ctx.getSystemService(android.content.ClipboardManager::class.java)
+
+    Surface(Modifier.fillMaxSize()) {
+        Column(
+            Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState()).padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Box(
+                Modifier.size(56.dp).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
+                    .clickable {
+                        tapCount++
+                        if (tapCount >= 7) {
+                            showOwner = true
+                            tapCount = 0
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("WG", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold, fontSize = 22.sp)
+            }
+            Text("تفعيل WG Auto", fontWeight = FontWeight.Bold, fontSize = 22.sp)
+            Text(
+                "أرسل معرّف جهازك أدناه إلى مطوّر التطبيق للحصول على كود التفعيل، ثم الصقه في الحقل تحته.",
+                fontSize = 14.sp
+            )
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("معرّف جهازك", fontWeight = FontWeight.Bold)
+                    Text(License.formatId(deviceId), fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = {
+                            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("device id", deviceId))
+                            msg = "نُسخ معرّف الجهاز"
+                        }, modifier = Modifier.weight(1f)) { Text("نسخ") }
+                        OutlinedButton(onClick = {
+                            val send = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_TEXT, "معرّف جهازي لتفعيل WG Auto: ${License.formatId(deviceId)}")
+                            }
+                            ctx.startActivity(Intent.createChooser(send, null))
+                        }, modifier = Modifier.weight(1f)) { Text("إرسال") }
+                    }
+                }
+            }
+            OutlinedTextField(
+                value = code, onValueChange = { code = it },
+                label = { Text("كود التفعيل") }, singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Button(onClick = {
+                when (val r = License.activate(app.store, deviceId, code)) {
+                    is License.Attempt.Ok -> { status = License.status(app.store); msg = "" }
+                    is License.Attempt.Wrong -> msg = "كود غير صحيح لهذا الجهاز"
+                    is License.Attempt.Locked -> msg = "محاولات كثيرة — انتظر ${r.secondsLeft} ثانية"
+                }
+            }, modifier = Modifier.fillMaxWidth()) { Text("تفعيل") }
+            if (msg.isNotEmpty()) Text(msg, color = MaterialTheme.colorScheme.error)
+
+            if (showOwner) {
+                HorizontalDivider()
+                Text("دخول المالك", fontWeight = FontWeight.Bold)
+                OutlinedTextField(
+                    value = ownerPhrase, onValueChange = { ownerPhrase = it },
+                    label = { Text("العبارة السرّية") }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Button(onClick = {
+                    when (val r = License.ownerLogin(app.store, ownerPhrase)) {
+                        is License.Attempt.Ok -> status = License.status(app.store)
+                        is License.Attempt.Wrong -> msg = "عبارة غير صحيحة"
+                        is License.Attempt.Locked -> msg = "محاولات كثيرة — انتظر ${r.secondsLeft} ثانية"
+                    }
+                }, modifier = Modifier.fillMaxWidth()) { Text("دخول") }
+            }
+        }
+    }
+}
 
 @Composable
 fun Root(app: WgApp, a: Actions) {
@@ -579,6 +678,18 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             OutlinedButton(onClick = { showPaste = true }, modifier = Modifier.weight(1f)) { Text("لصق", maxLines = 1) }
             OutlinedButton(onClick = a.testAll, modifier = Modifier.weight(1f)) { Text("فحص الكل", maxLines = 1) }
         }
+        val warpStatus by app.engine.warpStatus.collectAsState()
+        OutlinedButton(
+            onClick = { app.engine.generateWarp() },
+            enabled = warpStatus != "جارٍ التسجيل في WARP…",
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("توليد كونفيج Cloudflare WARP مجاني") }
+        if (warpStatus.isNotEmpty()) {
+            Text(
+                warpStatus, fontSize = 12.sp,
+                color = if (warpStatus.startsWith("✗")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+            )
+        }
         Text(
             "يدعم ملفات .conf وملف .zip يحوي عدة كونفيجات. تُفحص الكونفيجات تلقائياً عند تشغيل الـ VPN فقط.",
             fontSize = 12.sp
@@ -610,6 +721,11 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                         }
                         results[c.id]?.let { Text(it, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 8.dp)) }
                         Row {
+                            val isManualPick = !s.autoConfig && s.selConfigId == c.id
+                            TextButton(onClick = {
+                                app.store.updateSettings { it.copy(autoConfig = false, selConfigId = c.id) }
+                                if (st.running) app.engine.reselect("تفعيل يدوي: ${c.name}")
+                            }) { Text(if (isManualPick) "✔ مفعَّل يدوياً" else "▶ تفعيل") }
                             TextButton(onClick = { a.testOne(c.id) }) { Text("فحص") }
                             TextButton(onClick = { app.store.updateConfigs { l -> l.filter { it.id != c.id } } }) {
                                 Text("حذف", color = MaterialTheme.colorScheme.error)
@@ -618,6 +734,15 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                     }
                 }
             }
+        }
+        if (!s.autoConfig) {
+            OutlinedButton(
+                onClick = {
+                    app.store.updateSettings { it.copy(autoConfig = true) }
+                    if (st.running) app.engine.reselect("العودة للاختيار التلقائي")
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("العودة للاختيار التلقائي") }
         }
     }
 
@@ -868,7 +993,18 @@ fun SettingsTab(app: WgApp, a: Actions) {
             }
         }
         HorizontalDivider()
-        Text("حول التطبيق", fontWeight = FontWeight.Bold)
+        var verTaps by remember { mutableIntStateOf(0) }
+        var showOwnerHere by remember { mutableStateOf(false) }
+        Text(
+            "حول التطبيق", fontWeight = FontWeight.Bold,
+            modifier = Modifier.clickable {
+                verTaps++
+                if (verTaps >= 7) {
+                    showOwnerHere = true
+                    verTaps = 0
+                }
+            }
+        )
         Text("الإصدار: $ver")
         Text("Star Syria")
         TextButton(onClick = {
@@ -878,5 +1014,39 @@ fun SettingsTab(app: WgApp, a: Actions) {
                 // لا يوجد تطبيق بريد
             }
         }) { Text("starsyria2500@gmail.com") }
+
+        val lic = License.status(app.store)
+        Text(
+            when {
+                lic.isOwner -> "الترخيص: دخول مالك"
+                lic.expiryAt > 0 ->
+                    "الترخيص: ساري حتى " + SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(lic.expiryAt))
+                else -> "الترخيص: غير مفعّل"
+            },
+            fontSize = 12.sp
+        )
+        if (showOwnerHere) {
+            var phrase by remember { mutableStateOf("") }
+            var lm by remember { mutableStateOf("") }
+            OutlinedTextField(
+                value = phrase, onValueChange = { phrase = it },
+                label = { Text("عبارة دخول المالك") }, singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = {
+                    lm = when (val r = License.ownerLogin(app.store, phrase)) {
+                        is License.Attempt.Ok -> "تم الدخول كمالك"
+                        is License.Attempt.Wrong -> "عبارة غير صحيحة"
+                        is License.Attempt.Locked -> "محاولات كثيرة — انتظر ${r.secondsLeft} ثانية"
+                    }
+                }, modifier = Modifier.weight(1f)) { Text("دخول") }
+                OutlinedButton(onClick = {
+                    License.deactivate(app.store)
+                    lm = "أُلغي التفعيل — سيُطلب كود جديد عند إعادة فتح التطبيق"
+                }, modifier = Modifier.weight(1f)) { Text("إلغاء التفعيل") }
+            }
+            if (lm.isNotEmpty()) Text(lm, fontSize = 12.sp)
+        }
     }
 }
