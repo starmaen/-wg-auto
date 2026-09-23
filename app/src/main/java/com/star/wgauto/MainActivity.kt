@@ -1004,13 +1004,14 @@ fun SettingsTab(app: WgApp, a: Actions) {
         }
         HorizontalDivider()
         var verTaps by remember { mutableIntStateOf(0) }
-        var showOwnerHere by remember { mutableStateOf(false) }
+        var showPrompt by remember { mutableStateOf(false) }
+        var toolUnlocked by remember { mutableStateOf(false) }
         Text(
             "حول التطبيق", fontWeight = FontWeight.Bold,
             modifier = Modifier.clickable {
                 verTaps++
                 if (verTaps >= 7) {
-                    showOwnerHere = true
+                    showPrompt = true
                     verTaps = 0
                 }
             }
@@ -1035,12 +1036,13 @@ fun SettingsTab(app: WgApp, a: Actions) {
             },
             fontSize = 12.sp
         )
-        if (showOwnerHere) {
-            if (lic.isOwner) {
+        if (showPrompt) {
+            if (toolUnlocked) {
                 OwnerToolPanel(app)
                 OutlinedButton(onClick = {
-                    License.deactivate(app.store)
-                }, modifier = Modifier.fillMaxWidth()) { Text("خروج / إلغاء التفعيل") }
+                    toolUnlocked = false
+                    showPrompt = false
+                }, modifier = Modifier.fillMaxWidth()) { Text("خروج من الأداة") }
             } else {
                 var phrase by remember { mutableStateOf("") }
                 var lm by remember { mutableStateOf("") }
@@ -1050,8 +1052,8 @@ fun SettingsTab(app: WgApp, a: Actions) {
                     modifier = Modifier.fillMaxWidth()
                 )
                 Button(onClick = {
-                    lm = when (val r = License.ownerLogin(app.store, phrase)) {
-                        is License.Attempt.Ok -> "تم الدخول كمالك"
+                    lm = when (val r = License.verifyOwnerAttempt(app.store, phrase)) {
+                        is License.Attempt.Ok -> { toolUnlocked = true; "" }
                         is License.Attempt.Wrong -> "عبارة غير صحيحة"
                         is License.Attempt.Locked -> "محاولات كثيرة — انتظر ${r.secondsLeft} ثانية"
                     }

@@ -193,6 +193,21 @@ object License {
         return Attempt.Ok
     }
 
+    /**
+     * تحقق من عبارة المالك فقط، بلا أي أثر على ترخيص التطبيق — يُستخدم لإعادة فتح أداة توليد
+     * الأكواد من نسخة مفعّلة أصلاً، بحيث لا يؤدي إغلاقها إلى إلغاء تفعيل التطبيق نفسه. له قفل
+     * محاولات منفصل عن قفل شاشة التفعيل الرئيسية.
+     */
+    fun verifyOwnerAttempt(store: Store, phrase: String): Attempt {
+        lockRemaining(store, "toolowner").let { if (it > 0) return Attempt.Locked(it / 1000) }
+        if (!verifyOwnerPhrase(phrase)) {
+            recordFail(store, "toolowner")
+            return Attempt.Wrong
+        }
+        recordSuccess(store, "toolowner")
+        return Attempt.Ok
+    }
+
     fun deactivate(store: Store) {
         store.prefPut(PREF_ACTIVATED, null)
         store.prefPut(PREF_EXPIRY, null)
