@@ -720,12 +720,22 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                             )
                         }
                         results[c.id]?.let { Text(it, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 8.dp)) }
-                        Row {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             val isManualPick = !s.autoConfig && s.selConfigId == c.id
                             TextButton(onClick = {
-                                app.store.updateSettings { it.copy(autoConfig = false, selConfigId = c.id) }
-                                if (st.running) app.engine.reselect("تفعيل يدوي: ${c.name}")
-                            }) { Text(if (isManualPick) "✔ مفعَّل يدوياً" else "▶ تفعيل") }
+                                if (isManualPick) {
+                                    app.store.updateSettings { it.copy(autoConfig = true) }
+                                    if (st.running) app.engine.reselect("العودة للاختيار التلقائي")
+                                } else {
+                                    app.store.updateSettings { it.copy(autoConfig = false, selConfigId = c.id) }
+                                    if (st.running) app.engine.reselect("تفعيل يدوي: ${c.name}")
+                                }
+                            }) {
+                                Text(
+                                    if (isManualPick) "⏸ إيقاف" else "▶ تفعيل",
+                                    color = if (isManualPick) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                             TextButton(onClick = { a.testOne(c.id) }) { Text("فحص") }
                             TextButton(onClick = { app.store.updateConfigs { l -> l.filter { it.id != c.id } } }) {
                                 Text("حذف", color = MaterialTheme.colorScheme.error)
@@ -1026,27 +1036,115 @@ fun SettingsTab(app: WgApp, a: Actions) {
             fontSize = 12.sp
         )
         if (showOwnerHere) {
-            var phrase by remember { mutableStateOf("") }
-            var lm by remember { mutableStateOf("") }
-            OutlinedTextField(
-                value = phrase, onValueChange = { phrase = it },
-                label = { Text("عبارة دخول المالك") }, singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (lic.isOwner) {
+                OwnerToolPanel(app)
+                OutlinedButton(onClick = {
+                    License.deactivate(app.store)
+                }, modifier = Modifier.fillMaxWidth()) { Text("خروج / إلغاء التفعيل") }
+            } else {
+                var phrase by remember { mutableStateOf("") }
+                var lm by remember { mutableStateOf("") }
+                OutlinedTextField(
+                    value = phrase, onValueChange = { phrase = it },
+                    label = { Text("عبارة دخول المالك") }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
                 Button(onClick = {
                     lm = when (val r = License.ownerLogin(app.store, phrase)) {
                         is License.Attempt.Ok -> "تم الدخول كمالك"
                         is License.Attempt.Wrong -> "عبارة غير صحيحة"
                         is License.Attempt.Locked -> "محاولات كثيرة — انتظر ${r.secondsLeft} ثانية"
                     }
-                }, modifier = Modifier.weight(1f)) { Text("دخول") }
-                OutlinedButton(onClick = {
-                    License.deactivate(app.store)
-                    lm = "أُلغي التفعيل — سيُطلب كود جديد عند إعادة فتح التطبيق"
-                }, modifier = Modifier.weight(1f)) { Text("إلغاء التفعيل") }
+                }, modifier = Modifier.fillMaxWidth()) { Text("دخول") }
+                if (lm.isNotEmpty()) Text(lm, fontSize = 12.sp)
             }
-            if (lm.isNotEmpty()) Text(lm, fontSize = 12.sp)
+        }
+    }
+}
+
+/** أداة توليد أكواد التفعيل داخل التطبيق — تظهر فقط بعد دخول المالك، بلا أي أوامر يدوية خارجية. */
+@Composable
+fun OwnerToolPanel(app: WgApp) {
+    var name by remember { mutableStateOf("") }
+    var device by remember { mutableStateOf("") }
+    var days by remember { mutableStateOf("365") }
+    var permanent by remember { mutableStateOf(false) }
+    var result by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var err by remember { mutableStateOf("") }
+    var history by remember { mutableStateOf(License.historyList(app.store)) }
+    val ctx = LocalContext.current
+    val clipboard = ctx.getSystemService(android.content.ClipboardManager::class.java)
+
+    fun copy(text: String) {
+        clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("code", text))
+    }
+
+    HorizontalDivider()
+    Text("أداة توليد أكواد التفعيل", fontWeight = FontWeight.Bold)
+    OutlinedTextField(
+        value = name, onValueChange = { name = it },
+        label = { Text("اسم المستخدم (للسجل فقط)") }, singleLine = true,
+        modifier = Modifier.fillMaxWidth()
+    )
+    OutlinedTextField(
+        value = device, onValueChange = { device = it; err = "" },
+        label = { Text("معرّف جهاز المستخدم") }, singleLine = true,
+        modifier = Modifier.fillMaxWidth()
+    )
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OutlinedTextField(
+            value = days, onValueChange = { days = it.filter { c -> c.isDigit() } },
+            label = { Text("عدد الأيام") }, singleLine = true, enabled = !permanent,
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(Modifier.width(12.dp))
+        Text("دائم", fontSize = 13.sp)
+        Switch(checked = permanent, onCheckedChange = { permanent = it })
+    }
+    Button(onClick = {
+        val d = device.trim()
+        if (d.isEmpty()) {
+            err = "أدخل معرّف الجهاز أولاً"
+            return@Button
+        }
+        val daysNum = if (permanent) 0 else (days.toIntOrNull() ?: 0)
+        val (code, expiry) = License.generateCodeForOwner(d, daysNum)
+        result = code to expiry
+        License.historyAdd(
+            app.store,
+            License.IssuedCode(
+                name.trim(), d.replace("-", "").uppercase(), code, expiry,
+                SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
+            )
+        )
+        history = License.historyList(app.store)
+        copy(code)
+    }, modifier = Modifier.fillMaxWidth()) { Text("توليد الكود") }
+    if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+
+    result?.let { (code, expiry) ->
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("الكود (نُسخ تلقائياً)", fontSize = 12.sp)
+                Text(code, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                Text("صالح حتى: $expiry", fontSize = 12.sp)
+                OutlinedButton(onClick = { copy(code) }, modifier = Modifier.fillMaxWidth()) { Text("نسخ مرة أخرى") }
+            }
+        }
+    }
+
+    if (history.isNotEmpty()) {
+        Text("السجل (الأحدث أولاً)", fontWeight = FontWeight.Bold)
+        history.asReversed().take(30).forEach { h ->
+            Card(Modifier.fillMaxWidth().clickable { copy(h.code) }) {
+                Column(Modifier.padding(10.dp)) {
+                    Text(
+                        (if (h.name.isNotEmpty()) "${h.name} — " else "") + h.deviceId,
+                        fontWeight = FontWeight.Bold, fontSize = 13.sp
+                    )
+                    Text("${h.code}  •  حتى ${h.expiry}  •  صدر ${h.issuedAt}", fontSize = 12.sp)
+                }
+            }
         }
     }
 }

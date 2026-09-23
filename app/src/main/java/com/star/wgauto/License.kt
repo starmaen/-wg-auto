@@ -81,6 +81,29 @@ object License {
         return parts[0] to parts[1]
     }
 
+    private fun cleanDeviceId(raw: String) = raw.replace("-", "").replace(" ", "").trim().uppercase()
+
+    /**
+     * توليد كود تفعيل لجهاز آخر — متاح داخل التطبيق نفسه لمن سجّل دخول المالك فقط
+     * (تُستدعى من شاشة أداة المالك المخفية، لا من شاشة التفعيل العادية).
+     * days: 0 أو أقل = صلاحية دائمة عملياً (100 سنة). يعيد الكود وتاريخ الانتهاء (yyyy-MM-dd).
+     */
+    fun generateCodeForOwner(deviceIdRaw: String, days: Int): Pair<String, String> {
+        val deviceId = cleanDeviceId(deviceIdRaw)
+        val effDays = if (days <= 0) 36500 else days
+        val cal = java.util.Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+            add(java.util.Calendar.DAY_OF_YEAR, effDays)
+        }
+        val ymd = SimpleDateFormat("yyyyMMdd", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(cal.time)
+        val sig = hmac("$deviceId|$ymd").take(8).uppercase()
+        val niceDate = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(cal.time)
+        return "$ymd-$sig" to niceDate
+    }
+
     /** يتحقق من كود التفعيل لهذا الجهاز تحديداً. يعيد تاريخ الانتهاء (epoch ms) عند النجاح، أو null. */
     private fun verifyCode(deviceId: String, code: String): Long? {
         val (ymd, sig) = parseCode(code) ?: return null
@@ -177,4 +200,38 @@ object License {
     }
 
     data class Status(val valid: Boolean, val isOwner: Boolean, val expiryAt: Long)
+
+    // ---------- سجل الأكواد الصادرة (محلي على جهاز المالك فقط) ----------
+    data class IssuedCode(val name: String, val deviceId: String, val code: String, val expiry: String, val issuedAt: String)
+
+    private const val PREF_HISTORY = "lic_history"
+
+    fun historyList(store: Store): List<IssuedCode> {
+        val raw = store.prefGet(PREF_HISTORY) ?: return emptyList()
+        return try {
+            val arr = org.json.JSONArray(raw)
+            (0 until arr.length()).map {
+                val o = arr.getJSONObject(it)
+                IssuedCode(
+                    o.optString("name", ""), o.optString("deviceId", ""),
+                    o.optString("code", ""), o.optString("expiry", ""), o.optString("issuedAt", "")
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun historyAdd(store: Store, entry: IssuedCode) {
+        val list = (historyList(store) + entry).takeLast(200)   // سقف بسيط يمنع تضخّم التخزين
+        val arr = org.json.JSONArray()
+        list.forEach {
+            arr.put(
+                org.json.JSONObject()
+                    .put("name", it.name).put("deviceId", it.deviceId).put("code", it.code)
+                    .put("expiry", it.expiry).put("issuedAt", it.issuedAt)
+            )
+        }
+        store.prefPut(PREF_HISTORY, arr.toString())
+    }
 }
