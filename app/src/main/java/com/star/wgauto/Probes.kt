@@ -439,6 +439,26 @@ object Probes {
 
     // ---------- MTU ----------
     /** true = مرّت الحزمة، false = فشلت، null = أمر ping غير صالح للاستخدام. */
+    /**
+     * ping خفيف بحجم حزمة عادي، يعيد زمن الرحلة (ms) من مخرجات الأمر نفسه، أو null إن لم يستجب.
+     * لا يستخدم أي واجهة VPN ولا يمسّ النفق الحالي إطلاقاً — يمر عبر المسار الافتراضي للجهاز
+     * (عبر النفق الحالي إن كان يوجّه كل الحركة)، فمناسب لفحص خوادم بديلة دون قطع الاتصال العامل.
+     */
+    fun pingOnce(host: String, timeoutSec: Int = 2): Int? = try {
+        val p = ProcessBuilder("sh", "-c", "ping -c 1 -W $timeoutSec $host").redirectErrorStream(true).start()
+        val out = p.inputStream.bufferedReader().readText()
+        if (!p.waitFor(timeoutSec + 3L, TimeUnit.SECONDS)) {
+            p.destroy()
+            null
+        } else if (p.exitValue() != 0) {
+            null
+        } else {
+            Regex("time[=<]([0-9.]+)").find(out)?.groupValues?.get(1)?.toDoubleOrNull()?.let { Math.round(it).toInt() }
+        }
+    } catch (e: Exception) {
+        null
+    }
+
     private fun ping(host: String, packetSize: Int, ipv6: Boolean, root: Boolean, iface: String?): Boolean? {
         val payload = packetSize - if (ipv6) 48 else 28
         val cmd = "ping ${if (ipv6) "-6 " else ""}${if (iface != null) "-I $iface " else ""}" +

@@ -249,6 +249,86 @@ class Engine(ctx: Context, private val store: Store) {
         reselect(reason)
     }
 
+    /**
+     * فحص خلفي لا يقطع الاتصال الحالي إطلاقاً: يقيس زمن استجابة الخوادم البديلة عبر ping عادي
+     * (يمر خلال النفق الحالي نفسه، لا يلمس واجهته). لا يبدّل إلا إن وُجد مرشّح أسرع بوضوح
+     * (أقل من 70% من زمن النفق الحالي)، وحتى حينها يُختبر لثوانٍ معدودة فقط: إن لم يتفوّق فعلياً
+     * تتم العودة فوراً للكونفيج السابق بدل إكمال فحص شامل لكل الكونفيجات.
+     */
+    fun opportunisticCheck(reason: String) {
+        if (status.value.busy || now() < cooldownUntil) return
+        val st = status.value
+        if (!st.running) return
+        if (!st.connected) {
+            reselect(reason, allowFast = true)
+            return
+        }
+        runJob?.cancel()
+        runJob = scope.launch {
+            mutex.withLock {
+                try {
+                    opportunisticImpl(reason)
+                } finally {
+                    status.update { it.copy(busy = false) }
+                    cooldownUntil = now() + 20_000
+                }
+            }
+        }
+    }
+
+    private suspend fun opportunisticImpl(reason: String) {
+        val st = status.value
+        val cands = store.configs.value.filter { it.enabled && it.id != st.activeConfigId }
+        if (cands.isEmpty()) return
+        status.update { it.copy(busy = true, message = "فحص خلفي بلا انقطاع…") }
+        log("فحص خلفي بلا قطع الاتصال ($reason)")
+
+        val currentLat = st.latencyMs.takeIf { it > 0 } ?: return
+        var promising: WgConfig? = null
+        var bestPing = Int.MAX_VALUE
+        for (c in cands) {
+            currentCoroutineContext().ensureActive()
+            val host = Probes.parseEndpoint(c.text)?.first ?: continue
+            val rtt = Probes.pingOnce(host) ?: continue
+            if (rtt < bestPing) {
+                bestPing = rtt
+                promising = c
+            }
+        }
+        if (promising == null || bestPing >= (currentLat * 0.7).toInt()) {
+            log("لا يوجد كونفيج أفضل بوضوح — بقي ${st.activeConfig} كما هو")
+            status.update { it.copy(message = "متصل ✔ (لا تحسين متاح)") }
+            return
+        }
+
+        log("مرشّح واعد: ${promising.name} (~${bestPing}ms عبر ping مقابل ${currentLat}ms حالياً) — تجربة سريعة")
+        val savedCfg = store.configs.value.firstOrNull { it.id == st.activeConfigId }
+        val savedDns = store.dns.value.firstOrNull { it.id == st.activeDnsId }
+        val savedMtu = st.activeMtu
+        val direct = if (st.directIp.isNotEmpty()) ExitInfo(st.directIp, st.directLoc, 0) else null
+        val dnsAll = store.dns.value.filter { it.enabled && !it.filtered }
+
+        val ver = connectAndVerify(promising, 1420, savedDns?.ips() ?: emptyList(), direct)
+        if (ver != null && ver.lat < currentLat) {
+            val (dns, dnsRows) = pickDns(dnsAll, ver.vpn.network)
+            markConnected(promising, dns, dnsRows, ver, null, networkLabel(), direct, emptyList())
+            log("★ تبديل فوري إلى ${promising.name} (${ver.lat}ms) بعد تحسّن فعلي مؤكَّد")
+            return
+        }
+
+        log("لم يتحسّن فعلياً بعد التجربة — عودة فورية إلى ${savedCfg?.name ?: "السابق"}")
+        if (savedCfg != null) {
+            val back = connectAndVerify(savedCfg, savedMtu, savedDns?.ips() ?: emptyList(), direct)
+            if (back != null) {
+                status.update { it.copy(latencyMs = back.lat, message = "متصل ✔ (عاد للسابق)") }
+                log("✔ عاد الاتصال بـ ${savedCfg.name}")
+            } else {
+                log("⚠ تعذّرت العودة للكونفيج السابق — سيُجرى فحص كامل")
+                selectAndConnect("فشل الاسترجاع بعد محاولة تحسين", false)
+            }
+        }
+    }
+
     // ---------- أحداث الشبكة ----------
     /** kind = "vpn": ظهر أو اختفى VPN (من أي تطبيق) — kind = "net": تبدّلت الشبكة الأصلية أو IP. */
     fun onNetworkChanged(kind: String) {

@@ -587,10 +587,32 @@ fun HomeTab(app: WgApp, a: Actions) {
         }
         if (rep.rows.isNotEmpty() || rep.progress.isNotEmpty()) ResultsCard(rep, st)
         if (st.running && !st.busy) {
+            var showFullScanConfirm by remember { mutableStateOf(false) }
             OutlinedButton(
-                onClick = { app.engine.reselect("يدوي") },
+                onClick = {
+                    if (st.connected) app.engine.opportunisticCheck("يدوي") else app.engine.reselect("يدوي")
+                },
                 modifier = Modifier.fillMaxWidth()
-            ) { Text("فحص وإعادة اختيار الكونفيج الآن") }
+            ) { Text(if (st.connected) "بحث عن كونفيج أفضل (بلا قطع الاتصال)" else "فحص وإعادة اختيار الكونفيج الآن") }
+            if (st.connected) {
+                TextButton(
+                    onClick = { showFullScanConfirm = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("بحث كامل شامل — قد يقطع الاتصال مؤقتاً") }
+            }
+            if (showFullScanConfirm) {
+                AlertDialog(
+                    onDismissRequest = { showFullScanConfirm = false },
+                    title = { Text("بحث كامل شامل") },
+                    text = { Text("سيُعاد فحص كل الكونفيجات من الصفر، وقد ينقطع الاتصال الحالي مؤقتاً أثناء ذلك (قد يستغرق دقائق). متابعة؟") },
+                    confirmButton = {
+                        TextButton(onClick = { showFullScanConfirm = false; app.engine.reselect("بحث كامل يدوي") }) {
+                            Text("متابعة", color = MaterialTheme.colorScheme.error)
+                        }
+                    },
+                    dismissButton = { TextButton(onClick = { showFullScanConfirm = false }) { Text("إلغاء") } }
+                )
+            }
         }
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {

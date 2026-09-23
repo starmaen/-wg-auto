@@ -95,7 +95,7 @@ class AutoService : Service() {
             minutes++
             if (s.periodMin > 0 && minutes >= s.periodMin) {
                 minutes = 0
-                if (st.running) app.engine.autoReselect("فحص دوري")
+                if (st.running) app.engine.opportunisticCheck("فحص دوري")
                 else if (s.backgroundScan) app.engine.scanNetwork("فحص دوري")
             }
         }

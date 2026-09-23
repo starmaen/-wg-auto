@@ -12,8 +12,8 @@ android {
         applicationId = "com.star.wgauto"
         minSdk = 26
         targetSdk = 34
-        versionCode = 12
-        versionName = "1.11"
+        versionCode = 13
+        versionName = "1.12"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
@@ -39,11 +39,16 @@ android {
     }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        jniLibs {
+            useLegacyPackaging = false
+        }
     }
 }
 
 dependencies {
-    implementation("com.wireguard.android:tunnel:1.0.20230706")
+    // تحديث من 1.0.20230706: الإصدار القديم لا يدعم محاذاة صفحات 16 كيلوبايت (Android 15+).
+    // إن فشل هذا الإصدار في الجلب أثناء البناء، أرسل نص خطأ Gradle كاملاً لتحديد الرقم الصحيح.
+    implementation("com.wireguard.android:tunnel:1.0.20241018")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 
     implementation("androidx.core:core-ktx:1.13.1")
