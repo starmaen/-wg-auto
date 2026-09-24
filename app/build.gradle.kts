@@ -12,8 +12,8 @@ android {
         applicationId = "com.star.wgauto"
         minSdk = 26
         targetSdk = 34
-        versionCode = 14
-        versionName = "1.13"
+        versionCode = 15
+        versionName = "1.14"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
@@ -46,11 +46,9 @@ android {
 }
 
 dependencies {
-    // ⚠ لم تتوفر لي إمكانية الوصول للإنترنت للتحقق من رقم إصدار أحدث فعلي على Maven، وقد
-    // فشل جلب 1.0.20241018 لعدم وجوده. عدت للإصدار المؤكَّد عمله. تحذير 16 كيلوبايت لن يختفي
-    // تماماً حتى تُنشر نسخة أحدث من هذه المكتبة تدعمه رسمياً — الاعتماد الآن على خيار التعبئة
-    // أدناه فقط، وهو لا يغطي محاذاة الملفات الداخلية للمكتبة نفسها.
-    implementation("com.wireguard.android:tunnel:1.0.20230706")
+    // أحدث إصدار مؤكَّد على Maven Central (تحقّق منه المستخدم مباشرة، تاريخ النشر 2026-01-02):
+    // https://central.sonatype.com/artifact/com.wireguard.android/tunnel/versions
+    implementation("com.wireguard.android:tunnel:1.0.20260102")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 
     implementation("androidx.core:core-ktx:1.13.1")
