@@ -283,7 +283,7 @@ class Engine(ctx: Context, private val store: Store) {
         status.update { it.copy(busy = true, message = "فحص خلفي بلا انقطاع…") }
         log("فحص خلفي بلا قطع الاتصال ($reason)")
 
-        val currentLat = st.latencyMs.takeIf { it > 0 } ?: return
+        val currentLat = st.latencyMs?.takeIf { it > 0 } ?: return
         var promising: WgConfig? = null
         var bestPing = Int.MAX_VALUE
         for (c in cands) {
