@@ -159,10 +159,9 @@ class MainActivity : ComponentActivity() {
             },
             activateConfig = { id ->
                 app.store.updateSettings { it.copy(autoConfig = false, selConfigId = id) }
-                if (app.engine.status.value.running) {
-                    app.engine.reselect("تفعيل يدوي")
-                } else {
-                    withVpnPermission { startVpn() }
+                withVpnPermission {
+                    ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
+                    app.engine.connectManual(id)
                 }
             }
         )
@@ -1069,7 +1068,16 @@ fun SettingsTab(app: WgApp, a: Actions) {
             } catch (e: Exception) {
                 // لا يوجد تطبيق بريد
             }
-        }) { Text("starsyria2500@gmail.com") }
+        }) { Text("📧 starsyria2500@gmail.com") }
+        TextButton(onClick = {
+            try {
+                ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/963938466549")))
+            } catch (e: Exception) {
+                // لا يوجد واتساب مثبَّت
+            }
+        }) { Text("💬 واتساب: 963938466549+") }
+        // TODO: أضف رابط قناة تلغرام هنا فور تزويدي به، بنفس نمط الزرّين أعلاه:
+        // TextButton(onClick = { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://t.me/USERNAME"))) }) { Text("📣 قناة تلغرام") }
 
         val lic = License.status(app.store)
         Text(

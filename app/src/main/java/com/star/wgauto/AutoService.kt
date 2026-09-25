@@ -89,7 +89,8 @@ class AutoService : Service() {
             if (st.running && st.connected && !st.busy) app.engine.healthCheck()
             if (tick % 4 != 0 || st.busy) continue
             if (st.running && !st.connected) {
-                app.engine.autoReselect("إعادة محاولة")
+                if (s.autoConfig) app.engine.autoReselect("إعادة محاولة")
+                else if (s.selConfigId.isNotEmpty()) app.engine.connectManual(s.selConfigId)
                 continue
             }
             minutes++

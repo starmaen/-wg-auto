@@ -254,6 +254,58 @@ class Engine(ctx: Context, private val store: Store) {
     }
 
     /**
+     * تفعيل فردي مباشر لكونفيج محدد — منفصل تماماً عن آلية الفحص والاختيار التلقائي الشاملة.
+     * لا يقارن بين عدة كونفيجات، ولا يقيس جودة إحصائية (وسيط/تذبذب/فقد/سرعة)، ولا يبحث عن
+     * بديل عند الفشل. فقط: يرفع هذا الكونفيج بالذات (مع محاولات MTU الآمنة الجاهزة داخل
+     * connectAndVerify)، يتحقق أن IP تغيّر فعلاً، وينجح أو يفشل بوضوح — بلا أي تحوّل ضمني إلى
+     * فحص شامل لبقية الكونفيجات.
+     */
+    fun connectManual(cfgId: String) {
+        if (status.value.busy) return
+        runJob?.cancel()
+        runJob = scope.launch {
+            mutex.withLock {
+                try {
+                    connectManualImpl(cfgId)
+                } finally {
+                    status.update { it.copy(busy = false) }
+                    cooldownUntil = now() + if (status.value.connected) 20_000 else 30_000
+                }
+            }
+        }
+    }
+
+    private suspend fun connectManualImpl(cfgId: String) {
+        val cfg = store.configs.value.firstOrNull { it.id == cfgId }
+        if (cfg == null) {
+            status.update { it.copy(message = "الكونفيج غير موجود") }
+            return
+        }
+        status.update { it.copy(running = true, busy = true, connected = false, message = "جارٍ الاتصال بـ ${cfg.name}…") }
+        report.value = Report(rows = listOf(ConfigRow(cfg.id, cfg.name, state = "testing")))
+        val under = NetUtil.underlying(NetUtil.all(cm))
+        val direct = under?.let { Probes.exitInfo(it.network, fast = true) }
+        if (direct != null) status.update { it.copy(directIp = direct.ip, directLoc = direct.loc) }
+        val s = store.settings.value
+        val dns: DnsServer? =
+            if (s.autoDns) store.dns.value.firstOrNull { it.enabled && !it.filtered }
+            else store.dns.value.firstOrNull { it.id == s.selDnsId }
+        val startMtu = if (s.autoMtu) null else s.selMtu
+
+        downSafe()
+        val ver = connectAndVerify(cfg, startMtu, dns?.ips() ?: emptyList(), direct)
+        if (ver != null) {
+            markConnected(cfg, dns, emptyList(), ver, null, networkLabel(), direct, emptyList())
+            report.update { r -> r.copy(rows = r.rows.map { if (it.id == cfg.id) it.copy(state = "ok", latencyMs = ver.lat) else it }) }
+            log("✔ تفعيل فردي: ${cfg.name} • ${ver.diag}")
+        } else {
+            status.update { it.copy(connected = false, message = "فشل تفعيل ${cfg.name} — تعذّر الاتصال أو لم يتغيّر IP") }
+            report.update { r -> r.copy(rows = r.rows.map { if (it.id == cfg.id) it.copy(state = "fail", note = "تعذّر الاتصال أو لم يتغيّر IP") else it }) }
+            log("✗ فشل التفعيل الفردي: ${cfg.name}")
+        }
+    }
+
+    /**
      * فحص خلفي لا يقطع الاتصال الحالي إطلاقاً: يقيس زمن استجابة الخوادم البديلة عبر ping عادي
      * (يمر خلال النفق الحالي نفسه، لا يلمس واجهته). لا يبدّل إلا إن وُجد مرشّح أسرع بوضوح
      * (أقل من 70% من زمن النفق الحالي)، وحتى حينها يُختبر لثوانٍ معدودة فقط: إن لم يتفوّق فعلياً
@@ -379,11 +431,17 @@ class Engine(ctx: Context, private val store: Store) {
             }
             val label = networkLabel()
             when {
-                !st.connected -> reselect("تغيّر الشبكة", allowFast = true)
-                label != lastNetLabel && label != "غير متصل" -> {
+                !st.connected && s.autoConfig -> reselect("تغيّر الشبكة", allowFast = true)
+                !st.connected -> connectManual(s.selConfigId)
+                label != lastNetLabel && label != "غير متصل" && s.autoConfig -> {
                     lastNetLabel = label
                     log("تبدّلت الشبكة إلى $label")
                     reselect("تبدّل الشبكة إلى $label", allowFast = true)
+                }
+                label != lastNetLabel && label != "غير متصل" -> {
+                    lastNetLabel = label
+                    log("تبدّلت الشبكة إلى $label — إعادة الاتصال بالكونفيج المحدَّد يدوياً")
+                    connectManual(s.selConfigId)
                 }
                 else -> mutex.withLock {
                     // نفس نوع الشبكة (تغيّر IP فقط): نتحقق أن النفق سليم فعلاً
@@ -391,8 +449,10 @@ class Engine(ctx: Context, private val store: Store) {
                     if (lat != null) {
                         status.update { it.copy(latencyMs = lat, lastScanAt = now()) }
                         log("النفق سليم بعد تغيّر الشبكة (${lat}ms)")
-                    } else {
+                    } else if (s.autoConfig) {
                         recover("تغيّر الشبكة")
+                    } else {
+                        connectManual(s.selConfigId)
                     }
                 }
             }
