@@ -17,10 +17,10 @@ class Store(ctx: Context) {
         configs.value = f(configs.value)
         val a = JSONArray()
         configs.value.forEach {
-            a.put(
-                JSONObject().put("id", it.id).put("name", it.name)
-                    .put("text", it.text).put("enabled", it.enabled)
-            )
+            val o = JSONObject().put("id", it.id).put("name", it.name)
+                .put("text", it.text).put("enabled", it.enabled).put("lastCountry", it.lastCountry)
+            it.lastCountryUseful?.let { u -> o.put("lastCountryUseful", u) }
+            a.put(o)
         }
         sp.edit().putString("configs", a.toString()).apply()
     }
@@ -31,7 +31,11 @@ class Store(ctx: Context) {
             val a = JSONArray(s)
             (0 until a.length()).map {
                 val o = a.getJSONObject(it)
-                WgConfig(o.getString("id"), o.getString("name"), o.getString("text"), o.optBoolean("enabled", true))
+                WgConfig(
+                    o.getString("id"), o.getString("name"), o.getString("text"), o.optBoolean("enabled", true),
+                    o.optString("lastCountry", ""),
+                    if (o.has("lastCountryUseful")) o.getBoolean("lastCountryUseful") else null
+                )
             }
         } catch (e: Exception) {
             emptyList()
@@ -94,6 +98,7 @@ class Store(ctx: Context) {
             .put("reselectOnNetwork", s.reselectOnNetwork).put("periodMinV2", s.periodMin)
             .put("useRoot", s.useRoot).put("backgroundScan", s.backgroundScan).put("applyRoot", s.applyRoot)
             .put("allowFilteredDns", s.allowFilteredDns).put("killSwitch", s.killSwitch)
+            .put("excludeSameCountry", s.excludeSameCountry)
         sp.edit().putString("settings", o.toString()).apply()
     }
 
@@ -111,7 +116,8 @@ class Store(ctx: Context) {
                 o.optBoolean("backgroundScan", d.backgroundScan),
                 o.optBoolean("applyRoot", d.applyRoot),
                 o.optBoolean("allowFilteredDns", d.allowFilteredDns),
-                o.optBoolean("killSwitch", d.killSwitch)
+                o.optBoolean("killSwitch", d.killSwitch),
+                o.optBoolean("excludeSameCountry", d.excludeSameCountry)
             )
         } catch (e: Exception) {
             AppSettings()

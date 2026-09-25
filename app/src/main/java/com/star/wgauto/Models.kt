@@ -6,7 +6,11 @@ data class WgConfig(
     val id: String = UUID.randomUUID().toString(),
     val name: String,
     val text: String,
-    val enabled: Boolean = true
+    val enabled: Boolean = true,
+    /** آخر دولة IP خروج معروفة لهذا الكونفيج (رمز دولتين، من فحص فعلي سابق). */
+    val lastCountry: String = "",
+    /** null = لم يُختبر بعد؛ true = دولة مختلفة عن دولتك (مفيد لتخطي الحجب)؛ false = نفس دولتك. */
+    val lastCountryUseful: Boolean? = null
 )
 
 data class DnsServer(
@@ -36,7 +40,9 @@ data class AppSettings(
     val backgroundScan: Boolean = true,
     val applyRoot: Boolean = false,
     val allowFilteredDns: Boolean = false,
-    val killSwitch: Boolean = false
+    val killSwitch: Boolean = false,
+    /** استبعاد كونفيجات تعطي IP من نفس دولتك (Anycast قد يعيدك لأقرب سيرفر محلي، فلا يفيد لتخطي الحجب). */
+    val excludeSameCountry: Boolean = true
 )
 
 data class Status(
@@ -100,7 +106,8 @@ data class ConfigRow(
     val jitter: Int = 0,
     val loss: Int = 0,
     val exitIp: String = "",
-    val exitLoc: String = ""
+    val exitLoc: String = "",
+    val sameCountry: Boolean = false
 )
 
 data class DnsRow(

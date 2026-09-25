@@ -92,7 +92,8 @@ class Actions(
     val syncService: () -> Unit,
     val restoreSystem: () -> Unit,
     val shutdownAll: () -> Unit,
-    val openVpnSettings: () -> Unit
+    val openVpnSettings: () -> Unit,
+    val activateConfig: (String) -> Unit
 )
 
 class MainActivity : ComponentActivity() {
@@ -154,6 +155,14 @@ class MainActivity : ComponentActivity() {
                     startActivity(Intent(AndroidSettings.ACTION_VPN_SETTINGS))
                 } catch (e: Exception) {
                     toast("تعذّر فتح إعدادات VPN في هذا الجهاز")
+                }
+            },
+            activateConfig = { id ->
+                app.store.updateSettings { it.copy(autoConfig = false, selConfigId = id) }
+                if (app.engine.status.value.running) {
+                    app.engine.reselect("تفعيل يدوي")
+                } else {
+                    withVpnPermission { startVpn() }
                 }
             }
         )
@@ -434,10 +443,11 @@ fun ScanAgeLine(lastScanAt: Long) {
     Text(text, fontSize = 12.sp, color = color)
 }
 
-private fun rowLine(r: ConfigRow): String = when (r.state) {
-    "pending" -> "بانتظار الفحص"
-    "testing" -> "جارٍ الفحص…"
-    "fail" -> "✗ ${r.note}"
+private fun rowLine(r: ConfigRow): String = when {
+    r.sameCountry -> "⚠ نفس دولتك (${r.exitLoc}) — لا يفيد لتجاوز الحجب، مستبعَد تلقائياً"
+    r.state == "pending" -> "بانتظار الفحص"
+    r.state == "testing" -> "جارٍ الفحص…"
+    r.state == "fail" -> "✗ ${r.note}"
     else -> buildString {
         append("${r.latencyMs} ms")
         if (r.jitter > 0) append(" ±${r.jitter}")
@@ -469,8 +479,11 @@ fun ResultsCard(rep: Report, st: Status) {
                         Text(r.name, fontWeight = if (chosen) FontWeight.Bold else FontWeight.Normal)
                         Text(
                             rowLine(r), fontSize = 12.sp,
-                            color = if (r.state == "fail") MaterialTheme.colorScheme.error
-                            else MaterialTheme.colorScheme.onSurfaceVariant
+                            color = when {
+                                r.sameCountry -> Color(0xFFF9A825)
+                                r.state == "fail" -> MaterialTheme.colorScheme.error
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                            }
                         )
                     }
                 }
@@ -743,19 +756,29 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                         }
                         results[c.id]?.let { Text(it, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 8.dp)) }
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            val isManualPick = !s.autoConfig && s.selConfigId == c.id
+                            val isTargeted = !s.autoConfig && s.selConfigId == c.id
+                            val isLiveConnected = st.connected && st.activeConfigId == c.id
                             TextButton(onClick = {
-                                if (isManualPick) {
+                                if (isTargeted) {
                                     app.store.updateSettings { it.copy(autoConfig = true) }
                                     if (st.running) app.engine.reselect("العودة للاختيار التلقائي")
                                 } else {
-                                    app.store.updateSettings { it.copy(autoConfig = false, selConfigId = c.id) }
-                                    if (st.running) app.engine.reselect("تفعيل يدوي: ${c.name}")
+                                    a.activateConfig(c.id)
                                 }
                             }) {
                                 Text(
-                                    if (isManualPick) "⏸ إيقاف" else "▶ تفعيل",
-                                    color = if (isManualPick) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant
+                                    when {
+                                        isLiveConnected -> "✔ متصل فعلياً"
+                                        isTargeted && st.busy -> "⏳ جارٍ الاتصال…"
+                                        isTargeted -> "⏸ إيقاف (لم يتصل بعد)"
+                                        else -> "▶ تفعيل"
+                                    },
+                                    color = when {
+                                        isLiveConnected -> Color(0xFF2E7D32)
+                                        isTargeted && st.busy -> Color(0xFFF9A825)
+                                        isTargeted -> MaterialTheme.colorScheme.error
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    }
                                 )
                             }
                             TextButton(onClick = { a.testOne(c.id) }) { Text("فحص") }

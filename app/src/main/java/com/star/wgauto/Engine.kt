@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayInputStream
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -53,7 +54,10 @@ class Engine(ctx: Context, private val store: Store) {
         val mtu: Int, val dnsIps: List<String>, val diag: String
     )
 
-    private class Probe(val vpn: NetUtil.Info?, val mtu: Int, val lat: Int, val exit: ExitInfo?, val note: String)
+    private class Probe(
+        val vpn: NetUtil.Info?, val mtu: Int, val lat: Int, val exit: ExitInfo?, val note: String,
+        val sameCountry: Boolean = false
+    )
     private class SideScan(val info: SideInfo, val measures: List<Pair<DnsServer, DnsMeasure>>, val sys: Stat?)
 
     private val appCtx = ctx.applicationContext
@@ -615,10 +619,17 @@ class Engine(ctx: Context, private val store: Store) {
             log("✗ تعذّر ضبط DNS النظام")
             return
         }
-        delay(1500)
-        val after = Probes.systemResolveStat(under.network)
+        log("⏳ تطبيق DNS تجريبياً: ${cand.first.name} — يُتحقق خلال 5 ثوانٍ كحد أقصى")
+        // مهلة صارمة 5 ثوانٍ: لا يُترك النظام معلَّقاً على DNS لا يعمل أطول من ذلك.
+        val after = withTimeoutOrNull(5000) {
+            delay(1000)
+            Probes.systemResolveStat(under.network)
+        }
         if (after == null || after.loss > 25) {
-            log("✗ فشل الحل بعد تطبيق ${cand.first.name} — تراجعتُ عن التغيير")
+            log(
+                if (after == null) "✗ عُلِّق التحقق (>5 ثوانٍ) بعد تطبيق ${cand.first.name} — تراجعتُ فوراً"
+                else "✗ فشل الحل بعد تطبيق ${cand.first.name} — تراجعتُ عن التغيير"
+            )
             restoreNow()
         } else {
             store.prefPut("appliedDot", cand.first.dot)
@@ -795,7 +806,9 @@ class Engine(ctx: Context, private val store: Store) {
             if (direct != null && exit.ip == direct.ip) {
                 return Probe(null, m, lat, exit, "الـ IP لم يتغيّر — لا يحمل الحركة")
             }
-            return Probe(v, m, lat, exit, "")
+            val sameCountry = direct != null && exit.loc.isNotEmpty() &&
+                exit.loc.equals(direct.loc, ignoreCase = true)
+            return Probe(v, m, lat, exit, "", sameCountry)
         }
         return Probe(null, mtus.lastOrNull() ?: 0, -1, null, note)
     }
@@ -935,6 +948,8 @@ class Engine(ctx: Context, private val store: Store) {
 
         // ---- المرحلة أ: فحص سريع بدليل (واجهة + TCP + HTTPS + تغيّر IP) عبر النفق التجريبي
         val alive = ArrayList<Triple<WgConfig, Int, Int>>()   // كونفيج، تأخر، MTU الناجح
+        val sameCountryFallback = ArrayList<Triple<WgConfig, Int, Int>>()
+        var sameCountryLoc = ""
         for ((i, c) in candidates.withIndex()) {
             currentCoroutineContext().ensureActive()
             setProgress("فحص سريع ${i + 1}/${candidates.size}: ${c.name}")
@@ -948,13 +963,28 @@ class Engine(ctx: Context, private val store: Store) {
             updateRow(c.id) {
                 it.copy(
                     state = "ok", latencyMs = p.lat, mtu = p.mtu,
-                    exitIp = p.exit?.ip ?: "", exitLoc = p.exit?.loc ?: ""
+                    exitIp = p.exit?.ip ?: "", exitLoc = p.exit?.loc ?: "", sameCountry = p.sameCountry
                 )
+            }
+            if (p.sameCountry && s.autoConfig) {
+                sameCountryLoc = p.exit?.loc ?: ""
+                log("⚠ ${c.name}: نفس دولتك ($sameCountryLoc) — لا يفيد لتجاوز الحجب، مستبعَد من الاختيار التلقائي")
+                sameCountryFallback += Triple(c, p.lat, p.mtu)
+                continue
             }
             log("✓ ${c.name}: ${p.lat}ms • MTU ${p.mtu} • ${p.exit?.ip ?: "؟"} ${p.exit?.loc ?: ""}")
             alive += Triple(c, p.lat, p.mtu)
         }
         downSafe()
+
+        if (alive.isEmpty() && sameCountryFallback.isNotEmpty()) {
+            log(
+                "⚠ كل الكونفيجات المتاحة من نفس دولتك ($sameCountryLoc) — لن تساعد على تجاوز الحجب. " +
+                    "يُنصح بإضافة كونفيج من دولة أخرى. سيتصل التطبيق مؤقتاً بأفضلها."
+            )
+            status.update { it.copy(message = "تنبيه: كل الكونفيجات من دولتك ($sameCountryLoc) — لا تفيد لتجاوز الحجب") }
+            alive += sameCountryFallback
+        }
 
         if (alive.isEmpty()) {
             setProgress("لم ينجح أي كونفيج")
