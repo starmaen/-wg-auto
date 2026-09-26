@@ -20,9 +20,11 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -152,20 +154,65 @@ class Engine(ctx: Context, private val store: Store) {
     fun generateWarp() {
         warpStatus.value = "جارٍ التسجيل في WARP…"
         scope.launch {
-            try {
-                val r = WarpGenerator.register()
-                val base = "WARP"
-                var n = base
-                var i = 2
-                while (store.configs.value.any { it.name == n }) {
-                    n = "$base-$i"
-                    i++
+            mutex.withLock {
+                val prevStatus = status.value
+                try {
+                    // إن كان هناك نفق آخر يعمل بالفعل، سجّل WARP عبره — يجعل Cloudflare يرى IP
+                    // ذلك النفق بدل IP شبكتك المحلية، فيسجَّل WARP على مركز بيانات دولة مختلفة.
+                    val activeVpn = vpnInfo()?.takeIf { tunnelIsUp() }
+                    if (activeVpn != null) warpStatus.value = "جارٍ التسجيل في WARP عبر النفق النشط…"
+                    val r = WarpGenerator.register(activeVpn?.network)
+
+                    val base = "WARP"
+                    var n = base
+                    var i = 2
+                    while (store.configs.value.any { it.name == n }) {
+                        n = "$base-$i"
+                        i++
+                    }
+                    val err = addConfig(n, r.configText)
+                    if (err != null) {
+                        warpStatus.value = "✗ $err"
+                        return@withLock
+                    }
+
+                    // فحص فوري: هل IP الناتج من دولة مختلفة عن دولتك فعلاً؟ Cloudflare Anycast
+                    // يعيد غالباً أقرب مركز بيانات جغرافياً بلا تسجيل عبر نفق آخر، فيكون بلا فائدة.
+                    warpStatus.value = "جارٍ التحقق من دولة الخروج…"
+                    val cfg = store.configs.value.firstOrNull { it.name == n }
+                    val under = NetUtil.underlying(NetUtil.all(cm))
+                    val direct = under?.let { Probes.exitInfo(it.network, fast = true) }
+                    val p = if (cfg != null) probeTunnel(cfg, listOf(1280, 1420), emptyList(), direct) else null
+                    downSafe()
+                    when {
+                        p?.vpn == null -> {
+                            store.updateConfigs { l -> l.filter { it.id != cfg?.id } }
+                            warpStatus.value = "✗ $n: تعذّر الاتصال به بعد التوليد — حُذف"
+                        }
+                        p.sameCountry -> {
+                            store.updateConfigs { l -> l.filter { it.id != cfg?.id } }
+                            warpStatus.value =
+                                "✗ WARP لا يفيد من شبكتك الحالية: أعطى IP من نفس دولتك (${p.exit?.loc}) — حُذف. " +
+                                    "جرّب توليده وأنت متصل بنفق آخر يعمل (اضغط تفعيل على كونفيج ناجح أولاً)، أو استخدم مصدراً آخر."
+                        }
+                        else -> warpStatus.value = "✔ أُضيف $n — خروج فعلي من ${p.exit?.loc ?: "دولة أخرى"}"
+                    }
+                } catch (e: Exception) {
+                    warpStatus.value = "✗ فشل تسجيل WARP: ${e.message ?: e.javaClass.simpleName}"
+                    log("WARP: ${e.message}")
+                } finally {
+                    // فحص WARP يقطع أي نفق كان عاملاً مؤقتاً — نعيد الاتصال بما كان يعمل قبل ذلك.
+                    val prevCfg = prevStatus.activeConfigId?.let { id -> store.configs.value.firstOrNull { it.id == id } }
+                    if (prevStatus.connected && prevCfg != null && !tunnelIsUp()) {
+                        val prevDns = prevStatus.activeDnsId?.let { id -> store.dns.value.firstOrNull { it.id == id } }
+                        val backDirect = if (prevStatus.directIp.isNotEmpty()) ExitInfo(prevStatus.directIp, prevStatus.directLoc, 0) else null
+                        val back = connectAndVerify(prevCfg, prevStatus.activeMtu, prevDns?.ips() ?: emptyList(), backDirect)
+                        if (back != null) {
+                            status.update { it.copy(connected = true, latencyMs = back.lat, message = "متصل ✔") }
+                            log("↩ عاد الاتصال بـ ${prevCfg.name} بعد فحص WARP")
+                        }
+                    }
                 }
-                val err = addConfig(n, r.configText)
-                warpStatus.value = if (err == null) "✔ أُضيف $n" else "✗ $err"
-            } catch (e: Exception) {
-                warpStatus.value = "✗ فشل تسجيل WARP: ${e.message ?: e.javaClass.simpleName}"
-                log("WARP: ${e.message}")
             }
         }
     }
@@ -680,23 +727,32 @@ class Engine(ctx: Context, private val store: Store) {
             return
         }
         log("⏳ تطبيق DNS تجريبياً: ${cand.first.name} — يُتحقق خلال 5 ثوانٍ كحد أقصى")
-        // مهلة صارمة 5 ثوانٍ: لا يُترك النظام معلَّقاً على DNS لا يعمل أطول من ذلك.
-        val after = withTimeoutOrNull(5000) {
-            delay(1000)
-            Probes.systemResolveStat(under.network)
-        }
-        if (after == null || after.loss > 25) {
-            log(
-                if (after == null) "✗ عُلِّق التحقق (>5 ثوانٍ) بعد تطبيق ${cand.first.name} — تراجعتُ فوراً"
-                else "✗ فشل الحل بعد تطبيق ${cand.first.name} — تراجعتُ عن التغيير"
-            )
-            restoreNow()
-        } else {
-            store.prefPut("appliedDot", cand.first.dot)
-            log(
-                "✔ DNS النظام: ${cand.first.name} (${cand.first.dot}) — DoT ${cand.second.median}ms " +
-                    "مقابل الحالي ${base?.median ?: "؟"}ms، وبعد التطبيق ${after.median}ms"
-            )
+        var confirmed = false
+        try {
+            // مهلة صارمة 5 ثوانٍ: لا يُترك النظام معلَّقاً على DNS لا يعمل أطول من ذلك.
+            val after = withTimeoutOrNull(5000) {
+                delay(1000)
+                Probes.systemResolveStat(under.network)
+            }
+            if (after == null || after.loss > 25) {
+                log(
+                    if (after == null) "✗ عُلِّق التحقق (>5 ثوانٍ) بعد تطبيق ${cand.first.name} — تراجعتُ فوراً"
+                    else "✗ فشل الحل بعد تطبيق ${cand.first.name} — تراجعتُ عن التغيير"
+                )
+            } else {
+                confirmed = true
+                store.prefPut("appliedDot", cand.first.dot)
+                log(
+                    "✔ DNS النظام: ${cand.first.name} (${cand.first.dot}) — DoT ${cand.second.median}ms " +
+                        "مقابل الحالي ${base?.median ?: "؟"}ms، وبعد التطبيق ${after.median}ms"
+                )
+            }
+        } finally {
+            // يعمل حتى لو أُلغيت هذه العملية أو استُبدلت بفحص آخر أثناء الانتظار — لا يبقى
+            // النظام عالقاً على DNS غير مؤكَّد مهما حدث.
+            if (!confirmed) {
+                withContext(NonCancellable) { restoreNow() }
+            }
         }
     }
 

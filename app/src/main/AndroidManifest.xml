@@ -11,7 +11,8 @@
     <application
         android:name=".WgApp"
         android:allowBackup="false"
-        android:icon="@drawable/ic_launcher"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="WG Auto"
         android:supportsRtl="true"
         android:theme="@style/Theme.WGAuto">

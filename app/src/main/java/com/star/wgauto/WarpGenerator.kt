@@ -4,6 +4,7 @@ import android.util.Base64
 import org.json.JSONObject
 import java.math.BigInteger
 import java.net.HttpURLConnection
+import java.net.Network
 import java.net.URL
 import java.security.SecureRandom
 import java.text.SimpleDateFormat
@@ -104,8 +105,15 @@ object WarpGenerator {
 
     class WarpResult(val configText: String) 
 
-    /** يسجّل جهازاً جديداً في WARP ويبني نص كونفيج WireGuard جاهزاً. يرمي استثناءً برسالة واضحة عند الفشل. */
-    fun register(): WarpResult {
+    /**
+     * يسجّل جهازاً جديداً في WARP ويبني نص كونفيج WireGuard جاهزاً. يرمي استثناءً برسالة واضحة عند الفشل.
+     * network: مرّر شبكة نفق نشط بالفعل (VPN آخر متصل) لتوجيه طلب التسجيل عبره — بما أن Cloudflare
+     * يختار أقرب مركز بيانات حسب الـ IP الذي يراه (Anycast)، فتسجيل الطلب عبر نفق في دولة أخرى
+     * يجعل WARP نفسه يُسجَّل على مركز بيانات تلك الدولة بدل دولتك الأصلية. بلا ذلك، ولا سيما من
+     * شبكات ذات توجيه محلي صارم، ستحصل غالباً على مركز بيانات في دولتك — هذا قيد من Cloudflare
+     * نفسه لا من هذا التطبيق، ولا حل برمجي بديل له سوى تمرير الطلب عبر نفق آخر كما هنا.
+     */
+    fun register(network: Network? = null): WarpResult {
         val (priv, pub) = X25519.generateKeyPair()
         val privB64 = b64(priv)
         val pubB64 = b64(pub)
@@ -123,7 +131,8 @@ object WarpGenerator {
             put("locale", "en_US")
         }.toString()
 
-        val conn = (URL(REG_URL).openConnection() as HttpURLConnection).apply {
+        val regUrl = URL(REG_URL)
+        val conn = ((network?.openConnection(regUrl) ?: regUrl.openConnection()) as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 8000
             readTimeout = 8000
