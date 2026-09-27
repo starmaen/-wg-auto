@@ -1,10 +1,10 @@
 package com.star.wgauto
 
+import android.net.Network
 import android.util.Base64
 import org.json.JSONObject
 import java.math.BigInteger
 import java.net.HttpURLConnection
-import java.net.Network
 import java.net.URL
 import java.security.SecureRandom
 import java.text.SimpleDateFormat
