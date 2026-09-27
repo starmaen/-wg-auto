@@ -186,16 +186,19 @@ class Engine(ctx: Context, private val store: Store) {
                     downSafe()
                     when {
                         p?.vpn == null -> {
-                            store.updateConfigs { l -> l.filter { it.id != cfg?.id } }
-                            warpStatus.value = "✗ $n: تعذّر الاتصال به بعد التوليد — حُذف"
+                            setResult(cfg?.id ?: "", "✗ ${p?.note ?: "تعذّر الاتصال بعد التوليد"} — الكونفيج محفوظ، جرّب فحصه يدوياً لاحقاً")
+                            warpStatus.value = "⚠ أُضيف $n لكن تعذّر التحقق منه الآن (${p?.note ?: "الشبكة مشغولة"})"
                         }
                         p.sameCountry -> {
-                            store.updateConfigs { l -> l.filter { it.id != cfg?.id } }
+                            setResult(cfg?.id ?: "", "⚠ نفس دولتك (${p.exit?.loc}) — لا يفيد لتجاوز الحجب، لكنه محفوظ")
                             warpStatus.value =
-                                "✗ WARP لا يفيد من شبكتك الحالية: أعطى IP من نفس دولتك (${p.exit?.loc}) — حُذف. " +
-                                    "جرّب توليده وأنت متصل بنفق آخر يعمل (اضغط تفعيل على كونفيج ناجح أولاً)، أو استخدم مصدراً آخر."
+                                "⚠ أُضيف $n، لكن IP الخروج من نفس دولتك (${p.exit?.loc}) فلن يفيد لتجاوز الحجب. " +
+                                    "لدولة مختلفة: فعّل كونفيجاً ناجحاً آخر أولاً ثم ولّد WARP مجدداً وهو يعمل."
                         }
-                        else -> warpStatus.value = "✔ أُضيف $n — خروج فعلي من ${p.exit?.loc ?: "دولة أخرى"}"
+                        else -> {
+                            setResult(cfg?.id ?: "", "✓ خروج فعلي من ${p.exit?.loc ?: "دولة أخرى"} • ${p.lat}ms")
+                            warpStatus.value = "✔ أُضيف $n — خروج فعلي من ${p.exit?.loc ?: "دولة أخرى"}"
+                        }
                     }
                 } catch (e: Exception) {
                     warpStatus.value = "✗ فشل تسجيل WARP: ${e.message ?: e.javaClass.simpleName}"
