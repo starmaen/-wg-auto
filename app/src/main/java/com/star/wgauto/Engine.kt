@@ -175,7 +175,14 @@ class Engine(ctx: Context, private val store: Store) {
                             warpStatus.value = "لا يوجد نفق نشط — تجربة ${candidate.name} مؤقتاً لتوليد WARP عبره…"
                             val under0 = NetUtil.underlying(NetUtil.all(cm))
                             val direct0 = under0?.let { Probes.exitInfo(it.network, fast = true) }
-                            val ver0 = connectAndVerify(candidate, null, emptyList(), direct0)
+                            // لا نترك DNS فارغاً هنا (السبب الفعلي لفشل حلّ اسم خادم WARP على
+                            // كونفيجات بلا سطر DNS خاص بها) — نستخدم نفس DNS الذي يختاره التطبيق
+                            // تلقائياً لبقية الاتصالات (أفضل خادم مفعَّل غير مُرشِّح)، لا رقماً
+                            // منفصلاً، حتى يبقى الاختيار من مصدر واحد متّسق. 1.1.1.1 احتياط أخير
+                            // فقط إن لم يبقَ أي خادم DNS مفعَّل عند المستخدم.
+                            val bootDns = store.dns.value.firstOrNull { it.enabled && !it.filtered }
+                                ?.ips()?.takeIf { it.isNotEmpty() } ?: listOf("1.1.1.1", "1.0.0.1")
+                            val ver0 = connectAndVerify(candidate, null, bootDns, direct0)
                             if (ver0 != null) {
                                 bootstrapped = candidate
                                 activeVpn = ver0.vpn
@@ -373,8 +380,18 @@ class Engine(ctx: Context, private val store: Store) {
         val ver = connectAndVerify(cfg, startMtu, dns?.ips() ?: emptyList(), direct)
         if (ver != null) {
             markConnected(cfg, dns, emptyList(), ver, null, networkLabel(), direct, emptyList())
-            report.update { r -> r.copy(rows = r.rows.map { if (it.id == cfg.id) it.copy(state = "ok", latencyMs = ver.lat) else it }) }
-            log("✔ تفعيل فردي: ${cfg.name} • ${ver.diag}")
+            // تحذير شفاف في كل مرة: شبكات Anycast مثل Cloudflare WARP قد تُعيد توجيهك لمركز
+            // بيانات مختلف (ربما دولتك) كلما تغيّرت الشبكة الفعلية — حتى لنفس الكونفيج بلا تغيير.
+            val sameCountry = direct != null && ver.exit?.loc?.isNotEmpty() == true &&
+                ver.exit.loc.equals(direct.loc, ignoreCase = true)
+            val note = if (sameCountry) " ⚠ نفس دولتك (${ver.exit?.loc}) على هذه الشبكة" else ""
+            report.update { r ->
+                r.copy(rows = r.rows.map {
+                    if (it.id == cfg.id) it.copy(state = "ok", latencyMs = ver.lat, sameCountry = sameCountry) else it
+                })
+            }
+            if (sameCountry) status.update { it.copy(message = "متصل ✔ لكن$note") }
+            log("✔ تفعيل فردي: ${cfg.name} • ${ver.diag}$note")
         } else {
             status.update { it.copy(connected = false, message = "فشل تفعيل ${cfg.name} — تعذّر الاتصال أو لم يتغيّر IP") }
             report.update { r -> r.copy(rows = r.rows.map { if (it.id == cfg.id) it.copy(state = "fail", note = "تعذّر الاتصال أو لم يتغيّر IP") else it }) }
