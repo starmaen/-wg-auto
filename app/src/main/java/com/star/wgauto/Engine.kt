@@ -98,6 +98,10 @@ class Engine(ctx: Context, private val store: Store) {
     @Volatile
     private var cooldownUntil = 0L
 
+    /** يمنع محاولة تغيير DNS النظام أكثر من مرة كل 30 دقيقة (كل محاولة تفتح نافذة اختبار قصيرة). */
+    @Volatile
+    private var dnsChangeCooldownUntil = 0L
+
     private fun now() = System.currentTimeMillis()
 
     fun log(msg: String) {
@@ -156,11 +160,34 @@ class Engine(ctx: Context, private val store: Store) {
         scope.launch {
             mutex.withLock {
                 val prevStatus = status.value
+                var bootstrapped: WgConfig? = null
                 try {
                     // إن كان هناك نفق آخر يعمل بالفعل، سجّل WARP عبره — يجعل Cloudflare يرى IP
                     // ذلك النفق بدل IP شبكتك المحلية، فيسجَّل WARP على مركز بيانات دولة مختلفة.
-                    val activeVpn = vpnInfo()?.takeIf { tunnelIsUp() }
-                    if (activeVpn != null) warpStatus.value = "جارٍ التسجيل في WARP عبر النفق النشط…"
+                    var activeVpn = vpnInfo()?.takeIf { tunnelIsUp() }
+
+                    // لا يوجد نفق يعمل حالياً: جرّب تشغيل كونفيج ناجح آخر مؤقتاً فقط لتسجيل WARP
+                    // عبره، ثم أعِد الحالة كما كانت. هذا الطريق الوحيد المضمون تقنياً لتفادي حصول
+                    // WARP على عنوان من دولتك (قيد من توجيه Cloudflare Anycast نفسه لا حل برمجي بديل).
+                    if (activeVpn == null) {
+                        val candidate = store.configs.value.firstOrNull { it.enabled && it.name != "WARP" && !it.name.startsWith("WARP-") }
+                        if (candidate != null) {
+                            warpStatus.value = "لا يوجد نفق نشط — تجربة ${candidate.name} مؤقتاً لتوليد WARP عبره…"
+                            val under0 = NetUtil.underlying(NetUtil.all(cm))
+                            val direct0 = under0?.let { Probes.exitInfo(it.network, fast = true) }
+                            val ver0 = connectAndVerify(candidate, null, emptyList(), direct0)
+                            if (ver0 != null) {
+                                bootstrapped = candidate
+                                activeVpn = ver0.vpn
+                                warpStatus.value = "جارٍ التسجيل في WARP عبر ${candidate.name}…"
+                            } else {
+                                warpStatus.value = "تعذّر تشغيل ${candidate.name} مؤقتاً — سيُسجَّل WARP مباشرة (قد يعطي IP محلياً)"
+                            }
+                        }
+                    } else {
+                        warpStatus.value = "جارٍ التسجيل في WARP عبر النفق النشط…"
+                    }
+
                     val r = WarpGenerator.register(activeVpn?.network)
 
                     val base = "WARP"
@@ -703,7 +730,10 @@ class Engine(ctx: Context, private val store: Store) {
             }
         }
 
-        // 2) DNS النظام (Private DNS): خادم DoT مقاس فعلاً وبفقد 0% وأفضل من الحالي بوضوح
+        // 2) DNS النظام (Private DNS): خادم DoT مقاس فعلاً وبفقد 0% وأفضل من الحالي بوضوح.
+        // تهدئة 30 دقيقة بين محاولتين: كل محاولة تفتح نافذة اختبار قصيرة قد تُحسّ كانقطاع، فلا
+        // داعي لتكرارها في كل فحص خلفية.
+        if (now() < dnsChangeCooldownUntil) return
         val cand = direct.measures
             .filter { allowFiltered || !it.first.filtered }
             .mapNotNull { (d, m) -> m.dot?.takeIf { it.loss == 0 && d.dot.isNotEmpty() }?.let { d to it } }
@@ -725,6 +755,7 @@ class Engine(ctx: Context, private val store: Store) {
             store.prefPut("prevSpec", spec)
             store.prefPut("prevDnsSaved", "1")
         }
+        dnsChangeCooldownUntil = now() + 30 * 60 * 1000
         if (!RootTools.setPrivateDns(cand.first.dot)) {
             log("✗ تعذّر ضبط DNS النظام")
             return

@@ -759,8 +759,9 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                             val isLiveConnected = st.connected && st.activeConfigId == c.id
                             TextButton(onClick = {
                                 if (isTargeted) {
-                                    app.store.updateSettings { it.copy(autoConfig = true) }
-                                    if (st.running) app.engine.reselect("العودة للاختيار التلقائي")
+                                    // إيقاف هذا الكونفيج فقط — لا يُغيَّر إعداد الاختيار التلقائي
+                                    // ولا يبدأ أي فحص شامل؛ العودة للتلقائي فعل منفصل ومقصود.
+                                    if (st.running) app.engine.stop()
                                 } else {
                                     a.activateConfig(c.id)
                                 }
