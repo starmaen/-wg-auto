@@ -277,7 +277,7 @@ object Probes {
      * اختبار سريع لمرور البيانات: يحاول عدة وجهات لمدة قصيرة، وعند أول نجاح يأخذ أفضل قياسين.
      * مرّر network لربطه بواجهة الـ VPN، وإلا فسيُقاس المسار الافتراضي (وقد لا يكون النفق).
      */
-    fun quickAlive(network: Network? = null, budgetMs: Long = 3200): Int? {
+    fun quickAlive(network: Network? = null, budgetMs: Long = 5000): Int? {
         val hosts = listOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222")
         val t0 = System.nanoTime()
         var i = 0
@@ -329,7 +329,8 @@ object Probes {
             "https://www.cloudflare.com/cdn-cgi/trace",
             "https://api64.ipify.org"
         )
-        for (u in urls) httpTrace(u, network, if (fast) 2500 else 3500).first?.let { return it }
+        // مهلة أطول قليلاً من المعتاد: شبكات الجوال عادة أبطأ وأكثر تذبذباً من الواي فاي.
+        for (u in urls) httpTrace(u, network, if (fast) 4000 else 5000).first?.let { return it }
         return null
     }
 

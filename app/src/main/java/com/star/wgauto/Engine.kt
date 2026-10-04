@@ -273,18 +273,28 @@ class Engine(ctx: Context, private val store: Store) {
         reselect("تشغيل", allowFast = true)
     }
 
+    /**
+     * إيقاف فوري من واجهة المستخدم — لا ينتظر انتهاء أي فحص شبكة قد يكون عالقاً في استدعاء
+     * محظور إلغاؤه (مقبس خام، أمر su، إلخ)، وهذا شائع تحديداً على شبكات الجوال البطيئة. ننزل
+     * النفق ونحدّث الحالة فوراً وبشكل متزامن، ثم ننظّف ما تبقى في الخلفية بلا أي انتظار من
+     * المستخدم.
+     */
     fun stop() {
+        down()
+        if (killSwitchApplied) {
+            RootTools.killSwitchDisable()
+            killSwitchApplied = false
+        }
+        status.value = Status(running = false, message = "متوقف")
+        report.update { it.copy(progress = "", chosenConfigId = "", chosenDnsId = "") }
+        log("تم الإيقاف")
+        val jobs = listOfNotNull(netJob, runJob, scanJob)
+        netJob?.cancel()
+        runJob?.cancel()
+        scanJob?.cancel()
         scope.launch {
-            netJob?.cancelAndJoin()
-            runJob?.cancelAndJoin()
-            mutex.withLock { downSafe() }
-            if (killSwitchApplied) {
-                RootTools.killSwitchDisable()
-                killSwitchApplied = false
-            }
-            status.value = Status(running = false, message = "متوقف")
-            report.update { it.copy(progress = "", chosenConfigId = "", chosenDnsId = "") }
-            log("تم الإيقاف")
+            jobs.forEach { it.cancelAndJoin() }
+            mutex.withLock { downSafe() }   // تنظيف نهائي بلا عجلة، بعد أن ظهرت حالة "متوقف" فعلاً
             if (store.settings.value.backgroundScan) scanNetwork("بعد الإيقاف")
         }
     }
@@ -293,25 +303,30 @@ class Engine(ctx: Context, private val store: Store) {
      * إغلاق شامل نهائي: إيقاف النفق، إلغاء قاطع الطوارئ، إيقاف الفحص الدوري في الخلفية،
      * واستعادة DNS الخاص للنظام إلى ما كان عليه قبل أي تدخّل من التطبيق.
      */
+    /** إغلاق فوري من الواجهة؛ التنظيف الكامل (الروت، DNS) يتابع في الخلفية بلا انتظار. */
     fun shutdownAll(onDone: () -> Unit) {
+        down()
+        if (killSwitchApplied || RootTools.killSwitchActive()) {
+            RootTools.killSwitchDisable()
+            killSwitchApplied = false
+        }
+        store.updateSettings { it.copy(backgroundScan = false) }
+        status.value = Status(running = false, message = "أُغلق التطبيق بالكامل")
+        report.value = Report()
+        netInfo.value = NetInfo()
+        log("إغلاق شامل: أُوقف كل شيء")
+        val jobs = listOfNotNull(netJob, runJob, scanJob)
+        netJob?.cancel()
+        runJob?.cancel()
+        scanJob?.cancel()
+        onDone()
         scope.launch {
-            netJob?.cancelAndJoin()
-            runJob?.cancelAndJoin()
-            scanJob?.cancelAndJoin()
+            jobs.forEach { it.cancelAndJoin() }
             mutex.withLock {
                 downSafe()
-                if (killSwitchApplied || RootTools.killSwitchActive()) {
-                    RootTools.killSwitchDisable()
-                    killSwitchApplied = false
-                }
                 if (store.prefGet("prevDnsSaved") != null) restoreNow()
-                store.updateSettings { it.copy(backgroundScan = false) }
-                status.value = Status(running = false, message = "أُغلق التطبيق بالكامل")
-                report.value = Report()
-                netInfo.value = NetInfo()
-                log("إغلاق شامل: أُوقف كل شيء واستُعيدت إعدادات النظام")
+                log("اكتمل تنظيف الإغلاق الشامل")
             }
-            onDone()
         }
     }
 
@@ -917,7 +932,9 @@ class Engine(ctx: Context, private val store: Store) {
      * تغيّر الـ IP الخارجي، وحل DNS. عند الفشل يجرّب سلّم MTU أدنى ثم الكونفيج بلا أي تعديل (كتطبيق WireGuard الرسمي).
      */
     private suspend fun connectAndVerify(cfg: WgConfig, mtu: Int?, dns: List<String>, direct: ExitInfo?): Verified? {
-        val rungs: List<Int?> = listOfNotNull(mtu, 1280, 1120).distinct() + listOf<Int?>(null)
+        // 1000 إضافية: شبكات الجوال (خصوصاً مع NAT64/464XLAT عند بعض المشغّلين) غالباً ما
+        // تحتاج MTU أقل من المعتاد على الواي فاي.
+        val rungs: List<Int?> = listOfNotNull(mtu, 1280, 1120, 1000).distinct() + listOf<Int?>(null)
         for (m in rungs) {
             val label = m?.toString() ?: "الافتراضي"
             var ips: List<String> = if (m == null) emptyList() else dns
