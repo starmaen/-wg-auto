@@ -204,7 +204,41 @@ class Engine(ctx: Context, private val store: Store) {
                         n = "$base-$i"
                         i++
                     }
-                    val err = addConfig(n, r.configText)
+                    // نولّد أولاً بالنص الافتراضي ثم نختبر بدائل Endpoint ونحفظ الأفضل أجنبياً
+                    var bestText = r.configText
+                    var bestNote = ""
+                    var bestProbe: Probe? = null
+                    val under = NetUtil.underlying(NetUtil.all(cm))
+                    val direct = under?.let { Probes.exitInfo(it.network, fast = true) }
+                    val directCc = direct?.loc ?: ""
+                    warpStatus.value = "جارٍ تجربة ${WarpGenerator.variants(r).size} عناوين WARP لاختيار خروج أجنبي…"
+                    // كونفيج مؤقت للفحص (لا نحفظ كل البدائل، فقط الأفضل)
+                    val tmpCfg = WgConfig(name = "tmp-warp-probe", text = r.configText)
+                    var tried = 0
+                    for (ep in WarpGenerator.variants(r, max = 6)) {
+                        tried++
+                        warpStatus.value = "تجربة عنوان $tried/${WarpGenerator.variants(r).size}: $ep"
+                        val t = tmpCfg.copy(text = r.withEndpoint(ep))
+                        val p = probeTunnel(t, listOf(1280), emptyList(), direct)
+                        if (p.vpn == null) {
+                            log("WARP $ep: ✗ ${p.note}")
+                            continue
+                        }
+                        val cc = p.exit?.loc ?: ""
+                        val foreign = directCc.isEmpty() || cc.isEmpty() || !cc.equals(directCc, true)
+                        log("WARP $ep: ${p.lat}ms • ${Country.ipLine(p.exit?.ip ?: "", cc)}" + if (!foreign) " (محلي)" else " (أجنبي ★)")
+                        if (foreign) {
+                            bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
+                            break // وجدنا أجنبياً — لا نضيع وقتاً وبيانات أكثر
+                        }
+                        if (bestProbe == null && p.lat < (bestProbe?.lat ?: Int.MAX_VALUE)) {
+                            bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
+                        } else if (bestProbe != null && p.lat < bestProbe!!.lat &&
+                            (bestProbe!!.exit?.loc.equals(directCc, true) == p.exit?.loc.equals(directCc, true))) {
+                            bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
+                        }
+                    }
+                    val err = addConfig(n, bestText)
                     if (err != null) {
                         warpStatus.value = "✗ $err"
                         return@withLock
@@ -214,9 +248,15 @@ class Engine(ctx: Context, private val store: Store) {
                     // يعيد غالباً أقرب مركز بيانات جغرافياً بلا تسجيل عبر نفق آخر، فيكون بلا فائدة.
                     warpStatus.value = "جارٍ التحقق من دولة الخروج…"
                     val cfg = store.configs.value.firstOrNull { it.name == n }
-                    val under = NetUtil.underlying(NetUtil.all(cm))
-                    val direct = under?.let { Probes.exitInfo(it.network, fast = true) }
-                    val p = if (cfg != null) probeTunnel(cfg, listOf(1280, 1420), emptyList(), direct) else null
+                    // حفظ الدولة فوراً لعرض العلم بجانب IP
+                    val p = bestProbe
+                    if (cfg != null && p?.exit != null) {
+                        store.updateConfigs { l -> l.map {
+                            if (it.id == cfg.id) it.copy(lastCountry = p.exit.loc,
+                                lastCountryUseful = directCc.isEmpty() || !p.exit.loc.equals(directCc, true))
+                            else it
+                        } }
+                    }
                     downSafe()
                     when {
                         p?.vpn == null -> {
@@ -224,14 +264,14 @@ class Engine(ctx: Context, private val store: Store) {
                             warpStatus.value = "⚠ أُضيف $n لكن تعذّر التحقق منه الآن (${p?.note ?: "الشبكة مشغولة"})"
                         }
                         p.sameCountry -> {
-                            setResult(cfg?.id ?: "", "⚠ نفس دولتك (${p.exit?.loc}) — لا يفيد لتجاوز الحجب، لكنه محفوظ")
+                            setResult(cfg?.id ?: "", "⚠ ${Country.label(p.exit?.loc ?: "")} — نفس دولتك، لا يفيد للحجب لكنه محفوظ للسرعة")
                             warpStatus.value =
-                                "⚠ أُضيف $n، لكن IP الخروج من نفس دولتك (${p.exit?.loc}) فلن يفيد لتجاوز الحجب. " +
-                                    "لدولة مختلفة: فعّل كونفيجاً ناجحاً آخر أولاً ثم ولّد WARP مجدداً وهو يعمل."
+                                "⚠ أُضيف $n ${Country.label(p.exit?.loc ?: "")} عبر $bestNote — نفس دولتك فلن يفيد للحجب. " +
+                                    "جرّب: فعّل كونفيجاً أجنبياً أولاً ثم ولّد WARP مجدداً وهو يعمل، أو جرّب مولداً آخر."
                         }
                         else -> {
-                            setResult(cfg?.id ?: "", "✓ خروج فعلي من ${p.exit?.loc ?: "دولة أخرى"} • ${p.lat}ms")
-                            warpStatus.value = "✔ أُضيف $n — خروج فعلي من ${p.exit?.loc ?: "دولة أخرى"}"
+                            setResult(cfg?.id ?: "", "✓ ${Country.ipLine(p.exit?.ip ?: "", p.exit?.loc ?: "")} • ${p.lat}ms عبر $bestNote")
+                            warpStatus.value = "✔ أُضيف $n — خروج فعلي ${Country.label(p.exit?.loc ?: "")} عبر $bestNote"
                         }
                     }
                 } catch (e: Exception) {
@@ -379,6 +419,17 @@ class Engine(ctx: Context, private val store: Store) {
         if (cfg == null) {
             status.update { it.copy(message = "الكونفيج غير موجود") }
             return
+        }
+        // بلا تقطيع عبثي: إن كنا متصلين فعلاً بنفس الكونفيج والنفق سليم، لا نهدمه
+        val st0 = status.value
+        if (st0.connected && st0.activeConfigId == cfgId && tunnelIsUp()) {
+            val v = vpnInfo()
+            val lat = v?.let { Probes.quickAlive(it.network) }
+            if (lat != null) {
+                status.update { it.copy(latencyMs = lat, lastScanAt = now(), message = "متصل ✔ (بدون إعادة بناء — النفق سليم ${lat}ms)") }
+                log("↩ نفس الكونفيج متصل وسليم — لم يُعَد البناء لتفادي التقطيع")
+                return
+            }
         }
         status.update { it.copy(running = true, busy = true, connected = false, message = "جارٍ الاتصال بـ ${cfg.name}…") }
         report.value = Report(rows = listOf(ConfigRow(cfg.id, cfg.name, state = "testing")))
@@ -856,6 +907,10 @@ class Engine(ctx: Context, private val store: Store) {
         }
     }
 
+    /** آخر خطأ فعلي من backend.setState لعرضه بدل رسالة عامة. */
+    @Volatile
+    private var lastUpError = ""
+
     // ---------- التحكم بالنفق: رفع وإنزال آمن مع التحقق ----------
     /** appOnly = true: نفق تجريبي خاص بهذا التطبيق فقط (لا يقطع بقية التطبيقات). */
     private fun up(c: WgConfig, mtu: Int?, dns: List<String>, appOnly: Boolean, quiet: Boolean = false): Boolean {
@@ -865,10 +920,13 @@ class Engine(ctx: Context, private val store: Store) {
             val cfg = Config.parse(ByteArrayInputStream(text.toByteArray()))
             backend.setState(tunnel, Tunnel.State.UP, cfg)
             lastOwnChange = now()
+            lastUpError = ""
             true
         } catch (e: Exception) {
             lastOwnChange = now()
-            if (!quiet) log("خطأ في ${c.name}: ${e.message ?: e.javaClass.simpleName}")
+            lastUpError = e.message?.take(120) ?: e.javaClass.simpleName
+            // حتى في الفحص الصامت نحفظ السبب في اللوج، لأن "لم تُنشأ الواجهة" وحده لا يساعد
+            log("خطأ في ${c.name}: $lastUpError")
             false
         }
     }
@@ -982,7 +1040,8 @@ class Engine(ctx: Context, private val store: Store) {
         var note = "لم تُنشأ واجهة النفق"
         for (m in mtus) {
             val v = bringUp(c, m, dns, appOnly = true, quiet = true)
-                ?: return Probe(null, m, -1, null, "لم تُنشأ واجهة النفق")
+                ?: return Probe(null, m, -1, null,
+                    if (lastUpError.isNotEmpty()) "لم تُنشأ الواجهة: $lastUpError" else "لم تُنشأ واجهة النفق (تأكد من إذن VPN وعدم وجود VPN آخر)")
             val lat = Probes.quickAlive(v.network)
                 ?: return Probe(null, m, -1, null, "الخادم لا يستجيب (لا تمر بيانات)")
             val exit = Probes.exitInfo(v.network, fast = true)
@@ -1005,8 +1064,28 @@ class Engine(ctx: Context, private val store: Store) {
 
     fun testConfigs(ids: List<String>) {
         if (ids.isEmpty()) return
+        // فحص صامت بلا قطع: إن كان VPN يعمل، لا نرفع أنفاقاً — نكتفي بping المنفذ
+        // عبر المسار الحالي. لا يقطع الاتصال إطلاقاً.
         if (status.value.running) {
-            ids.forEach { setResult(it, "سيُفحص عند إعادة الفحص (الـ VPN يعمل)") }
+            scope.launch {
+                for (id in ids) {
+                    val c = store.configs.value.firstOrNull { it.id == id } ?: continue
+                    val ep = Probes.parseEndpoint(c.text)
+                    if (ep == null) {
+                        setResult(id, "✗ لا يوجد Endpoint صالح في الكونفيج")
+                        continue
+                    }
+                    setResult(id, "فحص صامت (بلا قطع)…")
+                    val rtt = Probes.pingOnce(ep.first)
+                    if (rtt == null) {
+                        setResult(id, "⚠ صامت: الخادم لا يرد ping — قد يكون محجوباً أو ميتاً (افحصه لاحقاً بدون VPN)")
+                    } else {
+                        val cc = store.configs.value.firstOrNull { it.id == id }?.lastCountry ?: ""
+                        val flag = if (cc.isNotEmpty()) " ${Country.label(cc)}" else ""
+                        setResult(id, "○ صامت: ping ${ep.first} ≈ ${rtt}ms$flag — الفحص الكامل بعد إيقاف VPN")
+                    }
+                }
+            }
             return
         }
         ids.forEach { setResult(it, "بانتظار الفحص…") }
@@ -1030,7 +1109,7 @@ class Engine(ctx: Context, private val store: Store) {
                     setResult(
                         id,
                         "✓ ${st?.median ?: p.lat}ms ±${st?.jitter ?: 0} • MTU ${p.mtu} • " +
-                            "${mbps?.let { "%.1f".format(it) } ?: "?"}Mbps • ${p.exit?.ip ?: ""} ${p.exit?.loc ?: ""}"
+                            "${mbps?.let { "%.1f".format(it) } ?: "?"}Mbps • ${Country.ipLine(p.exit?.ip ?: "", p.exit?.loc ?: "")}"
                     )
                 }
                 downSafe()
@@ -1074,6 +1153,16 @@ class Engine(ctx: Context, private val store: Store) {
             )
         }
         saveLastBest(label, cfg.id, ver.mtu, 0, dns?.id ?: "")
+        // حفظ دولة الخروج لكل كونفيج لعرض العلم لاحقاً بدون فحص جديد
+        ver.exit?.let { e ->
+            if (e.loc.isNotEmpty()) {
+                store.updateConfigs { l -> l.map {
+                    if (it.id == cfg.id) it.copy(lastCountry = e.loc,
+                        lastCountryUseful = direct == null || !e.loc.equals(direct.loc, true))
+                    else it
+                } }
+            }
+        }
         healthFails = 0
     }
 
@@ -1255,13 +1344,12 @@ class Engine(ctx: Context, private val store: Store) {
     }
 
     /**
-     * MTU تجريبي: ننطلق من القيمة الآمنة الناجحة ونجرّب قيماً أعلى (من الأعلى إلى الأدنى).
-     * تُقبل القيمة إذا مرّت مصافحة HTTPS عبر النفق (دليل مرور الحزم كاملة الحجم) وبقيت السرعة ≥ 92% من السرعة الآمنة.
-     * لا نعتمد على ICMP لأن كثيراً من الشبكات تحجبه أو تحدّه فيعطي أرقاماً أقل من الحقيقة.
+     * MTU تجريبي خفيف: غربلة سريعة بـ HTTPS latency أولاً (بدون تحميل)،
+     * ثم قياس سرعة قصير واحد فقط للمرشح الفائز — توفيراً لبيانات الجوال وبدون تقطيع إضافي.
      */
     private suspend fun tuneMtu(r: Result, dns: DnsServer?): Pair<Int, List<MtuRow>> {
         val ladder = listOf(1420, 1380, 1340, 1280, 1200, 1120, 1040, 1000)
-        val cands = ladder.filter { it > r.mtu }.sorted().take(4).sortedDescending()
+        val cands = ladder.filter { it > r.mtu }.sorted().take(2).sortedDescending()
         val rows = ArrayList<MtuRow>()
         rows += MtuRow(r.mtu, r.mbps)
         var chosen = r.mtu
@@ -1274,9 +1362,17 @@ class Engine(ctx: Context, private val store: Store) {
                 log("MTU $m: لا يمر HTTPS")
                 continue
             }
-            val mbps = Probes.throughputMbps(4000, v?.network)
+            // غربلة: إن كان HTTPS أبطأ من المرجع بـ +40% نرفضه فوراً بدون تحميل
+            val h = v?.let { Probes.httpsLatencyAvg(it.network, tries = 2) } ?: exit.ms
+            val ref = r.exit?.ms ?: h
+            if (ref > 0 && h > ref * 1.4) {
+                rows += MtuRow(m, null)
+                log("MTU $m: HTTPS بطيء ${h}ms مقابل ${ref}ms — مرفوض بدون تحميل")
+                continue
+            }
+            val mbps = Probes.throughputMbps(2500, v?.network)
             rows += MtuRow(m, mbps)
-            log("MTU $m: HTTPS ✔ • ${mbps?.let { "%.1f".format(it) } ?: "؟"} Mbps")
+            log("MTU $m: HTTPS ✔ ${h}ms • ${mbps?.let { "%.1f".format(it) } ?: "؟"} Mbps")
             val base = r.mbps
             if (base == null || mbps == null || mbps >= base * 0.92) {
                 chosen = m

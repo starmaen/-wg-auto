@@ -103,7 +103,58 @@ object WarpGenerator {
 
     private fun b64(b: ByteArray): String = Base64.encodeToString(b, Base64.NO_WRAP)
 
-    class WarpResult(val configText: String) 
+    class WarpResult(
+        val configText: String,
+        val privB64: String = "",
+        val addresses: String = "",
+        val peerPub: String = "",
+        val endpointHost: String = ""
+    ) {
+        /** يبني كونفيج بديل بنفس الحساب لكن Endpoint مختلف (لتجربة PoP أجنبي). */
+        fun withEndpoint(host: String): String = buildString {
+            appendLine("[Interface]")
+            appendLine("PrivateKey = $privB64")
+            appendLine("Address = $addresses")
+            appendLine()
+            appendLine("[Peer]")
+            appendLine("PublicKey = $peerPub")
+            appendLine("AllowedIPs = 0.0.0.0/0, ::/0")
+            appendLine("Endpoint = $host")
+        }
+    }
+
+    /**
+     * عناوين Cloudflare Edge المعروفة + منافذ تتجاوز جدران الحماية.
+     * الفكرة: الـ Endpoint الافتراضي Anycast يعيدك للأقرب (غالباً دولتك).
+     * تجربة IP محدد + منفذ بديل قد يثبت على PoP أبعد إن سمح التوجيه.
+     * القائمة أوفلاين ولا تحتاج إنترنت إضافياً — الفحص الفعلي يحدد الأفضل.
+     */
+    val ENDPOINT_CANDIDATES: List<String> = listOf(
+        "162.159.192.1:2408", "162.159.193.1:2408", "162.159.195.1:2408",
+        "162.159.192.1:500", "162.159.193.1:500", "162.159.195.1:500",
+        "162.159.192.1:4500", "162.159.193.1:4500",
+        "188.114.96.1:2408", "188.114.97.1:2408",
+        "[2606:4700:d0::a29f:c001]:2408", "[2606:4700:d1::a29f:c001]:2408"
+    )
+
+    /** يعيد بدائل Endpoint مرتبة: الأصلي أولاً ثم المرشحات (بدون تكرار). */
+    fun variants(result: WarpResult, max: Int = 6): List<String> {
+        val out = LinkedHashSet<String>()
+        if (result.endpointHost.isNotEmpty()) out += result.endpointHost
+        // نفس IP الأصلي لكن بمنافذ بديلة (مفيد عند حجب 2408)
+        val baseIp = result.endpointHost.substringBefore(":").substringBefore("]")
+            .let { if (result.endpointHost.startsWith("[")) "$it]" else it }
+        for (p in listOf(":2408", ":500", ":4500")) {
+            if (out.size >= max) break
+            val h = if (baseIp.startsWith("[")) "$baseIp$p" else "${baseIp.trim('[', ']')}$p"
+            out += h
+        }
+        for (e in ENDPOINT_CANDIDATES) {
+            if (out.size >= max) break
+            out += e
+        }
+        return out.take(max)
+    }
 
     /**
      * يسجّل جهازاً جديداً في WARP ويبني نص كونفيج WireGuard جاهزاً. يرمي استثناءً برسالة واضحة عند الفشل.
@@ -193,6 +244,6 @@ object WarpGenerator {
             appendLine("AllowedIPs = 0.0.0.0/0, ::/0")
             appendLine("Endpoint = $endpointHost")
         }
-        return WarpResult(conf)
+        return WarpResult(conf, privB64, addresses.joinToString(", "), peerPub, endpointHost)
     }
 }

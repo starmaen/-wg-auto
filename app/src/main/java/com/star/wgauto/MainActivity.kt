@@ -443,7 +443,7 @@ fun ScanAgeLine(lastScanAt: Long) {
 }
 
 private fun rowLine(r: ConfigRow): String = when {
-    r.sameCountry -> "⚠ نفس دولتك (${r.exitLoc}) — لا يفيد لتجاوز الحجب، مستبعَد تلقائياً"
+    r.sameCountry -> "⚠ نفس دولتك ${Country.label(r.exitLoc)} — لا يفيد لتجاوز الحجب، مستبعَد تلقائياً"
     r.state == "pending" -> "بانتظار الفحص"
     r.state == "testing" -> "جارٍ الفحص…"
     r.state == "fail" -> "✗ ${r.note}"
@@ -453,7 +453,7 @@ private fun rowLine(r: ConfigRow): String = when {
         if (r.score > 0) append(" • فقد ${r.loss}%")
         r.mbps?.let { append(" • %.1f Mbps".format(it)) }
         if (r.mtu > 0) append(" • MTU ${r.mtu}")
-        if (r.exitIp.isNotEmpty()) append(" • ${r.exitIp} ${r.exitLoc}")
+        if (r.exitIp.isNotEmpty()) append(" • ${Country.ipLine(r.exitIp, r.exitLoc)}")
     }
 }
 
@@ -586,8 +586,8 @@ fun HomeTab(app: WgApp, a: Actions) {
                     Text("دليل أن النفق حقيقي", fontWeight = FontWeight.Bold)
                     if (st.diag.isNotEmpty()) Text(st.diag, fontSize = 13.sp)
                     if (st.vpnIface.isNotEmpty()) Text("واجهة VPN: ${st.vpnIface}", fontSize = 13.sp)
-                    if (st.exitIp.isNotEmpty()) Text("IP عبر النفق: ${st.exitIp} ${st.exitLoc}", fontSize = 13.sp)
-                    if (st.directIp.isNotEmpty()) Text("IP المباشر: ${st.directIp} ${st.directLoc}", fontSize = 13.sp)
+                    if (st.exitIp.isNotEmpty()) Text("IP عبر النفق: ${Country.ipLine(st.exitIp, st.exitLoc)}", fontSize = 13.sp)
+                    if (st.directIp.isNotEmpty()) Text("IP المباشر: ${Country.ipLine(st.directIp, st.directLoc)}", fontSize = 13.sp)
                     Text(
                         if (st.verified) "✔ تغيّر الـ IP: الحركة تمر فعلاً عبر النفق"
                         else "⚠ لم يُتحقق من تغيّر الـ IP (تحقق بنفسك من موقع فحص IP)",
