@@ -469,7 +469,8 @@ private fun rowLine(r: ConfigRow): String = when {
 fun ResultsCard(rep: Report, st: Status) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("نتيجة الفحص", fontWeight = FontWeight.Bold)
+            Text("نتيجة الفحص — امتحان عادل للجميع", fontWeight = FontWeight.Bold)
+            Text(Exam.FORMULA, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (rep.progress.isNotEmpty()) Text(rep.progress, fontSize = 12.sp)
             val rows = rep.rows.sortedWith(
                 compareBy<ConfigRow>(
@@ -478,12 +479,17 @@ fun ResultsCard(rep: Report, st: Status) {
                     { if (it.latencyMs < 0) Int.MAX_VALUE else it.latencyMs }
                 )
             )
+            var rank = 0
             rows.forEach { r ->
                 val chosen = st.connected && r.id == rep.chosenConfigId
+                val badge = if (r.state == "ok") { rank++; Exam.rankMedal(rank - 1) } else null
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     MarkerSlot(chosen)
                     Column(Modifier.weight(1f)) {
-                        Text(r.name, fontWeight = if (chosen) FontWeight.Bold else FontWeight.Normal)
+                        Text(
+                            (if (badge != null) "$badge • " else "") + r.name,
+                            fontWeight = if (chosen) FontWeight.Bold else FontWeight.Normal
+                        )
                         Text(
                             rowLine(r), fontSize = 12.sp,
                             color = when {
@@ -513,7 +519,7 @@ fun ResultsCard(rep: Report, st: Status) {
                 HorizontalDivider()
                 Text("MTU المختار: ${rep.chosenMtu}", fontWeight = FontWeight.Bold)
                 Text(
-                    "اختير بالتجربة الفعلية: أعلى MTU تمرّ عبره مصافحة HTTPS بنجاح وتبقى سرعته ≥ 92% من القيمة الآمنة " +
+                    "اختير بالتجربة الفعلية عبر النفق: أعلى MTU يمرّ فيه HTTPS بزمن مقارب للمرجع " +
                         "(لا نعتمد على ICMP لأنه يعطي أرقاماً أقل من الحقيقة في كثير من الشبكات).",
                     fontSize = 12.sp
                 )

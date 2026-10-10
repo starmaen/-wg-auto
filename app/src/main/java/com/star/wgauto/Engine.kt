@@ -1074,23 +1074,31 @@ class Engine(ctx: Context, private val store: Store) {
             ?: listOf("1.1.1.1", "1.0.0.1")
 
     /**
-     * يرفع النفق الكامل ويتحقق من كل الطبقات: واجهة VPN، اتصال TCP، مصافحة HTTPS (تثبت مرور الحزم الكبيرة)،
-     * تغيّر الـ IP الخارجي، وحل DNS.
-     * الترتيب (لا نفرض MTU): أولاً الكونفيج كما هو تماماً (MTU وDNS الأصليان — مثل التطبيق الرسمي)،
-     * ثم MTU المختار/العام مع DNS التطبيق، ثم سلّم أدنى، وأخيراً بلا تعديل.
+     * يرفع النفق الكامل ويتحقق من كل الطبقات.
+     * الترتيب (لا نفرض MTU): القيمة المجرّبة الناجحة أولاً (من الفحص السريع)،
+     * ثم الكونفيج كما هو تماماً (مثل التطبيق الرسمي)، ثم قيم عامة.
+     * قاعدة التثبيت العادلة: من يمرّر TCP يُثبَّت — فشل HTTPS وحده تحذير
+     * (قد يكون منفذ 443 محجوباً) وليس سبب رفض. الرفض فقط عند انعدام TCP
+     * (كونفيج منتهٍ أو مقطوع فعلاً).
      */
     private suspend fun connectAndVerify(cfg: WgConfig, mtu: Int?, dns: List<String>, direct: ExitInfo?): Verified? {
         // 1000 إضافية: شبكات الجوال (خصوصاً مع NAT64/464XLAT عند بعض المشغّلين) غالباً ما
         // تحتاج MTU أقل من المعتاد على الواي فاي.
         // الزوج (mtu, useOwnDns): useOwnDns=true يعني DNS الكونفيج الأصلي كما هو.
+        // المجرّب أولاً: إن جاء mtu جاهزاً من الفحص السريع فهو أثبت نجاحه قبل ثوانٍ.
         val rungs: List<Pair<Int?, Boolean>> =
-            listOf(null to true) +
-                listOfNotNull(mtu?.let { it to false }, 1280 to false, 1120 to false, 1000 to false).distinct() +
+            listOfNotNull(mtu?.let { it to false }) +
+                listOf(null to true) +
+                listOfNotNull(
+                    if (mtu != 1280) (1280 to false) else null,
+                    if (mtu != 1120) (1120 to false) else null,
+                    if (mtu != 1000) (1000 to false) else null
+                ).distinct() +
                 listOf(null to false)
         for ((idx, rung) in rungs.withIndex()) {
             val (m, ownDns) = rung
             if (idx > 0) delay(700)
-            val label = if (ownDns) "الأصلي للكونفيج" else (m?.toString() ?: "الافتراضي")
+            val label = if (ownDns && m == null) "الأصلي للكونفيج" else (m?.toString() ?: "الافتراضي")
             var ips: List<String> = if (ownDns) emptyList() else dns
             for (round in 0..1) {
                 val v = bringUp(cfg, m, ips, appOnly = false) ?: break
@@ -1101,9 +1109,15 @@ class Engine(ctx: Context, private val store: Store) {
                     break
                 }
                 val exit = Probes.exitInfo(v.network, fast = true)
+                val effMtu = m ?: ConfigText.configuredMtu(cfg.text) ?: 1280
                 if (exit == null) {
-                    log("✗ MTU $label: TCP يتصل لكن HTTPS لا يمر (حزم كبيرة محجوبة؟) — أجرّب قيمة أدنى")
-                    break
+                    // النفق يحمل TCP لكن HTTPS لا يمر — يُثبَّت أساسياً ولا يُستبعد:
+                    // الجاني غالباً حجب 443 أو خلل قياس، لا الكونفيج نفسه.
+                    log("⚠ MTU $label: TCP يمر لكن HTTPS لا يمر — تثبيت أساسي (تحقق يدوياً من التصفح)")
+                    val dnsStat0 = Probes.systemResolveStat(v.network, 2)
+                    val diag0 = "TCP ✔ ${lat}ms • HTTPS ⚠ (لا يمر، قد يكون 443 محجوباً) • DNS " +
+                        (dnsStat0?.let { "✔ ${it.median}ms" } ?: "✗") + " • MTU $label"
+                    return Verified(v, null, lat, effMtu, ips, diag0)
                 }
                 if (direct != null && exit.ip == direct.ip) {
                     log("✗ الـ IP لم يتغيّر (${exit.ip}) — النفق لا يحمل الحركة")
@@ -1120,7 +1134,6 @@ class Engine(ctx: Context, private val store: Store) {
                 }
                 // متوسط 3 محاولات لنفس المرجع (1.1.1.1) لعرض عادل يُقارَن بزمن TCP بلا تحيّز أول اتصال
                 val httpsAvg = Probes.httpsLatencyAvg(v.network) ?: exit.ms
-                val effMtu = m ?: ConfigText.configuredMtu(cfg.text) ?: 1280
                 val diag = "TCP ✔ ${lat}ms • HTTPS ✔ ${httpsAvg}ms • DNS " +
                     (dnsStat?.let { "✔ ${it.median}ms" } ?: "✗ (لا يحل الأسماء)") + " • MTU $label"
                 return Verified(v, exit.copy(ms = httpsAvg), lat, effMtu, ips, diag)
@@ -1330,6 +1343,7 @@ class Engine(ctx: Context, private val store: Store) {
             if (i > 0) delay(900)
             setProgress("فحص سريع ${i + 1}/${candidates.size}: ${c.name}")
             updateRow(c.id) { it.copy(state = "testing") }
+            try {
             // ملاحظة: لا فحص UDP مسبق هنا — سيرفر WireGuard يتجاهل رسائل المصافحة
             // المزيفة بلا MAC صحيح (حماية من التضخيم)، فأي فحص مزيف يعطي
             // "محجوب" كاذباً. الاختبار الحقيقي الوحيد هو رفع النفق نفسه.
@@ -1358,6 +1372,11 @@ class Engine(ctx: Context, private val store: Store) {
             }
             log("✓ ${c.name}: ${p.lat}ms • MTU ${p.mtu} • ${p.exit?.ip ?: "؟"} ${p.exit?.loc ?: ""}")
             alive += Triple(c, p.lat, p.mtu)
+            } catch (e: Exception) {
+                // مرشح واحد لا يُسقط الامتحان كله — يُسجَّل ويُتابَع البقية
+                updateRow(c.id) { it.copy(state = "fail", note = "خطأ فحص: ${e.message?.take(60)}") }
+                log("✗ ${c.name}: خطأ فحص (${e.message?.take(60)}) — متابعة البقية")
+            }
         }
         downSafe()
 
@@ -1383,6 +1402,7 @@ class Engine(ctx: Context, private val store: Store) {
         val results = ArrayList<Result>()
         for ((i, t) in top.withIndex()) {
             currentCoroutineContext().ensureActive()
+            try {
             val c = t.first
             val m0 = t.third
             setProgress("فحص دقيق ${i + 1}/${top.size}: ${c.name}")
@@ -1399,7 +1419,9 @@ class Engine(ctx: Context, private val store: Store) {
             }
             val exit = Probes.exitInfo(v.network, fast = true)
             val (dns, dnsRows) = if (s.autoDns) pickDns(dnsAll, v.network) else (defDns to emptyList())
-            val score = 1.0 / (1 + st.score / 100.0)
+            // معادلة الامتحان الموحدة: الزمن 50% + الفقد 30% + التذبذب 20%
+            val exam = Exam.score(st.median, st.jitter, st.loss)
+            val score = 1.0 / (1 + exam / 100.0)
             results += Result(c, m0, 0, dns, dnsRows, st, null, score, exit, emptyList())
             updateRow(c.id) {
                 it.copy(
@@ -1408,7 +1430,11 @@ class Engine(ctx: Context, private val store: Store) {
                     exitIp = exit?.ip ?: it.exitIp, exitLoc = exit?.loc ?: it.exitLoc
                 )
             }
-            log("★ ${c.name}: ${st.median}ms ±${st.jitter} • فقد ${st.loss}% • MTU $m0")
+            log("★ ${c.name}: ${st.median}ms ±${st.jitter} • فقد ${st.loss}% • درجة ${"%.1f".format(exam)} • MTU $m0")
+            } catch (e: Exception) {
+                updateRow(t.first.id) { it.copy(state = "fail", note = "خطأ فحص دقيق: ${e.message?.take(60)}") }
+                log("✗ ${t.first.name}: خطأ فحص دقيق — متابعة البقية")
+            }
         }
         downSafe()
 

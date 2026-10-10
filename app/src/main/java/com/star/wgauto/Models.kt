@@ -130,6 +130,27 @@ data class DnsMeasure(val udp: Stat? = null, val dot: Stat? = null, val doh: Sta
             .minByOrNull { it.second.score }
 }
 
+/**
+ * معادلة الامتحان الموحدة (المدرس العادل): الكل يحضر والكل يجتاز الفحص،
+ * والترتيب بالأرقام فقط — الأول والثاني والثالث — بلا استبعاد تعسفي.
+ * الدرجة = زمن 50% + فقد 30% + تذبذب 20%. أقل درجة = متفوق.
+ */
+object Exam {
+    const val FORMULA = "الترتيب: الزمن 50% + الفقد 30% + التذبذب 20% (أقل = أفضل)"
+    fun score(latMs: Int, jitterMs: Int, lossPct: Int): Double {
+        val lat = latMs.coerceAtLeast(0).toDouble()
+        val jit = jitterMs.coerceAtLeast(0).toDouble()
+        val loss = lossPct.coerceIn(0, 100).toDouble()
+        return lat * 0.5 + loss * 30.0 + jit * 0.2
+    }
+    fun rankMedal(i: Int): String = when (i) {
+        0 -> "🥇 الأول"
+        1 -> "🥈 الثاني"
+        2 -> "🥉 الثالث"
+        else -> "#${i + 1}"
+    }
+}
+
 data class ExitInfo(val ip: String, val loc: String, val ms: Int)
 
 /**

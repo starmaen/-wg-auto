@@ -322,9 +322,12 @@ object Probes {
         Pair(null, errText(e))
     }
 
-    /** fast=true: محاولة واحدة سريعة (تُستخدم أثناء تجربة قيم MTU). fast=false: يجرّب عدة خدمات. */
+    /** fast=true: محاولتان سريعتان على بنيتين مختلفتين (تحسباً لحجب 443 على واحدة). fast=false: يجرّب عدة خدمات. */
     fun exitInfo(network: Network?, fast: Boolean = false): ExitInfo? {
-        val urls = if (fast) listOf("https://1.1.1.1/cdn-cgi/trace") else listOf(
+        val urls = if (fast) listOf(
+            "https://1.1.1.1/cdn-cgi/trace",
+            "https://api64.ipify.org"
+        ) else listOf(
             "https://1.1.1.1/cdn-cgi/trace",
             "https://www.cloudflare.com/cdn-cgi/trace",
             "https://api64.ipify.org"
