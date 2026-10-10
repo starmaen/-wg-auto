@@ -135,11 +135,17 @@ class Engine(ctx: Context, private val store: Store) {
     // ---------- إدارة الكونفيجات ----------
     /** يعيد null عند النجاح، أو رسالة الخطأ. */
     fun addConfig(name: String, text: String): String? {
-        val clean = ConfigText.sanitize(text)
+        // تنظيف استيراد (Proton وغيره): BOM + مفاتيح غريبة + DNS داخلي + Keepalive
+        // فلا يضطر المستخدم لتغيير الامتداد أو حذف أسطر يدوياً.
+        val clean = ConfigText.normalizeForImport(text)
+        if (!clean.contains("[Interface]", true) || !clean.contains("[Peer]", true)) {
+            return "كونفيج غير صالح: لا يحوي [Interface] و [Peer] — تأكد أن الملف WireGuard وليس OpenVPN"
+        }
         try {
             Config.parse(ByteArrayInputStream(clean.toByteArray()))
         } catch (e: Exception) {
-            return "كونفيج غير صالح: ${e.message ?: e.cause?.message ?: ""}"
+            val msg = e.message ?: e.cause?.message ?: e.javaClass.simpleName
+            return "كونفيج غير صالح: $msg"
         }
         store.updateConfigs { list ->
             val base = name.ifBlank { "config" }
@@ -152,6 +158,27 @@ class Engine(ctx: Context, private val store: Store) {
             list + WgConfig(name = n, text = clean)
         }
         return null
+    }
+
+    /** يعيد تنظيف كل الكونفيجات المحفوظة (Proton القديمة): يحذف DNS الداخلي والأسطر الغريبة ويضيف Keepalive. */
+    fun repairAllConfigs(): Pair<Int, Int> {
+        var ok = 0
+        var fail = 0
+        store.updateConfigs { list ->
+            list.map { c ->
+                try {
+                    val clean = ConfigText.normalizeForImport(c.text)
+                    Config.parse(ByteArrayInputStream(clean.toByteArray()))
+                    if (clean != c.text) ok++ 
+                    c.copy(text = clean)
+                } catch (e: Exception) {
+                    fail++
+                    c
+                }
+            }
+        }
+        log("إصلاح الكل: عُولج $ok كونفيج • فشل $fail")
+        return ok to fail
     }
 
     /** يسجّل حساب Cloudflare WARP مجانياً محلياً ويضيف الكونفيج الناتج تلقائياً. */
@@ -915,19 +942,42 @@ class Engine(ctx: Context, private val store: Store) {
     /** appOnly = true: نفق تجريبي خاص بهذا التطبيق فقط (لا يقطع بقية التطبيقات). */
     private fun up(c: WgConfig, mtu: Int?, dns: List<String>, appOnly: Boolean, quiet: Boolean = false): Boolean {
         lastOwnChange = now()
+        // المحاولة 1: النص الكامل (مع IPv6 إن وُجد)
+        val first = tryUp(c, mtu, dns, appOnly, ipv4Only = false)
+        if (first == null) return true // نجح
+        // المحاولة 2 تلقائياً: إن فشل بسبب العنوان (Cannot set address) نعيد بـ IPv4 فقط
+        // هذا يحل كونفيجات Proton على أجهزة/شبكات بلا IPv6 بدون أي تدخل يدوي.
+        if (first.contains("address", true) || first.contains("عنوان", true) ||
+            first.contains("EINVAL", true) || first.contains("addAddress", true)
+        ) {
+            log("↻ ${c.name}: فشل العنوان — إعادة المحاولة IPv4 فقط")
+            val second = tryUp(c, mtu, dns, appOnly, ipv4Only = true)
+            if (second == null) {
+                log("✔ ${c.name}: نجح بـ IPv4 فقط")
+                return true
+            }
+            lastUpError = second
+            log("خطأ في ${c.name}: $second")
+            return false
+        }
+        lastUpError = first
+        log("خطأ في ${c.name}: $first")
+        return false
+    }
+
+    /** يعيد null عند النجاح أو نص الخطأ. */
+    private fun tryUp(c: WgConfig, mtu: Int?, dns: List<String>, appOnly: Boolean, ipv4Only: Boolean): String? {
         return try {
-            val text = ConfigText.override(c.text, mtu, dns, if (appOnly) appCtx.packageName else null)
+            var text = ConfigText.override(c.text, mtu, dns, if (appOnly) appCtx.packageName else null)
+            if (ipv4Only) text = ConfigText.stripIpv6(text)
             val cfg = Config.parse(ByteArrayInputStream(text.toByteArray()))
             backend.setState(tunnel, Tunnel.State.UP, cfg)
             lastOwnChange = now()
             lastUpError = ""
-            true
+            null
         } catch (e: Exception) {
             lastOwnChange = now()
-            lastUpError = e.message?.take(120) ?: e.javaClass.simpleName
-            // حتى في الفحص الصامت نحفظ السبب في اللوج، لأن "لم تُنشأ الواجهة" وحده لا يساعد
-            log("خطأ في ${c.name}: $lastUpError")
-            false
+            e.message?.take(140) ?: e.javaClass.simpleName
         }
     }
 

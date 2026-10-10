@@ -731,6 +731,15 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             modifier = Modifier.fillMaxWidth()
         ) { Text("🇨🇭 خوادم Proton المجانية (خروج أجنبي)") }
         if (showProton) ProtonDialog(app, onClose = { showProton = false })
+        var repairMsg by remember { mutableStateOf("") }
+        OutlinedButton(
+            onClick = {
+                val (ok, fail) = app.engine.repairAllConfigs()
+                repairMsg = "عُولج $ok كونفيج • فشل $fail — لا حاجة لحذف DNS يدوياً بعد الآن"
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("🔧 إصلاح الكونفيجات المستوردة تلقائياً") }
+        if (repairMsg.isNotEmpty()) Text(repairMsg, fontSize = 12.sp)
         Text(
             "يدعم ملفات .conf وملف .zip يحوي عدة كونفيجات. تُفحص الكونفيجات تلقائياً عند تشغيل الـ VPN فقط.",
             fontSize = 12.sp
