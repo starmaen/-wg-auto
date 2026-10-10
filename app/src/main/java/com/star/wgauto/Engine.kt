@@ -270,7 +270,7 @@ class Engine(ctx: Context, private val store: Store) {
                         tried++
                         warpStatus.value = "تجربة عنوان $tried/${WarpGenerator.variants(r).size}: $ep"
                         val t = tmpCfg.copy(text = r.withEndpoint(ep))
-                        val p = probeTunnel(t, listOf(1280, 1000), emptyList(), direct)
+                        val p = probeTunnel(t, listOf(null, 1280, 1000), emptyList(), direct)
                         if (p.vpn == null) {
                             log("WARP $ep: ✗ ${p.note}")
                             continue
@@ -1064,18 +1064,24 @@ class Engine(ctx: Context, private val store: Store) {
 
     /**
      * يرفع النفق الكامل ويتحقق من كل الطبقات: واجهة VPN، اتصال TCP، مصافحة HTTPS (تثبت مرور الحزم الكبيرة)،
-     * تغيّر الـ IP الخارجي، وحل DNS. عند الفشل يجرّب سلّم MTU أدنى ثم الكونفيج بلا أي تعديل (كتطبيق WireGuard الرسمي).
+     * تغيّر الـ IP الخارجي، وحل DNS.
+     * الترتيب (لا نفرض MTU): أولاً الكونفيج كما هو تماماً (MTU وDNS الأصليان — مثل التطبيق الرسمي)،
+     * ثم MTU المختار/العام مع DNS التطبيق، ثم سلّم أدنى، وأخيراً بلا تعديل.
      */
     private suspend fun connectAndVerify(cfg: WgConfig, mtu: Int?, dns: List<String>, direct: ExitInfo?): Verified? {
         // 1000 إضافية: شبكات الجوال (خصوصاً مع NAT64/464XLAT عند بعض المشغّلين) غالباً ما
         // تحتاج MTU أقل من المعتاد على الواي فاي.
-        val rungs: List<Int?> = listOfNotNull(mtu, 1280, 1120, 1000).distinct() + listOf<Int?>(null)
-        for (m in rungs) {
-            val label = m?.toString() ?: "الافتراضي"
-            var ips: List<String> = if (m == null) emptyList() else dns
+        // الزوج (mtu, useOwnDns): useOwnDns=true يعني DNS الكونفيج الأصلي كما هو.
+        val rungs: List<Pair<Int?, Boolean>> =
+            listOf(null to true) +
+                listOfNotNull(mtu?.let { it to false }, 1280 to false, 1120 to false, 1000 to false).distinct() +
+                listOf(null to false)
+        for ((m, ownDns) in rungs) {
+            val label = if (ownDns) "الأصلي للكونفيج" else (m?.toString() ?: "الافتراضي")
+            var ips: List<String> = if (ownDns) emptyList() else dns
             for (round in 0..1) {
                 val v = bringUp(cfg, m, ips, appOnly = false) ?: break
-                delay(400)
+                delay(800)
                 val lat = Probes.quickAlive(v.network)
                 if (lat == null) {
                     log("✗ MTU $label: لا يتصل TCP عبر النفق")
@@ -1091,7 +1097,7 @@ class Engine(ctx: Context, private val store: Store) {
                     return null
                 }
                 val dnsStat = Probes.systemResolveStat(v.network, 2)
-                if (dnsStat == null && round == 0 && m != null) {
+                if (dnsStat == null && round == 0 && !ownDns) {
                     val alt = fallbackDns()
                     if (alt != ips) {
                         log("⚠ DNS النفق لا يستجيب — أجرّب ${alt.joinToString()}")
@@ -1101,36 +1107,41 @@ class Engine(ctx: Context, private val store: Store) {
                 }
                 // متوسط 3 محاولات لنفس المرجع (1.1.1.1) لعرض عادل يُقارَن بزمن TCP بلا تحيّز أول اتصال
                 val httpsAvg = Probes.httpsLatencyAvg(v.network) ?: exit.ms
+                val effMtu = m ?: ConfigText.configuredMtu(cfg.text) ?: 1280
                 val diag = "TCP ✔ ${lat}ms • HTTPS ✔ ${httpsAvg}ms • DNS " +
                     (dnsStat?.let { "✔ ${it.median}ms" } ?: "✗ (لا يحل الأسماء)") + " • MTU $label"
-                return Verified(v, exit.copy(ms = httpsAvg), lat, m ?: 1280, ips, diag)
+                return Verified(v, exit.copy(ms = httpsAvg), lat, effMtu, ips, diag)
             }
         }
         return null
     }
 
     /** فحص نفق تجريبي (خاص بالتطبيق): واجهة + TCP + HTTPS عبر النفق، بسلّم MTU. vpn=null يعني فشل مع note. */
-    private suspend fun probeTunnel(c: WgConfig, mtus: List<Int>, dns: List<String>, direct: ExitInfo?): Probe {
+    private suspend fun probeTunnel(c: WgConfig, mtus: List<Int?>, dns: List<String>, direct: ExitInfo?): Probe {
         var note = "لم تُنشأ واجهة النفق"
         for (m in mtus) {
-            val v = bringUp(c, m, dns, appOnly = true, quiet = true)
-                ?: return Probe(null, m, -1, null,
+            // قيمة null = الكونفيج كما هو (MTU وDNS الأصليان) — لا نفرض شيئاً أولاً
+            val useDns = if (m == null) emptyList() else dns
+            val effMtu = m ?: ConfigText.configuredMtu(c.text) ?: 1280
+            val v = bringUp(c, m, useDns, appOnly = true, quiet = true)
+                ?: return Probe(null, effMtu, -1, null,
                     if (lastUpError.isNotEmpty()) "لم تُنشأ الواجهة: $lastUpError" else "لم تُنشأ واجهة النفق (تأكد من إذن VPN وعدم وجود VPN آخر)")
             val lat = Probes.quickAlive(v.network)
-                ?: return Probe(null, m, -1, null, "الخادم لا يستجيب (لا تمر بيانات)")
+                ?: return Probe(null, effMtu, -1, null, "الخادم لا يستجيب (لا تمر بيانات)")
             val exit = Probes.exitInfo(v.network, fast = true)
             if (exit == null) {
-                note = "TCP يتصل لكن HTTPS لا يمر (MTU $m)"
+                note = "TCP يتصل لكن HTTPS لا يمر (MTU $effMtu)"
                 continue
             }
             if (direct != null && exit.ip == direct.ip) {
-                return Probe(null, m, lat, exit, "الـ IP لم يتغيّر — لا يحمل الحركة")
+                return Probe(null, effMtu, lat, exit, "الـ IP لم يتغيّر — لا يحمل الحركة")
             }
             val sameCountry = direct != null && exit.loc.isNotEmpty() &&
                 exit.loc.equals(direct.loc, ignoreCase = true)
-            return Probe(v, m, lat, exit, "", sameCountry)
+            return Probe(v, effMtu, lat, exit, "", sameCountry)
         }
-        return Probe(null, mtus.lastOrNull() ?: 0, -1, null, note)
+        val lastMtu = mtus.lastOrNull() ?: 1280
+        return Probe(null, lastMtu, -1, null, note)
     }
 
     // ---------- فحص يدوي لكونفيج (بنفق تجريبي، بلا سجل) ----------
@@ -1172,18 +1183,17 @@ class Engine(ctx: Context, private val store: Store) {
                 for (id in ids) {
                     val c = store.configs.value.firstOrNull { it.id == id } ?: continue
                     setResult(id, "جارٍ الفحص…")
-                    val p = probeTunnel(c, listOf(1280, 1120, 1000), dns?.ips() ?: emptyList(), direct)
+                    val p = probeTunnel(c, listOf(null, 1280, 1120, 1000), dns?.ips() ?: emptyList(), direct)
                     val v = p.vpn
                     if (v == null) {
                         setResult(id, "✗ ${p.note}")
                         continue
                     }
                     val st = Probes.tcpStat(v.network, 6)
-                    val mbps = Probes.throughputMbps(network = v.network)
+                    // بلا تحميل في الفحص الفردي أيضاً — الزمن والفقد يكفيان للترتيب
                     setResult(
                         id,
-                        "✓ ${st?.median ?: p.lat}ms ±${st?.jitter ?: 0} • MTU ${p.mtu} • " +
-                            "${mbps?.let { "%.1f".format(it) } ?: "?"}Mbps • ${Country.ipLine(p.exit?.ip ?: "", p.exit?.loc ?: "")}"
+                        "✓ ${st?.median ?: p.lat}ms ±${st?.jitter ?: 0} • فقد ${st?.loss ?: 0}% • MTU ${p.mtu} • ${Country.ipLine(p.exit?.ip ?: "", p.exit?.loc ?: "")}"
                     )
                 }
                 downSafe()
@@ -1294,7 +1304,8 @@ class Engine(ctx: Context, private val store: Store) {
         downSafe()
 
         // MTU ابتدائي آمن: 1280 (الافتراضي في تطبيق WireGuard للأندرويد وحدّ IPv6 الأدنى)، ثم 1120 كاحتياط
-        val startMtus: List<Int> = if (s.autoMtu) listOf(1280, 1120, 1000) else listOf(s.selMtu)
+        // MTU: الكونفيج كما هو أولاً (لا نفرض)، ثم قيم عامة، ثم 1000 للجوال/NAT
+        val startMtus: List<Int?> = if (s.autoMtu) listOf(null, 1280, 1120, 1000) else listOf(s.selMtu)
 
         // ---- المرحلة أ: فحص سريع بدليل (واجهة + TCP + HTTPS + تغيّر IP) عبر النفق التجريبي
         val alive = ArrayList<Triple<WgConfig, Int, Int>>()   // كونفيج، تأخر، MTU الناجح
@@ -1302,6 +1313,8 @@ class Engine(ctx: Context, private val store: Store) {
         var sameCountryLoc = ""
         for ((i, c) in candidates.withIndex()) {
             currentCoroutineContext().ensureActive()
+            // فاصل بين المرشحين: يمنع رشق السيرفر بمصافحات متتالية فيُحجب مؤقتاً
+            if (i > 0) delay(900)
             setProgress("فحص سريع ${i + 1}/${candidates.size}: ${c.name}")
             updateRow(c.id) { it.copy(state = "testing") }
             // ملاحظة: لا فحص UDP مسبق هنا — سيرفر WireGuard يتجاهل رسائل المصافحة
@@ -1351,7 +1364,8 @@ class Engine(ctx: Context, private val store: Store) {
             return
         }
 
-        // ---- المرحلة ب: فحص دقيق لأسرع 3 (جودة: وسيط/تذبذب/فقد + DNS + سرعة)
+        // ---- المرحلة ب: فحص دقيق لأسرع 3 — زمن + تذبذب + فقد (بلا أي تحميل توفيراً للبيانات).
+        // السرعة تُقاس مرة واحدة للفائز بعد التثبيت. الفقد المرتفع مستبعَد: الأفضل أداءً بلا فقد.
         val top = alive.sortedBy { it.second }.take(if (s.autoConfig) 3 else 1)
         val results = ArrayList<Result>()
         for ((i, t) in top.withIndex()) {
@@ -1365,27 +1379,23 @@ class Engine(ctx: Context, private val store: Store) {
                 updateRow(c.id) { it.copy(state = "fail", note = "انقطع أثناء الفحص الدقيق") }
                 continue
             }
-            if (st.loss > 40) {
+            if (st.loss > 25) {
                 updateRow(c.id) { it.copy(state = "fail", note = "فقد حزم مرتفع (${st.loss}%) — مستبعَد") }
                 log("✗ ${c.name}: فقد حزم ${st.loss}% — مستبعَد تلقائياً")
                 continue
             }
             val exit = Probes.exitInfo(v.network, fast = true)
             val (dns, dnsRows) = if (s.autoDns) pickDns(dnsAll, v.network) else (defDns to emptyList())
-            val mbps = Probes.throughputMbps(network = v.network)
-            val score = (mbps ?: 0.5) / (1 + st.score / 100.0)
-            results += Result(c, m0, 0, dns, dnsRows, st, mbps, score, exit, emptyList())
+            val score = 1.0 / (1 + st.score / 100.0)
+            results += Result(c, m0, 0, dns, dnsRows, st, null, score, exit, emptyList())
             updateRow(c.id) {
                 it.copy(
-                    state = "ok", latencyMs = st.median, jitter = st.jitter, loss = st.loss, mbps = mbps,
+                    state = "ok", latencyMs = st.median, jitter = st.jitter, loss = st.loss, mbps = null,
                     mtu = m0, dnsName = dns?.name ?: "", score = score,
                     exitIp = exit?.ip ?: it.exitIp, exitLoc = exit?.loc ?: it.exitLoc
                 )
             }
-            log(
-                "★ ${c.name}: ${st.median}ms ±${st.jitter} • فقد ${st.loss}% • " +
-                    "${mbps?.let { "%.1f".format(it) } ?: "?"}Mbps • MTU $m0"
-            )
+            log("★ ${c.name}: ${st.median}ms ±${st.jitter} • فقد ${st.loss}% • MTU $m0")
         }
         downSafe()
 
@@ -1414,8 +1424,21 @@ class Engine(ctx: Context, private val store: Store) {
             setProgress("تثبيت الاتصال: ${r.cfg.name}")
             val ver = connectAndVerify(r.cfg, r.mtu, r.dns?.ips() ?: emptyList(), direct)
             if (ver != null) {
-                markConnected(r.cfg, r.dns, r.dnsRows, ver, r.mbps, label, direct, r.mtuRows)
+                markConnected(r.cfg, r.dns, r.dnsRows, ver, null, label, direct, r.mtuRows)
                 log("★ الأفضل: ${r.cfg.name} • ${ver.diag} • DNS ${r.dns?.name ?: "حسب الكونفيج"} • IP ${ver.exit?.ip ?: "؟"}")
+                // السرعة تُقاس مرة واحدة في الخلفية للفائز فقط — بلا صرف بيانات أثناء الفحص
+                val wnet = ver.vpn.network
+                val wid = r.cfg.id
+                scope.launch {
+                    val sp = Probes.throughputMbps(4000, wnet)
+                    if (sp != null) {
+                        status.update { it.copy(mbps = sp) }
+                        report.update { rp -> rp.copy(rows = rp.rows.map {
+                            if (it.id == wid) it.copy(mbps = sp) else it
+                        }) }
+                        log("السرعة عبر ${r.cfg.name}: ${"%.1f".format(sp)} Mbps")
+                    }
+                }
                 return
             }
             log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name}")
@@ -1426,15 +1449,17 @@ class Engine(ctx: Context, private val store: Store) {
     }
 
     /**
-     * MTU تجريبي خفيف: غربلة سريعة بـ HTTPS latency أولاً (بدون تحميل)،
-     * ثم قياس سرعة قصير واحد فقط للمرشح الفائز — توفيراً لبيانات الجوال وبدون تقطيع إضافي.
+     * ضبط MTU بلا أي تحميل: ننطلق من القيمة الناجحة ونجرّب الأعلى، ونقبل ما يمرّ
+     * فيه HTTPS بزمن مقارب للمرجع (≤ +10%). لا تحميل إطلاقاً توفيراً للبيانات —
+     * السرعة تُقاس لاحقاً للفائز فقط.
      */
     private suspend fun tuneMtu(r: Result, dns: DnsServer?): Pair<Int, List<MtuRow>> {
         val ladder = listOf(1420, 1380, 1340, 1280, 1200, 1120, 1040, 1000)
         val cands = ladder.filter { it > r.mtu }.sorted().take(2).sortedDescending()
         val rows = ArrayList<MtuRow>()
-        rows += MtuRow(r.mtu, r.mbps)
+        rows += MtuRow(r.mtu, null)
         var chosen = r.mtu
+        val ref = r.exit?.ms ?: 0
         for (m in cands) {
             currentCoroutineContext().ensureActive()
             val v = bringUp(r.cfg, m, dns?.ips() ?: emptyList(), appOnly = true, quiet = true)
@@ -1444,22 +1469,15 @@ class Engine(ctx: Context, private val store: Store) {
                 log("MTU $m: لا يمر HTTPS")
                 continue
             }
-            // غربلة: إن كان HTTPS أبطأ من المرجع بـ +40% نرفضه فوراً بدون تحميل
             val h = v?.let { Probes.httpsLatencyAvg(it.network, tries = 2) } ?: exit.ms
-            val ref = r.exit?.ms ?: h
-            if (ref > 0 && h > ref * 1.4) {
-                rows += MtuRow(m, null)
-                log("MTU $m: HTTPS بطيء ${h}ms مقابل ${ref}ms — مرفوض بدون تحميل")
+            rows += MtuRow(m, null)
+            if (ref > 0 && h > ref * 1.1) {
+                log("MTU $m: HTTPS أبطأ ${h}ms مقابل ${ref}ms — بقي $chosen")
                 continue
             }
-            val mbps = Probes.throughputMbps(2500, v?.network)
-            rows += MtuRow(m, mbps)
-            log("MTU $m: HTTPS ✔ ${h}ms • ${mbps?.let { "%.1f".format(it) } ?: "؟"} Mbps")
-            val base = r.mbps
-            if (base == null || mbps == null || mbps >= base * 0.92) {
-                chosen = m
-                break
-            }
+            log("MTU $m: HTTPS ✔ ${h}ms — المختار")
+            chosen = m
+            break
         }
         downSafe()
         return chosen to rows.sortedByDescending { it.mtu }
