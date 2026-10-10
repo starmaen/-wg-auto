@@ -962,6 +962,14 @@ class Engine(ctx: Context, private val store: Store) {
     @Volatile
     private var lastUpError = ""
 
+    /**
+     * محدد سرعة المصافحات: سيرفرات Proton المجانية تحجب مؤقتاً من يرشقها
+     * بعشرات المصافحات المتتالية (وهذا ما كان يُفشل الفحص الدقيق واليدوي بعد
+     * فحص شامل). أي رفع نفق ينتظر 900ms على الأقل منذ السابق.
+     */
+    @Volatile
+    private var lastTunnelUpAt = 0L
+
     // ---------- التحكم بالنفق: رفع وإنزال آمن مع التحقق ----------
     /** appOnly = true: نفق تجريبي خاص بهذا التطبيق فقط (لا يقطع بقية التطبيقات). */
     private fun up(c: WgConfig, mtu: Int?, dns: List<String>, appOnly: Boolean, quiet: Boolean = false): Boolean {
@@ -1046,7 +1054,10 @@ class Engine(ctx: Context, private val store: Store) {
     ): NetUtil.Info? {
         downSafe()
         for (attempt in 1..2) {
+            val gap = now() - lastTunnelUpAt
+            if (gap < 900) delay(900 - gap)
             if (!up(c, mtu, dns, appOnly, quiet)) return null
+            lastTunnelUpAt = now()
             val v = waitVpnUp()
             if (v != null) {
                 lastOwnChange = now()
@@ -1076,7 +1087,9 @@ class Engine(ctx: Context, private val store: Store) {
             listOf(null to true) +
                 listOfNotNull(mtu?.let { it to false }, 1280 to false, 1120 to false, 1000 to false).distinct() +
                 listOf(null to false)
-        for ((m, ownDns) in rungs) {
+        for ((idx, rung) in rungs.withIndex()) {
+            val (m, ownDns) = rung
+            if (idx > 0) delay(700)
             val label = if (ownDns) "الأصلي للكونفيج" else (m?.toString() ?: "الافتراضي")
             var ips: List<String> = if (ownDns) emptyList() else dns
             for (round in 0..1) {
@@ -1400,9 +1413,26 @@ class Engine(ctx: Context, private val store: Store) {
         downSafe()
 
         if (results.isEmpty()) {
+            // سقوط مرن (مثل امتحان الطلاب: الناجح في السريع يكفي): الفحص الدقيق
+            // قد يتعذر لحد مؤقت من السيرفر، لكن مرشحي المرحلة أ أثبتوا فعلياً
+            // (واجهة + TCP + HTTPS + تغيّر IP). نثبّت أسرعهم مباشرة بدل فشل العملية.
+            log("الفحص الدقيق تعذّر لحد مؤقت — تثبيت مباشر لأسرع مرشح من الفحص السريع")
+            setProgress("تثبيت مباشر لأسرع مرشح…")
+            val fallback = (alive + sameCountryFallback).sortedBy { it.second }
+            for ((c, _, m) in fallback) {
+                currentCoroutineContext().ensureActive()
+                val ver = connectAndVerify(c, m, testDns?.ips() ?: emptyList(), direct)
+                if (ver != null) {
+                    markConnected(c, testDns, emptyList(), ver, null, label, direct, emptyList())
+                    log("★ الأفضل (تثبيت مباشر): ${c.name} • ${ver.diag} • IP ${ver.exit?.ip ?: "؟"}")
+                    refineDnsAfterConnect(dnsAll)
+                    return
+                }
+                log("✗ فشل التثبيت المباشر: ${c.name}")
+            }
             setProgress("فشل الفحص الدقيق لكل المرشحين")
-            status.update { it.copy(connected = false, message = "فشل الفحص الدقيق — إعادة المحاولة بعد دقيقة") }
-            log("لم ينجح أي كونفيج في الفحص الدقيق")
+            status.update { it.copy(connected = false, message = "فشل الفحص الدقيق — انتظر دقيقتين قبل إعادة المحاولة (حد مؤقت غالباً)") }
+            log("لم ينجح أي كونفيج في الفحص الدقيق ولا التثبيت المباشر — انتظر دقيقتين (حجب مؤقت محتمل)")
             return
         }
         var ordered = results.sortedByDescending { it.score }
@@ -1483,7 +1513,18 @@ class Engine(ctx: Context, private val store: Store) {
         return chosen to rows.sortedByDescending { it.mtu }
     }
 
-    /** يقيس DNS عبر النفق نفسه (UDP، وهو ما يستخدمه WireGuard) ويختار الأفضل بالوسيط والتذبذب والفقد. */
+    /** بعد التثبيت المباشر: يقيس DNS عبر النفق العامل نفسه ويحدّث الواجهة (بلا نفق جديد). */
+    private fun refineDnsAfterConnect(dnsAll: List<DnsServer>) {
+        scope.launch {
+            val net = vpnInfo()?.network ?: return@launch
+            val (dns, rows) = pickDns(dnsAll, net)
+            if (dns != null) {
+                status.update { it.copy(activeDns = dns.name, activeDnsId = dns.id) }
+                report.update { it.copy(chosenDnsId = dns.id, dnsRows = rows) }
+                log("DNS المحدّث عبر النفق: ${dns.name}")
+            }
+        }
+    }
     private suspend fun pickDns(list: List<DnsServer>, network: Network?): Pair<DnsServer?, List<DnsRow>> =
         coroutineScope {
             val res = list.map { d -> async(Dispatchers.IO) { d to Probes.dnsMeasure(d, network, false) } }.awaitAll()
