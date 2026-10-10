@@ -460,7 +460,8 @@ class Engine(ctx: Context, private val store: Store) {
                 promising = c
             }
         }
-        if (promising == null || bestPing >= (currentLat * 0.7).toInt()) {
+        // عتبة أشد صرامة: لا نخاطر بتبديل نفق يعمل فعلاً إلا لتحسّن كبير وواضح جداً.
+        if (promising == null || bestPing >= (currentLat * 0.5).toInt()) {
             log("لا يوجد كونفيج أفضل بوضوح — بقي ${st.activeConfig} كما هو")
             status.update { it.copy(message = "متصل ✔ (لا تحسين متاح)") }
             return
@@ -600,7 +601,9 @@ class Engine(ctx: Context, private val store: Store) {
                 } else {
                     healthFails++
                     log("⚠ لا تمر بيانات عبر النفق ($healthFails/3)")
-                    if (healthFails >= 3) {
+                    // عتبة أعلى من قبل: فحص واحد فاشل بين كل 15 ثانية أمر طبيعي حتى على شبكة
+                    // سليمة، وإعادة بناء النفق لمجرد ذلك تسبّب انقطاعات وهمية أثناء عمل فعلي.
+                    if (healthFails >= 6) {
                         healthFails = 0
                         recover("انقطاع الاتصال")
                     }
