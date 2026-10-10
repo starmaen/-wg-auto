@@ -512,10 +512,12 @@ object Probes {
     }
 
     /**
-     * فحص مصافحة WireGuard قبل رفع النفق: يرسل رسالة Handshake Initiation (نوع 1)
-     * وينتظر رداً (نوع 2). يميز بين "السيرفر ميت" و"UDP محجوب من المزود".
-     * يعيد: true=يرد، false=لا يرد (محجوب/ميت)، null=تعذر الفحص (DNS مثلاً).
+     * ⚠ مهمل — لا تستخدمه لاتخاذ قرار: سيرفر WireGuard الحقيقي يتجاهل رسائل
+     * المصافحة المزيفة بلا MAC1 صحيح (دفاع ضد التضخيم)، فيعيد دائماً "لا يرد"
+     * حتى للسيرفرات السليمة. أُبقيت للدواعي المرجعية فقط.
+     * الاختبار الحقيقي الوحيد هو رفع النفق بـ GoBackend.
      */
+    @Deprecated("نتائج كاذبة دائماً — استخدم رفع النفق الفعلي بدلاً منه")
     fun wgHandshakeOk(host: String, port: Int, network: Network?, timeoutMs: Int = 2500): Boolean? {
         return try {
             val addr = InetAddress.getByName(host)

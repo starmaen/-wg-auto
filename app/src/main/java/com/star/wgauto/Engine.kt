@@ -270,7 +270,7 @@ class Engine(ctx: Context, private val store: Store) {
                         tried++
                         warpStatus.value = "تجربة عنوان $tried/${WarpGenerator.variants(r).size}: $ep"
                         val t = tmpCfg.copy(text = r.withEndpoint(ep))
-                        val p = probeTunnel(t, listOf(1280), emptyList(), direct)
+                        val p = probeTunnel(t, listOf(1280, 1000), emptyList(), direct)
                         if (p.vpn == null) {
                             log("WARP $ep: ✗ ${p.note}")
                             continue
@@ -1172,7 +1172,7 @@ class Engine(ctx: Context, private val store: Store) {
                 for (id in ids) {
                     val c = store.configs.value.firstOrNull { it.id == id } ?: continue
                     setResult(id, "جارٍ الفحص…")
-                    val p = probeTunnel(c, listOf(1280, 1120), dns?.ips() ?: emptyList(), direct)
+                    val p = probeTunnel(c, listOf(1280, 1120, 1000), dns?.ips() ?: emptyList(), direct)
                     val v = p.vpn
                     if (v == null) {
                         setResult(id, "✗ ${p.note}")
@@ -1294,7 +1294,7 @@ class Engine(ctx: Context, private val store: Store) {
         downSafe()
 
         // MTU ابتدائي آمن: 1280 (الافتراضي في تطبيق WireGuard للأندرويد وحدّ IPv6 الأدنى)، ثم 1120 كاحتياط
-        val startMtus: List<Int> = if (s.autoMtu) listOf(1280, 1120) else listOf(s.selMtu)
+        val startMtus: List<Int> = if (s.autoMtu) listOf(1280, 1120, 1000) else listOf(s.selMtu)
 
         // ---- المرحلة أ: فحص سريع بدليل (واجهة + TCP + HTTPS + تغيّر IP) عبر النفق التجريبي
         val alive = ArrayList<Triple<WgConfig, Int, Int>>()   // كونفيج، تأخر، MTU الناجح
@@ -1304,18 +1304,9 @@ class Engine(ctx: Context, private val store: Store) {
             currentCoroutineContext().ensureActive()
             setProgress("فحص سريع ${i + 1}/${candidates.size}: ${c.name}")
             updateRow(c.id) { it.copy(state = "testing") }
-            // فحص مسبق خفيف (بدون نفق): هل يرد سيرفر WireGuard على UDP أصلاً؟
-            // يفرّق بين "UDP محجوب من شبكتك التركية" و"كونفيج تالف" قبل إضاعة 30 ثانية برفع أنفاق.
-            val ep = Probes.parseEndpoint(c.text)
-            if (ep != null && under != null) {
-                val hs = Probes.wgHandshakeOk(ep.first, ep.second, under.network)
-                if (hs == false) {
-                    val note = "لا يرد على UDP ${ep.first}:${ep.second} — المنفذ محجوب من شبكتك أو السيرفر ميت (جرّب بيانات الجوال بدل الواي فاي)"
-                    updateRow(c.id) { it.copy(state = "fail", note = note) }
-                    log("✗ ${c.name}: $note")
-                    continue
-                }
-            }
+            // ملاحظة: لا فحص UDP مسبق هنا — سيرفر WireGuard يتجاهل رسائل المصافحة
+            // المزيفة بلا MAC صحيح (حماية من التضخيم)، فأي فحص مزيف يعطي
+            // "محجوب" كاذباً. الاختبار الحقيقي الوحيد هو رفع النفق نفسه.
             val p = probeTunnel(c, startMtus, testDns?.ips() ?: emptyList(), direct)
             if (p.vpn == null) {
                 // رسالة أوضح: النفق يُبنى لكن لا تمر بيانات = مصافحة WireGuard لم تكتمل (مفتاح/حجب)
