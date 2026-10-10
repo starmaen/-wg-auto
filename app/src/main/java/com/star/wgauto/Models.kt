@@ -119,8 +119,8 @@ data class MtuRow(val mtu: Int, val mbps: Double?)
 
 /** إحصاءات قياس: الوسيط والتذبذب (متوسط الانحراف) ونسبة الفقد. */
 data class Stat(val median: Int, val jitter: Int, val loss: Int) {
-    /** درجة أقل = أفضل. */
-    val score: Int get() = median + jitter / 2 + loss * 4
+    /** درجة أقل = أفضل. الفقد معاقب بشدة (×8): خادم بفقد 33% لا يفوز أبداً على خادم سليم. */
+    val score: Int get() = median + jitter / 2 + loss * 8
 }
 
 /** قياس خادم DNS بالبروتوكولات القياسية الثلاثة. */

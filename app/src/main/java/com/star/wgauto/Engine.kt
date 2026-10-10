@@ -1393,8 +1393,15 @@ class Engine(ctx: Context, private val store: Store) {
                 .map { (d, m) ->
                     DnsRow(d.id, d.name, m.udp?.median ?: -1, "UDP", m.udp?.jitter ?: 0, m.udp?.loss ?: 100)
                 }
-            val best = res.filter { (it.second.udp?.loss ?: 100) <= 50 }
+            // أولاً: من فقدُه ≤20% فقط (سليم فعلاً). إن لم يوجد، نقبل ≤50% كحل أخير بدل لا شيء.
+            val best = res.filter { (it.second.udp?.loss ?: 100) <= 20 }
                 .minByOrNull { it.second.udp?.score ?: Int.MAX_VALUE }?.first
+                ?: res.filter { (it.second.udp?.loss ?: 100) <= 50 }
+                    .minByOrNull { it.second.udp?.score ?: Int.MAX_VALUE }?.first
+            if (best != null) {
+                val b = res.first { it.first.id == best.id }.second.udp
+                log("DNS المختار عبر النفق: ${best.name} (${b?.median}ms فقد ${b?.loss}%) — الفقد العالي مرفوض تلقائياً")
+            }
             best to rows
         }
 }

@@ -82,6 +82,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import java.io.ByteArrayInputStream
 import java.util.zip.ZipInputStream
+import kotlinx.coroutines.launch
 
 class Actions(
     val toggle: () -> Unit,
@@ -724,6 +725,12 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                 color = if (warpStatus.startsWith("✗")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
             )
         }
+        var showProton by remember { mutableStateOf(false) }
+        OutlinedButton(
+            onClick = { showProton = true },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("🇨🇭 خوادم Proton المجانية (خروج أجنبي)") }
+        if (showProton) ProtonDialog(app, onClose = { showProton = false })
         Text(
             "يدعم ملفات .conf وملف .zip يحوي عدة كونفيجات. تُفحص الكونفيجات تلقائياً عند تشغيل الـ VPN فقط.",
             fontSize = 12.sp
@@ -828,6 +835,74 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             dismissButton = { TextButton(onClick = { showPaste = false }) { Text("إلغاء") } }
         )
     }
+}
+
+@Composable
+fun ProtonDialog(app: WgApp, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    var list by remember { mutableStateOf(ProtonServers.cache) }
+    var loading by remember { mutableStateOf(false) }
+    var err by remember { mutableStateOf("") }
+    // جلب أول مرة تلقائياً
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        if (list.isEmpty()) {
+            loading = true
+            list = ProtonServers.refresh()
+            err = ProtonServers.lastError
+            loading = false
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Proton Free — خروج أجنبي") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "حساب Proton المجاني يعطي خروجاً أجنبياً حقيقياً (هولندا/أمريكا/اليابان) بلا دفع. التوليد التلقائي الكامل يحتاج تسجيل دخول، لذلك نعرض أخف الخوادم المجانية لتختارها في موقع Proton ثم تستورد ملف .conf هنا.",
+                    fontSize = 12.sp
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            loading = true
+                            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                                list = ProtonServers.refresh()
+                                err = ProtonServers.lastError
+                                loading = false
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text(if (loading) "جارٍ التحديث…" else "تحديث القائمة") }
+                    OutlinedButton(
+                        onClick = {
+                            try {
+                                ctx.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse("https://account.protonvpn.com/downloads"))
+                                )
+                            } catch (e: Exception) { }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("فتح تحميل Proton") }
+                }
+                if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                if (list.isEmpty() && !loading) Text("لا توجد بيانات بعد — اضغط تحديث القائمة", fontSize = 12.sp)
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(list.take(30), key = { it.domain + it.entryIp }) { s ->
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(8.dp)) {
+                                Text("${Country.label(s.country)} • ${s.name}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                Text("${s.entryIp} • حمل ${s.load}%", fontSize = 12.sp)
+                                Text(s.domain, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+                Text("بعد التحميل من الموقع: عُد هنا واضغط استيراد واختر ملف .conf — سيظهر العلم تلقائياً.", fontSize = 12.sp)
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("إغلاق") } },
+        dismissButton = null
+    )
 }
 
 private fun statText(name: String, st: Stat?): String =
