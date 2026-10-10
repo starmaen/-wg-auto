@@ -261,9 +261,10 @@ class MainActivity : ComponentActivity() {
                 val text = bytes.toString(Charsets.UTF_8)
                 // تنظيف اسم ملفات المتصفح (.conf.txt المزدوجة): لا حاجة لتغيير الامتداد يدوياً
                 var cleanName = name
+                fun strip(s: String, suf: String): String =
+                    if (s.endsWith(suf, ignoreCase = true)) s.substring(0, s.length - suf.length) else s
                 repeat(3) {
-                    cleanName = cleanName.removeSuffix(".txt", true).removeSuffix(".conf", true)
-                        .removeSuffix(".ovpn", true).removeSuffix(".cfg", true).trim()
+                    cleanName = strip(strip(strip(strip(cleanName, ".txt"), ".conf"), ".ovpn"), ".cfg").trim()
                 }
                 if (app.engine.addConfig(cleanName.ifEmpty { name }, text) == null) ok++ else fail++
             }

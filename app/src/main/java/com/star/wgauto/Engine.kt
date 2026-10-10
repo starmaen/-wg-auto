@@ -188,12 +188,13 @@ class Engine(ctx: Context, private val store: Store) {
             }
         }
         // تنظيف أسماء .conf.txt المزدوجة من تحميل المتصفح
+        fun stripCI(s: String, suf: String): String =
+            if (s.endsWith(suf, ignoreCase = true)) s.substring(0, s.length - suf.length) else s
         store.updateConfigs { list ->
             list.map { c ->
                 var n = c.name
                 repeat(3) {
-                    n = n.removeSuffix(".txt", true).removeSuffix(".conf", true)
-                        .removeSuffix(".ovpn", true).removeSuffix(".cfg", true).trim()
+                    n = stripCI(stripCI(stripCI(stripCI(n, ".txt"), ".conf"), ".ovpn"), ".cfg").trim()
                 }
                 if (n.isEmpty()) n = c.name
                 // إزالة تكرار اللاحقة داخل الاسم
