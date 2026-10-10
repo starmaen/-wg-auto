@@ -259,7 +259,13 @@ class MainActivity : ComponentActivity() {
                 }
             } else {
                 val text = bytes.toString(Charsets.UTF_8)
-                if (app.engine.addConfig(name.removeSuffix(".conf"), text) == null) ok++ else fail++
+                // تنظيف اسم ملفات المتصفح (.conf.txt المزدوجة): لا حاجة لتغيير الامتداد يدوياً
+                var cleanName = name
+                repeat(3) {
+                    cleanName = cleanName.removeSuffix(".txt", true).removeSuffix(".conf", true)
+                        .removeSuffix(".ovpn", true).removeSuffix(".cfg", true).trim()
+                }
+                if (app.engine.addConfig(cleanName.ifEmpty { name }, text) == null) ok++ else fail++
             }
         } catch (e: Exception) {
             fail++

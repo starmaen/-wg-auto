@@ -510,4 +510,36 @@ object Probes {
         }
         return null
     }
+
+    /**
+     * فحص مصافحة WireGuard قبل رفع النفق: يرسل رسالة Handshake Initiation (نوع 1)
+     * وينتظر رداً (نوع 2). يميز بين "السيرفر ميت" و"UDP محجوب من المزود".
+     * يعيد: true=يرد، false=لا يرد (محجوب/ميت)، null=تعذر الفحص (DNS مثلاً).
+     */
+    fun wgHandshakeOk(host: String, port: Int, network: Network?, timeoutMs: Int = 2500): Boolean? {
+        return try {
+            val addr = InetAddress.getByName(host)
+            // رسالة Initiation مزيفة (32 بايت نوع + 116 عشوائي) تكفي لاستفزاز رد من أي سيرفر حقيقي
+            val msg = ByteArray(148)
+            msg[0] = 1
+            kotlin.random.Random.nextBytes(msg, 4, msg.size)
+            DatagramSocket().use { s ->
+                network?.bindSocket(s)
+                s.soTimeout = timeoutMs
+                val t0 = System.nanoTime()
+                s.send(DatagramPacket(msg, msg.size, addr, port))
+                val buf = ByteArray(256)
+                s.receive(DatagramPacket(buf, buf.size))
+                val ms = (System.nanoTime() - t0) / 1_000_000
+                // أي رد (حتى خطأ مصافحة) يعني UDP مفتوح والسيرفر حي
+                ms < timeoutMs
+            }
+        } catch (e: java.net.SocketTimeoutException) {
+            false
+        } catch (e: UnknownHostException) {
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
 }

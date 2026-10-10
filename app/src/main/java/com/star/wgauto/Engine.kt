@@ -164,20 +164,43 @@ class Engine(ctx: Context, private val store: Store) {
     fun repairAllConfigs(): Pair<Int, Int> {
         var ok = 0
         var fail = 0
+        var firstErr = ""
         store.updateConfigs { list ->
             list.map { c ->
                 try {
-                    val clean = ConfigText.normalizeForImport(c.text)
+                    var clean = ConfigText.normalizeForImport(c.text)
+                    // احتياط: إن فشل المنظف الصارم، جرّب التنظيف الخفيف القديم قبل إعلان الفشل
+                    try {
+                        Config.parse(ByteArrayInputStream(clean.toByteArray()))
+                    } catch (e1: Exception) {
+                        val legacy = ConfigText.sanitize(c.text)
+                        Config.parse(ByteArrayInputStream(legacy.toByteArray()))
+                        clean = legacy
+                    }
                     Config.parse(ByteArrayInputStream(clean.toByteArray()))
-                    if (clean != c.text) ok++ 
+                    if (clean != c.text) ok++
                     c.copy(text = clean)
                 } catch (e: Exception) {
                     fail++
+                    if (firstErr.isEmpty()) firstErr = e.message?.take(100) ?: e.javaClass.simpleName
                     c
                 }
             }
         }
-        log("إصلاح الكل: عُولج $ok كونفيج • فشل $fail")
+        // تنظيف أسماء .conf.txt المزدوجة من تحميل المتصفح
+        store.updateConfigs { list ->
+            list.map { c ->
+                var n = c.name
+                repeat(3) {
+                    n = n.removeSuffix(".txt", true).removeSuffix(".conf", true)
+                        .removeSuffix(".ovpn", true).removeSuffix(".cfg", true).trim()
+                }
+                if (n.isEmpty()) n = c.name
+                // إزالة تكرار اللاحقة داخل الاسم
+                c.copy(name = n)
+            }
+        }
+        log("إصلاح الكل: عُولج $ok كونفيج • فشل $fail" + if (firstErr.isNotEmpty()) " • أول خطأ: $firstErr" else "")
         return ok to fail
     }
 
@@ -1280,10 +1303,27 @@ class Engine(ctx: Context, private val store: Store) {
             currentCoroutineContext().ensureActive()
             setProgress("فحص سريع ${i + 1}/${candidates.size}: ${c.name}")
             updateRow(c.id) { it.copy(state = "testing") }
+            // فحص مسبق خفيف (بدون نفق): هل يرد سيرفر WireGuard على UDP أصلاً؟
+            // يفرّق بين "UDP محجوب من شبكتك التركية" و"كونفيج تالف" قبل إضاعة 30 ثانية برفع أنفاق.
+            val ep = Probes.parseEndpoint(c.text)
+            if (ep != null && under != null) {
+                val hs = Probes.wgHandshakeOk(ep.first, ep.second, under.network)
+                if (hs == false) {
+                    val note = "لا يرد على UDP ${ep.first}:${ep.second} — المنفذ محجوب من شبكتك أو السيرفر ميت (جرّب بيانات الجوال بدل الواي فاي)"
+                    updateRow(c.id) { it.copy(state = "fail", note = note) }
+                    log("✗ ${c.name}: $note")
+                    continue
+                }
+            }
             val p = probeTunnel(c, startMtus, testDns?.ips() ?: emptyList(), direct)
             if (p.vpn == null) {
-                updateRow(c.id) { it.copy(state = "fail", note = p.note) }
-                log("✗ ${c.name}: ${p.note}")
+                // رسالة أوضح: النفق يُبنى لكن لا تمر بيانات = مصافحة WireGuard لم تكتمل (مفتاح/حجب)
+                var note = p.note
+                if (note.contains("لا يتصل TCP")) {
+                    note = "النفق يُبنى لكن المصافحة لا تكتمل — غالباً UDP محجوب أو المفتاح غير مسجل في السيرفر"
+                }
+                updateRow(c.id) { it.copy(state = "fail", note = note) }
+                log("✗ ${c.name}: $note")
                 continue
             }
             updateRow(c.id) {
