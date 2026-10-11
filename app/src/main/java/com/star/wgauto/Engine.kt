@@ -58,8 +58,16 @@ class Engine(ctx: Context, private val store: Store) {
 
     private class Probe(
         val vpn: NetUtil.Info?, val mtu: Int, val lat: Int, val exit: ExitInfo?, val note: String,
-        val sameCountry: Boolean = false
+        val sameCountry: Boolean = false, val jitter: Int = 0, val loss: Int = 0
     )
+
+    /** نتيجة الامتحان لكونفيج واحد: كل البيانات اللازمة للترتيب بالمعادلة الموحدة. */
+    private class ExamResult(
+        val cfg: WgConfig, val mtu: Int, val lat: Int, val jitter: Int, val loss: Int,
+        val exit: ExitInfo?, val sameCountry: Boolean
+    ) {
+        val examScore: Double get() = Exam.score(lat, jitter, loss)
+    }
     private class SideScan(val info: SideInfo, val measures: List<Pair<DnsServer, DnsMeasure>>, val sys: Stat?)
 
     private val appCtx = ctx.applicationContext
@@ -361,7 +369,9 @@ class Engine(ctx: Context, private val store: Store) {
                 }
             }
         }
-        reselect("تشغيل", allowFast = true)
+        // زر التشغيل يعني دائماً فحصاً شاملاً كاملاً — لا اختصار لآخر ناجح هنا.
+        // (المسار السريع محفوظ لإعادة الاتصال التلقائية بعد الانقطاع فقط).
+        reselect("تشغيل", allowFast = false)
     }
 
     /**
@@ -437,18 +447,16 @@ class Engine(ctx: Context, private val store: Store) {
         }
     }
 
-    /** إعادة اختيار تلقائية: لا تبدأ إن كان هناك فحص جارٍ أو ضمن فترة التهدئة. */
+    /** إعادة اختيار تلقائية (انقطاع/دورية): مسار سريع لآخر ناجح أولاً، ثم شامل. */
     fun autoReselect(reason: String) {
         if (status.value.busy || now() < cooldownUntil) return
-        reselect(reason)
+        reselect(reason, allowFast = true)
     }
 
     /**
-     * تفعيل فردي مباشر لكونفيج محدد — منفصل تماماً عن آلية الفحص والاختيار التلقائي الشاملة.
-     * لا يقارن بين عدة كونفيجات، ولا يقيس جودة إحصائية (وسيط/تذبذب/فقد/سرعة)، ولا يبحث عن
-     * بديل عند الفشل. فقط: يرفع هذا الكونفيج بالذات (مع محاولات MTU الآمنة الجاهزة داخل
-     * connectAndVerify)، يتحقق أن IP تغيّر فعلاً، وينجح أو يفشل بوضوح — بلا أي تحوّل ضمني إلى
-     * فحص شامل لبقية الكونفيجات.
+     * تفعيل فردي مباشر لكونفيج محدد — مسار مستقل تماماً عن الفحص الشامل:
+     * لا يقارن بغيره ولا يرتّب أحداً. من يمرّر TCP يُثبَّت (ولو بتحذير)،
+     * والفشل هنا يعني سبباً حقيقياً فقط: انتهاء/إبطال المفتاح أو انقطاع الشبكة.
      */
     fun connectManual(cfgId: String) {
         if (status.value.busy) return
@@ -509,10 +517,14 @@ class Engine(ctx: Context, private val store: Store) {
             }
             if (sameCountry) status.update { it.copy(message = "متصل ✔ لكن$note") }
             log("✔ تفعيل فردي: ${cfg.name} • ${ver.diag}$note")
+            // تكميل الخلفية لهذا الكونفيج فقط: خروج مؤكد + DNS + سرعة — دون مساس بغيره
+            postConnectRefine(store.dns.value.filter { it.enabled && (!it.filtered || s.allowFilteredDns) })
         } else {
-            status.update { it.copy(connected = false, message = "فشل تفعيل ${cfg.name} — تعذّر الاتصال أو لم يتغيّر IP") }
-            report.update { r -> r.copy(rows = r.rows.map { if (it.id == cfg.id) it.copy(state = "fail", note = "تعذّر الاتصال أو لم يتغيّر IP") else it }) }
-            log("✗ فشل التفعيل الفردي: ${cfg.name}")
+            // مع قاعدة التثبيت المتساهلة (TCP يكفي)، الفشل هنا حقيقي:
+            // مفتاح منتهٍ/مبطل أو شبكة مقطوعة — لا استبعاد ظالم.
+            status.update { it.copy(connected = false, message = "فشل تفعيل ${cfg.name}: لا يمر أي TCP (مفتاح منتهٍ؟ أو الشبكة مقطوعة؟)") }
+            report.update { r -> r.copy(rows = r.rows.map { if (it.id == cfg.id) it.copy(state = "fail", note = "لا يمر TCP — تحقق من صلاحية الكونفيج والشبكة") else it }) }
+            log("✗ فشل التفعيل الفردي: ${cfg.name} (لا TCP — سبب حقيقي)")
         }
     }
 
@@ -651,9 +663,19 @@ class Engine(ctx: Context, private val store: Store) {
                     reselect("تبدّل الشبكة إلى $label", allowFast = true)
                 }
                 label != lastNetLabel && label != "غير متصل" -> {
+                    // المسار اليدوي: لا هدم تلقائي — نتحقق أولاً، وإعادة البناء فقط للميت
                     lastNetLabel = label
-                    log("تبدّلت الشبكة إلى $label — إعادة الاتصال بالكونفيج المحدَّد يدوياً")
-                    connectManual(s.selConfigId)
+                    log("تبدّلت الشبكة إلى $label — التحقق من النفق اليدوي أولاً (بلا هدم)")
+                    mutex.withLock {
+                        val lat = aliveNow()
+                        if (lat != null) {
+                            status.update { it.copy(latencyMs = lat, lastScanAt = now()) }
+                            log("النفق اليدوي سليم بعد تبدّل الشبكة (${lat}ms) — بقي دون إعادة بناء")
+                        } else {
+                            log("النفق اليدوي ميت بعد تبدّل الشبكة — إعادة الاتصال بالكونفيج المحدَّد يدوياً")
+                            connectManual(s.selConfigId)
+                        }
+                    }
                 }
                 else -> mutex.withLock {
                     // نفس نوع الشبكة (تغيّر IP فقط): نتحقق أن النفق سليم فعلاً
@@ -1142,7 +1164,13 @@ class Engine(ctx: Context, private val store: Store) {
         return null
     }
 
-    /** فحص نفق تجريبي (خاص بالتطبيق): واجهة + TCP + HTTPS عبر النفق، بسلّم MTU. vpn=null يعني فشل مع note. */
+    /**
+     * امتحان كامل لكونفيج واحد بنفق تجريبي (خاص بالتطبيق — بلا قطع):
+     * واجهة + TCP + خروج اختياري + عينات جودة (زمن/تذبذب/فقد).
+     * vpn=null يعني راسباً مع note. الناجح يحمل درجته للترتيب النهائي.
+     * ملاحظة: الخروج (HTTPS) اختياري — من يمرّر TCP ناجح، وبلا خروج يُقبل
+     * بلا دولة مؤكدة (تُكتشف بعد التثبيت) بدل استبعاده.
+     */
     private suspend fun probeTunnel(c: WgConfig, mtus: List<Int?>, dns: List<String>, direct: ExitInfo?): Probe {
         var note = "لم تُنشأ واجهة النفق"
         for (m in mtus) {
@@ -1152,22 +1180,27 @@ class Engine(ctx: Context, private val store: Store) {
             val v = bringUp(c, m, useDns, appOnly = true, quiet = true)
                 ?: return Probe(null, effMtu, -1, null,
                     if (lastUpError.isNotEmpty()) "لم تُنشأ الواجهة: $lastUpError" else "لم تُنشأ واجهة النفق (تأكد من إذن VPN وعدم وجود VPN آخر)")
-            val lat = Probes.quickAlive(v.network)
-                ?: return Probe(null, effMtu, -1, null, "الخادم لا يستجيب (لا تمر بيانات)")
-            val exit = Probes.exitInfo(v.network, fast = true)
-            if (exit == null) {
-                note = "TCP يتصل لكن HTTPS لا يمر (MTU $effMtu)"
+            val lat = Probes.quickAlive(v.network, 2500)
+            if (lat == null) {
+                note = "الخادم لا يستجيب (لا تمر بيانات)"
+                // فشل TCP قد يكون MTU في حالات نادرة — نجرّب الدرجة التالية قبل الحكم
                 continue
             }
-            if (direct != null && exit.ip == direct.ip) {
+            val exit = Probes.exitInfo(v.network, fast = true)
+            if (direct != null && exit != null && exit.ip == direct.ip) {
                 return Probe(null, effMtu, lat, exit, "الـ IP لم يتغيّر — لا يحمل الحركة")
             }
-            val sameCountry = direct != null && exit.loc.isNotEmpty() &&
+            // عينات الجودة للمعادلة (3 عينات سريعة تكفي للترتيب)
+            val st = Probes.tcpStat(v.network, 3)
+            val sameCountry = direct != null && exit?.loc?.isNotEmpty() == true &&
                 exit.loc.equals(direct.loc, ignoreCase = true)
-            return Probe(v, effMtu, lat, exit, "", sameCountry)
+            return Probe(
+                v, effMtu, st?.median ?: lat, exit,
+                if (exit == null) "ناجح بلا خروج مؤكد (تُكتشف الدولة بعد التثبيت)" else "",
+                sameCountry, st?.jitter ?: 0, st?.loss ?: 0
+            )
         }
-        val lastMtu = mtus.lastOrNull() ?: 1280
-        return Probe(null, lastMtu, -1, null, note)
+        return Probe(null, mtus.lastOrNull() ?: 1280, -1, null, note)
     }
 
     // ---------- فحص يدوي لكونفيج (بنفق تجريبي، بلا سجل) ----------
@@ -1209,7 +1242,7 @@ class Engine(ctx: Context, private val store: Store) {
                 for (id in ids) {
                     val c = store.configs.value.firstOrNull { it.id == id } ?: continue
                     setResult(id, "جارٍ الفحص…")
-                    val p = probeTunnel(c, listOf(null, 1280, 1120, 1000), dns?.ips() ?: emptyList(), direct)
+                    val p = probeTunnel(c, listOf(null, 1280), dns?.ips() ?: emptyList(), direct)
                     val v = p.vpn
                     if (v == null) {
                         setResult(id, "✗ ${p.note}")
@@ -1329,13 +1362,14 @@ class Engine(ctx: Context, private val store: Store) {
         log("بدء الفحص: $reason (${candidates.size} كونفيج)")
         downSafe()
 
-        // MTU ابتدائي آمن: 1280 (الافتراضي في تطبيق WireGuard للأندرويد وحدّ IPv6 الأدنى)، ثم 1120 كاحتياط
-        // MTU: الكونفيج كما هو أولاً (لا نفرض)، ثم قيم عامة، ثم 1000 للجوال/NAT
-        val startMtus: List<Int?> = if (s.autoMtu) listOf(null, 1280, 1120, 1000) else listOf(s.selMtu)
+        // MTU: الكونفيج كما هو أولاً (لا نفرض)، ثم 1280 العامة — الامتحان وحده يحدد الناجح
+        val startMtus: List<Int?> = if (s.autoMtu) listOf(null, 1280) else listOf(s.selMtu)
 
-        // ---- المرحلة أ: فحص سريع بدليل (واجهة + TCP + HTTPS + تغيّر IP) عبر النفق التجريبي
-        val alive = ArrayList<Triple<WgConfig, Int, Int>>()   // كونفيج، تأخر، MTU الناجح
-        val sameCountryFallback = ArrayList<Triple<WgConfig, Int, Int>>()
+        // ---- الامتحان: فحص واحد شامل للجميع (واجهة + TCP + خروج + جودة) عبر النفق التجريبي.
+        // الكل يحضر والكل يُرتَّب بالمعادلة الموحدة (الأول والثاني...) — لا مرحلة ثانية
+        // تُسقط الناجحين ولا تُوقف عند مرشح فاشل.
+        val alive = ArrayList<ExamResult>()
+        val sameCountryFallback = ArrayList<ExamResult>()
         var sameCountryLoc = ""
         for ((i, c) in candidates.withIndex()) {
             currentCoroutineContext().ensureActive()
@@ -1359,19 +1393,21 @@ class Engine(ctx: Context, private val store: Store) {
                 continue
             }
             updateRow(c.id) {
+                val exam = Exam.score(p.lat, p.jitter, p.loss)
                 it.copy(
-                    state = "ok", latencyMs = p.lat, mtu = p.mtu,
+                    state = "ok", latencyMs = p.lat, jitter = p.jitter, loss = p.loss, mtu = p.mtu,
+                    score = 1.0 / (1 + exam / 100.0),
                     exitIp = p.exit?.ip ?: "", exitLoc = p.exit?.loc ?: "", sameCountry = p.sameCountry
                 )
             }
             if (p.sameCountry && s.autoConfig) {
                 sameCountryLoc = p.exit?.loc ?: ""
                 log("⚠ ${c.name}: نفس دولتك ($sameCountryLoc) — لا يفيد لتجاوز الحجب، مستبعَد من الاختيار التلقائي")
-                sameCountryFallback += Triple(c, p.lat, p.mtu)
+                sameCountryFallback += ExamResult(c, p.mtu, p.lat, p.jitter, p.loss, p.exit, true)
                 continue
             }
-            log("✓ ${c.name}: ${p.lat}ms • MTU ${p.mtu} • ${p.exit?.ip ?: "؟"} ${p.exit?.loc ?: ""}")
-            alive += Triple(c, p.lat, p.mtu)
+            log("✓ ${c.name}: ${p.lat}ms ±${p.jitter} • فقد ${p.loss}% • MTU ${p.mtu} • ${p.exit?.ip ?: "؟"} ${p.exit?.loc ?: ""}")
+            alive += ExamResult(c, p.mtu, p.lat, p.jitter, p.loss, p.exit, p.sameCountry)
             } catch (e: Exception) {
                 // مرشح واحد لا يُسقط الامتحان كله — يُسجَّل ويُتابَع البقية
                 updateRow(c.id) { it.copy(state = "fail", note = "خطأ فحص: ${e.message?.take(60)}") }
@@ -1396,108 +1432,35 @@ class Engine(ctx: Context, private val store: Store) {
             return
         }
 
-        // ---- المرحلة ب: فحص دقيق لأسرع 3 — زمن + تذبذب + فقد (بلا أي تحميل توفيراً للبيانات).
-        // السرعة تُقاس مرة واحدة للفائز بعد التثبيت. الفقد المرتفع مستبعَد: الأفضل أداءً بلا فقد.
-        val top = alive.sortedBy { it.second }.take(if (s.autoConfig) 3 else 1)
-        val results = ArrayList<Result>()
-        for ((i, t) in top.withIndex()) {
-            currentCoroutineContext().ensureActive()
-            try {
-            val c = t.first
-            val m0 = t.third
-            setProgress("فحص دقيق ${i + 1}/${top.size}: ${c.name}")
-            val v = bringUp(c, m0, testDns?.ips() ?: emptyList(), appOnly = true) ?: continue
-            val st = Probes.tcpStat(v.network, 6)
-            if (st == null) {
-                updateRow(c.id) { it.copy(state = "fail", note = "انقطع أثناء الفحص الدقيق") }
-                continue
-            }
-            if (st.loss > 25) {
-                updateRow(c.id) { it.copy(state = "fail", note = "فقد حزم مرتفع (${st.loss}%) — مستبعَد") }
-                log("✗ ${c.name}: فقد حزم ${st.loss}% — مستبعَد تلقائياً")
-                continue
-            }
-            val exit = Probes.exitInfo(v.network, fast = true)
-            val (dns, dnsRows) = if (s.autoDns) pickDns(dnsAll, v.network) else (defDns to emptyList())
-            // معادلة الامتحان الموحدة: الزمن 50% + الفقد 30% + التذبذب 20%
-            val exam = Exam.score(st.median, st.jitter, st.loss)
-            val score = 1.0 / (1 + exam / 100.0)
-            results += Result(c, m0, 0, dns, dnsRows, st, null, score, exit, emptyList())
-            updateRow(c.id) {
-                it.copy(
-                    state = "ok", latencyMs = st.median, jitter = st.jitter, loss = st.loss, mbps = null,
-                    mtu = m0, dnsName = dns?.name ?: "", score = score,
-                    exitIp = exit?.ip ?: it.exitIp, exitLoc = exit?.loc ?: it.exitLoc
-                )
-            }
-            log("★ ${c.name}: ${st.median}ms ±${st.jitter} • فقد ${st.loss}% • درجة ${"%.1f".format(exam)} • MTU $m0")
-            } catch (e: Exception) {
-                updateRow(t.first.id) { it.copy(state = "fail", note = "خطأ فحص دقيق: ${e.message?.take(60)}") }
-                log("✗ ${t.first.name}: خطأ فحص دقيق — متابعة البقية")
-            }
+        // ---- الترتيب النهائي بالمعادلة الموحدة مباشرة من الامتحان (الأول والثاني...).
+        // لا فحص ثانٍ: كل ناجح يحمل (زمن/تذبذب/فقد/MTU/خروج). DNS والسرعة يُقاسان
+        // مرة واحدة عبر نفق الفائز بعد التثبيت — توفيراً للوقت والبيانات والمصافحات.
+        val ordered = alive.sortedBy { it.examScore }.map { e ->
+            val sc = 1.0 / (1 + e.examScore / 100.0)
+            Result(e.cfg, e.mtu, 0, testDns, emptyList(), Stat(e.lat, e.jitter, e.loss), null, sc, e.exit, emptyList())
         }
-        downSafe()
+        log("الترتيب النهائي: " + ordered.take(5).mapIndexed { i, r ->
+            "${Exam.rankMedal(i)} ${r.cfg.name} (${"%.1f".format(100 * (1 / r.score - 1))})"
+        }.joinToString(" • "))
 
-        if (results.isEmpty()) {
-            // سقوط مرن (مثل امتحان الطلاب: الناجح في السريع يكفي): الفحص الدقيق
-            // قد يتعذر لحد مؤقت من السيرفر، لكن مرشحي المرحلة أ أثبتوا فعلياً
-            // (واجهة + TCP + HTTPS + تغيّر IP). نثبّت أسرعهم مباشرة بدل فشل العملية.
-            log("الفحص الدقيق تعذّر لحد مؤقت — تثبيت مباشر لأسرع مرشح من الفحص السريع")
-            setProgress("تثبيت مباشر لأسرع مرشح…")
-            val fallback = (alive + sameCountryFallback).sortedBy { it.second }
-            for ((c, _, m) in fallback) {
-                currentCoroutineContext().ensureActive()
-                val ver = connectAndVerify(c, m, testDns?.ips() ?: emptyList(), direct)
-                if (ver != null) {
-                    markConnected(c, testDns, emptyList(), ver, null, label, direct, emptyList())
-                    log("★ الأفضل (تثبيت مباشر): ${c.name} • ${ver.diag} • IP ${ver.exit?.ip ?: "؟"}")
-                    refineDnsAfterConnect(dnsAll)
-                    return
-                }
-                log("✗ فشل التثبيت المباشر: ${c.name}")
-            }
-            setProgress("فشل الفحص الدقيق لكل المرشحين")
-            status.update { it.copy(connected = false, message = "فشل الفحص الدقيق — انتظر دقيقتين قبل إعادة المحاولة (حد مؤقت غالباً)") }
-            log("لم ينجح أي كونفيج في الفحص الدقيق ولا التثبيت المباشر — انتظر دقيقتين (حجب مؤقت محتمل)")
-            return
-        }
-        var ordered = results.sortedByDescending { it.score }
-
-        // ---- المرحلة ج: رفع MTU تجريبياً فوق القيمة الآمنة، بشرط أن يمرّ HTTPS وتبقى السرعة مقاربة
-        if (s.autoMtu) {
-            val w = ordered.first()
-            setProgress("ضبط MTU للكونفيج ${w.cfg.name}")
-            val (bestMtu, rows) = tuneMtu(w, testDns)
-            ordered = listOf(
-                Result(w.cfg, bestMtu, 0, w.dns, w.dnsRows, w.stat, w.mbps, w.score, w.exit, rows)
-            ) + ordered.drop(1)
-            updateRow(w.cfg.id) { it.copy(mtu = bestMtu) }
-        }
-
-        // ---- التثبيت: نفق واحد لكل التطبيقات، مع التحقق من كل الطبقات
+        // ---- التثبيت: نفق واحد لكل التطبيقات — الأول المُثبَّت يفوز، والبقية احتياط.
+        // مرشح واحد عاطل لا يوقف القائمة: يُسجَّل ويُجرَّب التالي.
         for (r in ordered) {
             currentCoroutineContext().ensureActive()
+            try {
             setProgress("تثبيت الاتصال: ${r.cfg.name}")
             val ver = connectAndVerify(r.cfg, r.mtu, r.dns?.ips() ?: emptyList(), direct)
             if (ver != null) {
                 markConnected(r.cfg, r.dns, r.dnsRows, ver, null, label, direct, r.mtuRows)
                 log("★ الأفضل: ${r.cfg.name} • ${ver.diag} • DNS ${r.dns?.name ?: "حسب الكونفيج"} • IP ${ver.exit?.ip ?: "؟"}")
-                // السرعة تُقاس مرة واحدة في الخلفية للفائز فقط — بلا صرف بيانات أثناء الفحص
-                val wnet = ver.vpn.network
-                val wid = r.cfg.id
-                scope.launch {
-                    val sp = Probes.throughputMbps(4000, wnet)
-                    if (sp != null) {
-                        status.update { it.copy(mbps = sp) }
-                        report.update { rp -> rp.copy(rows = rp.rows.map {
-                            if (it.id == wid) it.copy(mbps = sp) else it
-                        }) }
-                        log("السرعة عبر ${r.cfg.name}: ${"%.1f".format(sp)} Mbps")
-                    }
-                }
+                // التكميل في الخلفية للفائز فقط: DNS + خروج مؤكد + سرعة — بلا مصافحات جديدة
+                postConnectRefine(dnsAll)
                 return
             }
-            log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name}")
+            log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name} — التالي في الترتيب")
+            } catch (e: Exception) {
+                log("✗ خطأ تثبيت ${r.cfg.name} (${e.message?.take(60)}) — التالي في الترتيب")
+            }
         }
         downSafe()
         setProgress("تعذّر تثبيت الاتصال")
@@ -1539,16 +1502,66 @@ class Engine(ctx: Context, private val store: Store) {
         return chosen to rows.sortedByDescending { it.mtu }
     }
 
-    /** بعد التثبيت المباشر: يقيس DNS عبر النفق العامل نفسه ويحدّث الواجهة (بلا نفق جديد). */
-    private fun refineDnsAfterConnect(dnsAll: List<DnsServer>) {
+    /**
+     * تكميل ما بعد التثبيت في الخلفية للفائز فقط (بلا مصافحات جديدة إطلاقاً):
+     * خروج مؤكد + أفضل DNS عبر النفق العامل + السرعة. يرقّي حالة
+     * "متصل (لم يُتحقق)" إلى "متصل ✔" متى توفر الدليل.
+     */
+    private fun postConnectRefine(dnsAll: List<DnsServer>) {
         scope.launch {
-            val net = vpnInfo()?.network ?: return@launch
-            val (dns, rows) = pickDns(dnsAll, net)
-            if (dns != null) {
-                status.update { it.copy(activeDns = dns.name, activeDnsId = dns.id) }
-                report.update { it.copy(chosenDnsId = dns.id, dnsRows = rows) }
-                log("DNS المحدّث عبر النفق: ${dns.name}")
-            }
+            val v = vpnInfo() ?: return@launch
+            if (!tunnelIsUp()) return@launch
+            val net = v.network
+            val st = status.value
+            val directIp = st.directIp
+            // 1) الخروج المؤكد (3 خدمات، مهلة مريحة — لا استعجال هنا)
+            try {
+                val ex = Probes.exitInfo(net)
+                if (ex != null) {
+                    val verified = directIp.isEmpty() || ex.ip != directIp
+                    status.update {
+                        it.copy(
+                            exitIp = ex.ip, exitLoc = ex.loc, verified = verified,
+                            message = if (verified) "متصل ✔ (تم التحقق من الـ IP)" else it.message
+                        )
+                    }
+                    report.update { rp -> rp.copy(rows = rp.rows.map {
+                        if (it.id == rp.chosenConfigId) it.copy(exitIp = ex.ip, exitLoc = ex.loc) else it
+                    }) }
+                    if (ex.loc.isNotEmpty()) {
+                        val cid = report.value.chosenConfigId
+                        store.updateConfigs { l -> l.map {
+                            if (it.id == cid) it.copy(lastCountry = ex.loc,
+                                lastCountryUseful = directIp.isEmpty() || !ex.loc.equals(st.directLoc, true))
+                            else it
+                        } }
+                    }
+                    log("تأكيد الخروج: ${Country.ipLine(ex.ip, ex.loc)}")
+                }
+            } catch (e: Exception) { }
+            if (!tunnelIsUp()) return@launch
+            // 2) أفضل DNS عبر النفق العامل نفسه
+            try {
+                val (dns, rows) = pickDns(dnsAll, net)
+                if (dns != null) {
+                    status.update { it.copy(activeDns = dns.name, activeDnsId = dns.id) }
+                    report.update { it.copy(chosenDnsId = dns.id, dnsRows = rows) }
+                    log("DNS المحدّث عبر النفق: ${dns.name}")
+                }
+            } catch (e: Exception) { }
+            if (!tunnelIsUp()) return@launch
+            // 3) السرعة مرة واحدة للفائز فقط
+            try {
+                val wid = report.value.chosenConfigId
+                val sp = Probes.throughputMbps(4000, net)
+                if (sp != null && tunnelIsUp()) {
+                    status.update { it.copy(mbps = sp) }
+                    report.update { rp -> rp.copy(rows = rp.rows.map {
+                        if (it.id == wid) it.copy(mbps = sp) else it
+                    }) }
+                    log("السرعة عبر النفق: ${"%.1f".format(sp)} Mbps")
+                }
+            } catch (e: Exception) { }
         }
     }
     private suspend fun pickDns(list: List<DnsServer>, network: Network?): Pair<DnsServer?, List<DnsRow>> =

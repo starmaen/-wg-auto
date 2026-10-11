@@ -332,8 +332,8 @@ object Probes {
             "https://www.cloudflare.com/cdn-cgi/trace",
             "https://api64.ipify.org"
         )
-        // مهلة أطول قليلاً من المعتاد: شبكات الجوال عادة أبطأ وأكثر تذبذباً من الواي فاي.
-        for (u in urls) httpTrace(u, network, if (fast) 4000 else 5000).first?.let { return it }
+        // مهلة مريحة للمسار الكامل، وسريعة للفحص (الامتحان يقيس العشرات).
+        for (u in urls) httpTrace(u, network, if (fast) 2500 else 5000).first?.let { return it }
         return null
     }
 
