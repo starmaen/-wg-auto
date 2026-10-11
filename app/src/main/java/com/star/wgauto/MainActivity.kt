@@ -685,8 +685,15 @@ fun HomeTab(app: WgApp, a: Actions) {
                 dismissButton = { TextButton(onClick = { showShutdown = false }) { Text("إلغاء") } }
             )
         }
-        Text("السجل", fontWeight = FontWeight.Bold)
-        logs.reversed().take(60).forEach { Text(it, fontSize = 12.sp) }
+        var showLog by remember { mutableStateOf(false) }
+        OutlinedButton(
+            onClick = { showLog = !showLog },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text(if (showLog) "▲ إخفاء سجل الفحص" else "▼ سجل الفحص التفصيلي (يُحذف تلقائياً بعد يوم)") }
+        if (showLog) {
+            Text("الأحدث أولاً — للمراجعة عند الحاجة فقط", fontSize = 11.sp)
+            logs.reversed().take(100).forEach { Text(it, fontSize = 12.sp) }
+        }
     }
 }
 
@@ -761,7 +768,8 @@ fun ConfigsTab(app: WgApp, a: Actions) {
         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(list, key = { it.id }) { c ->
                 Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(8.dp)) {
+                    Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        // السطر 1: الاسم + العلم (جدول منظم)
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             if (!s.autoConfig) {
                                 RadioButton(
@@ -770,10 +778,12 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                                 )
                             }
                             MarkerSlot(st.connected && st.activeConfigId == c.id)
-                            Column(Modifier.weight(1f)) {
-                                Text(c.name, fontWeight = FontWeight.Bold)
-                                val ep = Probes.parseEndpoint(c.text)
-                                Text(ep?.let { "${it.first}:${it.second}" } ?: "—", fontSize = 12.sp)
+                            Text(
+                                c.name, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f),
+                                maxLines = 1
+                            )
+                            if (c.lastCountry.isNotEmpty()) {
+                                Text(Country.label(c.lastCountry), fontSize = 13.sp, maxLines = 1)
                             }
                             Switch(
                                 checked = c.enabled,
@@ -782,7 +792,19 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                                 }
                             )
                         }
-                        results[c.id]?.let { Text(it, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 8.dp)) }
+                        // السطر 2: الخادم + IP الخروج (إن عُرف)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            val ep = Probes.parseEndpoint(c.text)
+                            Text(
+                                ep?.let { "🖥 ${it.first}:${it.second}" } ?: "—",
+                                fontSize = 12.sp, modifier = Modifier.weight(1f),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        // السطر 3: نتيجة الفحص فقط (بلا سلسلة كتابات)
+                        results[c.id]?.let {
+                            Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             val isTargeted = !s.autoConfig && s.selConfigId == c.id
                             val isLiveConnected = st.connected && st.activeConfigId == c.id

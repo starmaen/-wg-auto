@@ -112,9 +112,22 @@ class Engine(ctx: Context, private val store: Store) {
 
     private fun now() = System.currentTimeMillis()
 
+    init {
+        // استعادة سجل اليوم الماضي فقط (الأقدم حُذف تلقائياً عند التحميل)
+        try {
+            logs.value = store.loadScanLogs()
+        } catch (e: Exception) {
+        }
+    }
+
     fun log(msg: String) {
         val t = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
-        logs.update { (it + "$t  $msg").takeLast(300) }
+        val line = "$t  $msg"
+        logs.update { (it + line).takeLast(300) }
+        try {
+            store.appendScanLog(now(), line)
+        } catch (e: Exception) {
+        }
     }
 
     private fun setResult(id: String, text: String) {
@@ -1248,11 +1261,25 @@ class Engine(ctx: Context, private val store: Store) {
                         setResult(id, "✗ ${p.note}")
                         continue
                     }
-                    val st = Probes.tcpStat(v.network, 6)
+                    val st = Probes.tcpStat(v.network, 3)
+                    val epHost = Probes.parseEndpoint(c.text)?.first ?: ""
+                    // حفظ الدولة فوراً ليظهر العلم بجانب الكونفيج دائماً
+                    if (p.exit?.loc?.isNotEmpty() == true) {
+                        val cc = p.exit.loc
+                        store.updateConfigs { l -> l.map {
+                            if (it.id == id) it.copy(lastCountry = cc,
+                                lastCountryUseful = direct == null || !cc.equals(direct.loc, true))
+                            else it
+                        } }
+                    }
+                    val storedCc = store.configs.value.firstOrNull { it.id == id }?.lastCountry ?: ""
+                    val locLine = if (p.exit != null) Country.ipLine(p.exit.ip, p.exit.loc)
+                        else if (storedCc.isNotEmpty()) "${Country.label(storedCc)} (محفوظة)"
+                        else epHost
                     // بلا تحميل في الفحص الفردي أيضاً — الزمن والفقد يكفيان للترتيب
                     setResult(
                         id,
-                        "✓ ${st?.median ?: p.lat}ms ±${st?.jitter ?: 0} • فقد ${st?.loss ?: 0}% • MTU ${p.mtu} • ${Country.ipLine(p.exit?.ip ?: "", p.exit?.loc ?: "")}"
+                        "✓ ${st?.median ?: p.lat}ms ±${st?.jitter ?: 0} • فقد ${st?.loss ?: 0}% • MTU ${p.mtu}\n$locLine"
                     )
                 }
                 downSafe()

@@ -6,6 +6,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class Store(ctx: Context) {
+    private val appCtx = ctx.applicationContext
     private val sp = ctx.getSharedPreferences("wgauto", Context.MODE_PRIVATE)
 
     val configs = MutableStateFlow(loadConfigs())
@@ -128,5 +129,49 @@ class Store(ctx: Context) {
     fun prefGet(key: String): String? = sp.getString(key, null)
     fun prefPut(key: String, value: String?) {
         sp.edit().putString(key, value).apply()
+    }
+
+    // ---------- سجل الفحص (ملف، يُحذف تلقائياً ما تجاوز 24 ساعة) ----------
+    private fun scanLogFile() = java.io.File(appCtx.filesDir, "scanlog.txt")
+
+    @Synchronized
+    fun appendScanLog(epoch: Long, line: String) {
+        try {
+            val f = scanLogFile()
+            f.appendText("$epoch|$line\n")
+            // سقف الحجم: عند التجاوز نُبقي الأحدث فقط
+            if (f.length() > 120_000) {
+                val lines = f.readLines().takeLast(400)
+                f.writeText(lines.joinToString("\n") + "\n")
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    /** يحمّل السجل بعد حذف ما تجاوز عمره 24 ساعة. */
+    fun loadScanLogs(): List<String> {
+        return try {
+            val f = scanLogFile()
+            if (!f.exists()) return emptyList()
+            val cutoff = System.currentTimeMillis() - 24L * 3600 * 1000
+            val kept = ArrayList<String>()
+            val display = ArrayList<String>()
+            for (raw in f.readLines()) {
+                val i = raw.indexOf('|')
+                if (i <= 0) continue
+                val ep = raw.substring(0, i).toLongOrNull() ?: continue
+                if (ep < cutoff) continue
+                kept += raw
+                display += raw.substring(i + 1)
+            }
+            // إعادة كتابة الملف منظفاً (حذف القديم فعلياً)
+            try {
+                f.writeText(if (kept.isEmpty()) "" else kept.takeLast(500).joinToString("\n") + "\n")
+            } catch (e: Exception) {
+            }
+            display.takeLast(300)
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 }

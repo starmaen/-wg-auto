@@ -182,56 +182,94 @@ object WarpGenerator {
             put("locale", "en_US")
         }.toString()
 
-        val regUrl = URL(REG_URL)
-        val conn = ((network?.openConnection(regUrl) ?: regUrl.openConnection()) as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 8000
-            readTimeout = 8000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json")
-            setRequestProperty("User-Agent", "okhttp/3.12.1")
-            setRequestProperty("CF-Client-Version", CLIENT_VERSION)
-        }
-        conn.outputStream.use { it.write(body.toByteArray()) }
+        val regPath = "/v0a2158/reg"
+        val headers = mapOf(
+            "User-Agent" to "okhttp/3.12.1",
+            "CF-Client-Version" to CLIENT_VERSION
+        )
+        // المسار 1: المباشر عبر DNS النظام (سريع إن كان سليماً)
+        var code = -1
+        var raw: String? = null
+        try {
+            val regUrl = URL(REG_URL)
+            val conn = ((network?.openConnection(regUrl) ?: regUrl.openConnection()) as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 8000
+                readTimeout = 8000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                for ((k, v) in headers) setRequestProperty(k, v)
+            }
+            conn.outputStream.use { it.write(body.toByteArray()) }
 
-        val code = conn.responseCode
-        val raw = (if (code in 200..299) conn.inputStream else conn.errorStream)
-            ?.bufferedReader()?.use { it.readText() } ?: ""
-        conn.disconnect()
+            code = conn.responseCode
+            raw = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() } ?: ""
+            conn.disconnect()
+        } catch (e: java.net.UnknownHostException) {
+            // DNS النظام لا يحلّ api.cloudflareclient.com (حجب/عطل) — ننتقل للمسار 2
+            raw = null
+        }
+        // المسار 2 الاحترافي: حلّ عبر DNS عام (1.1.1.1 ثم 8.8.8.8) + TLS مع SNI صريح،
+        // مربوطاً بنفس الشبكة (النفق النشط إن وُجد) — يعمل داخل النفق وبدونه.
+        if (raw == null) {
+            var done: Pair<Int, String>? = null
+            var lastNote = ""
+            for (dnsIp in listOf("1.1.1.1", "8.8.8.8")) {
+                val ip = Probes.queryAVia(dnsIp, "api.cloudflareclient.com", network)
+                if (ip == null) {
+                    lastNote = "DNS العام $dnsIp لا يرد"
+                    continue
+                }
+                done = Probes.httpsPostTls(
+                    ip, "api.cloudflareclient.com", 443, regPath, body, headers, network
+                )
+                if (done != null) break
+                lastNote = "تعذّر TLS عبر $dnsIp"
+            }
+            if (done == null) {
+                throw IllegalStateException(
+                    "تعذّر الوصول لخادم WARP (DNS النظام محجوب: $lastNote) — بدّل الشبكة بين الجوال والواي فاي وحاول مجدداً"
+                )
+            }
+            code = done.first
+            raw = done.second
+        }
+        val rawText = raw ?: ""
 
         if (code !in 200..299) {
-            throw IllegalStateException("رفض الخادم التسجيل (HTTP $code): ${raw.take(300)}")
+            throw IllegalStateException("رفض الخادم التسجيل (HTTP $code): ${rawText.take(300)}")
         }
 
         val json = try {
-            JSONObject(raw)
+            JSONObject(rawText)
         } catch (e: Exception) {
-            throw IllegalStateException("رد غير متوقع من خادم WARP: ${raw.take(300)}")
+            throw IllegalStateException("رد غير متوقع من خادم WARP: ${rawText.take(300)}")
         }
 
         val result = json.optJSONObject("result") ?: json   // بعض الإصدارات تُرجع الحقول مباشرة بلا غلاف result
         val config = result.optJSONObject("config")
-            ?: throw IllegalStateException("لا يحوي الرد بيانات كونفيج: ${raw.take(300)}")
+            ?: throw IllegalStateException("لا يحوي الرد بيانات كونفيج: ${rawText.take(300)}")
 
         val iface = config.optJSONObject("interface")
         val addr4 = iface?.optJSONObject("addresses")?.optString("v4")
         val addr6 = iface?.optJSONObject("addresses")?.optString("v6")
         val peers = config.optJSONArray("peers")
         val peer = peers?.optJSONObject(0)
-            ?: throw IllegalStateException("لا يحوي الرد عنوان خادم WARP: ${raw.take(300)}")
+            ?: throw IllegalStateException("لا يحوي الرد عنوان خادم WARP: ${rawText.take(300)}")
         val peerPub = peer.optString("public_key")
         val endpointHost = peer.optJSONObject("endpoint")?.optString("host")
             ?: peer.optString("endpoint")
 
         if (peerPub.isEmpty() || endpointHost.isEmpty()) {
-            throw IllegalStateException("بيانات الخادم ناقصة في الرد: ${raw.take(300)}")
+            throw IllegalStateException("بيانات الخادم ناقصة في الرد: ${rawText.take(300)}")
         }
 
         val addresses = listOfNotNull(
             addr4?.takeIf { it.isNotEmpty() }?.let { "$it/32" },
             addr6?.takeIf { it.isNotEmpty() }?.let { "$it/128" }
         )
-        if (addresses.isEmpty()) throw IllegalStateException("لا يحوي الرد عنوان الواجهة: ${raw.take(300)}")
+        if (addresses.isEmpty()) throw IllegalStateException("لا يحوي الرد عنوان الواجهة: ${rawText.take(300)}")
 
         // بلا أسطر DNS أو MTU: التطبيق يديرهما تلقائياً بعد الإضافة، فتركهما هنا يسبّب تعارضاً
         val conf = buildString {

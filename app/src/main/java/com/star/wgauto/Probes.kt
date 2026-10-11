@@ -121,7 +121,8 @@ object Probes {
     }
 
     // ---------- DNS المشفّر: DoT وDoH ----------
-    private fun tls(ip: String, host: String, port: Int, network: Network?, timeoutMs: Int): SSLSocket? = try {
+    /** مصافحة TLS مربوطة بشبكة مع SNI صريح — تُستخدم أيضاً لتجاوز DNS النظام المحجوب. */
+    fun tls(ip: String, host: String, port: Int, network: Network?, timeoutMs: Int): SSLSocket? = try {
         val raw = Socket()
         network?.bindSocket(raw)
         raw.connect(InetSocketAddress(ip, port), timeoutMs)
@@ -222,6 +223,156 @@ object Probes {
         val dot = if (useEnc) dnsDot(d.primary, d.dot, network) else null
         val doh = if (useEnc) dnsDoh(d.primary, d.dot, network) else null
         return DnsMeasure(udp, dot, doh)
+    }
+
+    /**
+     * حلّ اسم مضيف عبر خادم DNS عام محدد مباشرة (يتجاوز DNS النظام المحجوب أو البطيء).
+     * يُستخدم لتسجيل WARP حين يفشل `api.cloudflareclient.com` في الحل عبر النظام.
+     * يعيد أول سجل A أو null.
+     */
+    fun queryAVia(serverIp: String, name: String, network: Network?, timeoutMs: Int = 3000): InetAddress? {
+        return try {
+            val q = buildQuery(name)
+            DatagramSocket().use { s ->
+                network?.bindSocket(s)
+                s.soTimeout = timeoutMs
+                val addr = InetAddress.getByName(serverIp)
+                s.send(DatagramPacket(q, q.size, addr, 53))
+                val buf = ByteArray(1500)
+                val pkt = DatagramPacket(buf, buf.size)
+                s.receive(pkt)
+                val resp = buf.copyOf(pkt.length)
+                if (!sameId(resp, q)) return null
+                parseFirstA(resp, q.size)
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun parseFirstA(resp: ByteArray, qLen: Int): InetAddress? {
+        try {
+            if (resp.size < 12) return null
+            val anCount = ((resp[6].toInt() and 0xff) shl 8) or (resp[7].toInt() and 0xff)
+            if (anCount == 0) return null
+            var off = qLen
+            repeat(anCount) {
+                if (off + 10 > resp.size) return null
+                off = if (resp[off].toInt() and 0xC0 == 0xC0) {
+                    off + 2
+                } else {
+                    var o = off
+                    while (o < resp.size && resp[o] != 0.toByte()) {
+                        val l = resp[o].toInt() and 0xff
+                        if (l == 0 || l > 63) return null
+                        o += 1 + l
+                        if (o >= resp.size) return null
+                    }
+                    o + 1
+                }
+                if (off + 10 > resp.size) return null
+                val type = ((resp[off].toInt() and 0xff) shl 8) or (resp[off + 1].toInt() and 0xff)
+                val rdLen = ((resp[off + 8].toInt() and 0xff) shl 8) or (resp[off + 9].toInt() and 0xff)
+                off += 10
+                if (off + rdLen > resp.size) return null
+                if (type == 1 && rdLen == 4) return InetAddress.getByAddress(resp.copyOfRange(off, off + 4))
+                off += rdLen
+            }
+        } catch (e: Exception) {
+        }
+        return null
+    }
+
+    /**
+     * طلب POST JSON عبر TLS مربوط بشبكة معينة مع SNI صريح —
+     * يعمل حتى لو كان DNS النظام محجوباً (بعد حلّ العنوان عبر queryAVia).
+     * يعيد (رمز الحالة، نص الرد) أو null.
+     */
+    fun httpsPostTls(
+        ip: InetAddress, sniHost: String, port: Int, path: String, json: String,
+        extraHeaders: Map<String, String>, network: Network?, timeoutMs: Int = 10000
+    ): Pair<Int, String>? {
+        val s = try {
+            tls(ip.hostAddress ?: return null, sniHost, port, network, timeoutMs) ?: return null
+        } catch (e: Exception) {
+            return null
+        }
+        return try {
+            s.soTimeout = timeoutMs
+            val out = s.outputStream
+            val body = json.toByteArray(Charsets.UTF_8)
+            val sb = StringBuilder()
+            sb.append("POST ").append(path).append(" HTTP/1.1\r\n")
+            sb.append("Host: ").append(sniHost).append("\r\n")
+            sb.append("Content-Type: application/json\r\n")
+            sb.append("Content-Length: ").append(body.size).append("\r\n")
+            sb.append("Connection: close\r\n")
+            for ((k, v) in extraHeaders) sb.append(k).append(": ").append(v).append("\r\n")
+            sb.append("\r\n")
+            out.write(sb.toString().toByteArray(Charsets.UTF_8))
+            out.write(body)
+            out.flush()
+            val ins = BufferedInputStream(s.inputStream)
+            val statusLine = readLineRaw(ins) ?: return null
+            val code = statusLine.split(" ").getOrNull(1)?.toIntOrNull() ?: return null
+            val headers = HashMap<String, String>()
+            while (true) {
+                val l = readLineRaw(ins) ?: break
+                if (l.isEmpty()) break
+                val i = l.indexOf(':')
+                if (i > 0) headers[l.substring(0, i).trim().lowercase()] = l.substring(i + 1).trim()
+            }
+            val len = headers["content-length"]?.toIntOrNull()
+            val raw = if (len != null && len in 1..500000) {
+                val b = ByteArray(len)
+                var got = 0
+                while (got < len) {
+                    val n = ins.read(b, got, len - got)
+                    if (n < 0) break
+                    got += n
+                }
+                String(b, 0, got, Charsets.UTF_8)
+            } else {
+                val bos = ByteArrayOutputStream()
+                val buf = ByteArray(8192)
+                var total = 0
+                try {
+                    s.soTimeout = 3000
+                    while (total < 300000) {
+                        val n = ins.read(buf)
+                        if (n < 0) break
+                        bos.write(buf, 0, n)
+                        total += n
+                    }
+                } catch (e: Exception) {
+                }
+                bos.toString("UTF-8")
+            }
+            code to raw
+        } catch (e: Exception) {
+            null
+        } finally {
+            try {
+                s.close()
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun readLineRaw(ins: BufferedInputStream): String? {
+        val sb = StringBuilder()
+        while (true) {
+            val c = try {
+                ins.read()
+            } catch (e: Exception) {
+                return if (sb.isEmpty()) null else sb.toString()
+            }
+            if (c < 0) return if (sb.isEmpty()) null else sb.toString()
+            if (c == '\n'.code) break
+            if (c != '\r'.code) sb.append(c.toChar())
+            if (sb.length > 8192) break
+        }
+        return sb.toString()
     }
 
     /** أداء محلّل DNS الحالي في النظام (خط الأساس للمقارنة العادلة قبل أي تغيير). */
