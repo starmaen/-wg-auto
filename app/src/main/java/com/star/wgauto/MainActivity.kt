@@ -544,6 +544,7 @@ fun HomeTab(app: WgApp, a: Actions) {
     val logs by app.engine.logs.collectAsState()
     val ni by app.engine.netInfo.collectAsState()
     val rep by app.engine.report.collectAsState()
+    val cfgs by app.store.configs.collectAsState()
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -612,6 +613,18 @@ fun HomeTab(app: WgApp, a: Actions) {
             }
         }
         if (rep.rows.isNotEmpty() || rep.progress.isNotEmpty()) ResultsCard(rep, st)
+        // زر الفحص الشامل دائم الظهور — حتى بدون تشغيل: يفحص الجميع ويعرض العامل فقط
+        if (!st.running && !st.busy) {
+            val n = cfgs.count { it.enabled }
+            OutlinedButton(
+                onClick = { a.testAll() },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("🔍 فحص شامل للجميع ($n) — بدون اتصال") }
+            Text(
+                "يفحص كل الكونفيجات المفعّلة واحداً واحداً ويعرض بجانب كل واحد: العلم والدولة وIP والزمن — ثم تختار أو تشغّل.",
+                fontSize = 12.sp
+            )
+        }
         if (st.running && !st.busy) {
             var showFullScanConfirm by remember { mutableStateOf(false) }
             OutlinedButton(

@@ -629,7 +629,8 @@ class Engine(ctx: Context, private val store: Store) {
         val direct = if (st.directIp.isNotEmpty()) ExitInfo(st.directIp, st.directLoc, 0) else null
         val dnsAll = store.dns.value.filter { it.enabled && !it.filtered }
 
-        val ver = connectAndVerify(promising, 1420, savedDns?.ips() ?: emptyList(), direct)
+        // بلا فرض MTU: الكونفيج كما هو أولاً، والسلّم يقرر — لا رقم ثابت
+        val ver = connectAndVerify(promising, null, savedDns?.ips() ?: emptyList(), direct)
         if (ver != null && ver.lat < currentLat) {
             val (dns, dnsRows) = pickDns(dnsAll, ver.vpn.network)
             markConnected(promising, dns, dnsRows, ver, null, networkLabel(), direct, emptyList())
@@ -1140,11 +1141,13 @@ class Engine(ctx: Context, private val store: Store) {
      * يرفع النفق الكامل ويتحقق من كل الطبقات.
      * الترتيب (لا نفرض MTU): القيمة المجرّبة الناجحة أولاً (من الفحص السريع)،
      * ثم الكونفيج كما هو تماماً (مثل التطبيق الرسمي)، ثم قيم عامة.
-     * قاعدة التثبيت العادلة: من يمرّر TCP يُثبَّت — فشل HTTPS وحده تحذير
-     * (قد يكون منفذ 443 محجوباً) وليس سبب رفض. الرفض فقط عند انعدام TCP
-     * (كونفيج منتهٍ أو مقطوع فعلاً).
+     * strict=true (للتمريرة الأولى): يشترط تحققاً كاملاً (TCP+HTTPS+تغيّر IP) —
+     * من لا يحققه يُتجاوز للتالي بدل تثبيته. strict=false: من يمرّر TCP يُثبَّت
+     * (ولو بتحذير) — الرفض فقط عند انعدام TCP (منتهٍ/مقطوع فعلاً).
      */
-    private suspend fun connectAndVerify(cfg: WgConfig, mtu: Int?, dns: List<String>, direct: ExitInfo?): Verified? {
+    private suspend fun connectAndVerify(
+        cfg: WgConfig, mtu: Int?, dns: List<String>, direct: ExitInfo?, strict: Boolean = false
+    ): Verified? {
         // 1000 إضافية: شبكات الجوال (خصوصاً مع NAT64/464XLAT عند بعض المشغّلين) غالباً ما
         // تحتاج MTU أقل من المعتاد على الواي فاي. الدرجات مضغوطة عمداً (بلا 1120 الهامشية)
         // حتى لا يتجمد التثبيت: المجرّب أولاً، ثم الأصلي، ثم 1280، ثم 1000.
@@ -1172,8 +1175,13 @@ class Engine(ctx: Context, private val store: Store) {
                 val exit = Probes.exitInfo(v.network, fast = true)
                 val effMtu = m ?: ConfigText.configuredMtu(cfg.text) ?: 1280
                 if (exit == null) {
-                    // النفق يحمل TCP لكن HTTPS لا يمر — يُثبَّت أساسياً ولا يُستبعد:
-                    // الجاني غالباً حجب 443 أو خلل قياس، لا الكونفيج نفسه.
+                    // النفق يحمل TCP لكن HTTPS لا يمر.
+                    if (strict) {
+                        // التمريرة الصارمة: يُتجاوز للتالي بحثاً عن مكتمل مضمون
+                        log("○ MTU $label: TCP يمر لكن HTTPS لا يمر — يُتجاوز لمكتمل أفضل")
+                        break
+                    }
+                    // المتساهلة: يُثبَّت أساسياً ولا يُستبعد — الجاني غالباً حجب 443 لا الكونفيج
                     log("⚠ MTU $label: TCP يمر لكن HTTPS لا يمر — تثبيت أساسي (تحقق يدوياً من التصفح)")
                     val dnsStat0 = Probes.systemResolveStat(v.network, 1)
                     val diag0 = "TCP ✔ ${lat}ms • HTTPS ⚠ (لا يمر، قد يكون 443 محجوباً) • DNS " +
@@ -1496,27 +1504,42 @@ class Engine(ctx: Context, private val store: Store) {
             "${Exam.rankMedal(i)} ${r.cfg.name} (${"%.1f".format(100 * (1 / r.score - 1))})"
         }.joinToString(" • "))
 
-        // ---- التثبيت: نفق واحد لكل التطبيقات — الأول المُثبَّت يفوز، والبقية احتياط.
+        // ---- التثبيت بتمريرتين — الاختيار للمضمون لا للأول في القائمة:
+        // التمريرة 1: أول مكتمل التحقق فعلاً (TCP+HTTPS+تغيّر IP).
+        // التمريرة 2 (احتياط فقط): أول أساسي (TCP وحده) بتثبيت تحذيري.
         // مرشح واحد عاطل لا يوقف القائمة: يُسجَّل ويُجرَّب التالي.
         // مهلة 75 ثانية لكل مرشح كحد أقصى حتى لا يتجمد التثبيت أبداً.
-        for (r in ordered) {
-            currentCoroutineContext().ensureActive()
-            try {
-            setProgress("تثبيت الاتصال: ${r.cfg.name}")
-            val ver = withTimeoutOrNull(75_000) {
-                connectAndVerify(r.cfg, r.mtu, r.dns?.ips() ?: emptyList(), direct)
+        var installed = false
+        for (pass in listOf(true, false)) {
+            if (installed) break
+            if (pass) setProgress("تثبيت: البحث عن مكتمل التحقق…")
+            else {
+                setProgress("لا مكتمل — تثبيت أفضل أساسي…")
+                log("لا يوجد مكتمل التحقق — التمريرة الاحتياطية (TCP يكفي)")
             }
-            if (ver == null) {
-                log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name} — التالي في الترتيب")
-                continue
-            }
-            markConnected(r.cfg, r.dns, r.dnsRows, ver, null, label, direct, r.mtuRows)
-            log("★ الأفضل: ${r.cfg.name} • ${ver.diag} • DNS ${r.dns?.name ?: "حسب الكونفيج"} • IP ${ver.exit?.ip ?: "؟"}")
-            // التكميل في الخلفية للفائز فقط: DNS + خروج مؤكد + سرعة — بلا مصافحات جديدة
-            postConnectRefine(dnsAll)
-            return
-            } catch (e: Exception) {
-                log("✗ خطأ تثبيت ${r.cfg.name} (${e.message?.take(60)}) — التالي في الترتيب")
+            for (r in ordered) {
+                currentCoroutineContext().ensureActive()
+                try {
+                setProgress("تثبيت الاتصال: ${r.cfg.name}" + if (pass) "" else " (احتياط)")
+                val ver = withTimeoutOrNull(75_000) {
+                    connectAndVerify(r.cfg, r.mtu, r.dns?.ips() ?: emptyList(), direct, strict = pass)
+                }
+                if (ver == null) {
+                    log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name} — التالي في الترتيب")
+                    continue
+                }
+                markConnected(r.cfg, r.dns, r.dnsRows, ver, null, label, direct, r.mtuRows)
+                log(
+                    (if (pass) "★ الأفضل (مكتمل مضمون): " else "★ الأفضل (أساسي احتياط): ") +
+                        "${r.cfg.name} • ${ver.diag} • DNS ${r.dns?.name ?: "حسب الكونفيج"} • IP ${ver.exit?.ip ?: "؟"}"
+                )
+                // التكميل في الخلفية للفائز فقط: DNS + خروج مؤكد + سرعة — بلا مصافحات جديدة
+                postConnectRefine(dnsAll)
+                installed = true
+                return
+                } catch (e: Exception) {
+                    log("✗ خطأ تثبيت ${r.cfg.name} (${e.message?.take(60)}) — التالي في الترتيب")
+                }
             }
         }
         downSafe()
