@@ -286,28 +286,52 @@ class Engine(ctx: Context, private val store: Store) {
                     warpStatus.value = "جارٍ تجربة ${WarpGenerator.variants(r).size} عناوين WARP لاختيار خروج أجنبي…"
                     // كونفيج مؤقت للفحص (لا نحفظ كل البدائل، فقط الأفضل)
                     val tmpCfg = WgConfig(name = "tmp-warp-probe", text = r.configText)
+                    val endpoints = WarpGenerator.variants(r, max = 6)
                     var tried = 0
-                    for (ep in WarpGenerator.variants(r, max = 6)) {
-                        tried++
-                        warpStatus.value = "تجربة عنوان $tried/${WarpGenerator.variants(r).size}: $ep"
-                        val t = tmpCfg.copy(text = r.withEndpoint(ep))
-                        val p = probeTunnel(t, listOf(null, 1280, 1000), emptyList(), direct)
-                        if (p.vpn == null) {
-                            log("WARP $ep: ✗ ${p.note}")
-                            continue
+                    var foundForeign = false
+                    // جولتان: مفاتيح WARP الجديدة تحتاج 10-60 ثانية لتنتشر على كل نقاط
+                    // Cloudflare، فالفشل الفوري لا يعني موت العنوان — ننتظر ونعيد.
+                    for (round in 0..1) {
+                        if (round == 1) {
+                            if (bestProbe?.vpn != null && foundForeign) break
+                            if (bestProbe?.vpn != null) break // يعمل محلياً — لا داعي لجولة ثانية
+                            warpStatus.value = "انتظار انتشار مفتاح WARP في شبكة Cloudflare (20 ثانية)…"
+                            log("WARP: لا TCP في الجولة الأولى — انتظار انتشار المفتاح ثم إعادة")
+                            delay(20000)
                         }
-                        val cc = p.exit?.loc ?: ""
-                        val foreign = directCc.isEmpty() || cc.isEmpty() || !cc.equals(directCc, true)
-                        log("WARP $ep: ${p.lat}ms • ${Country.ipLine(p.exit?.ip ?: "", cc)}" + if (!foreign) " (محلي)" else " (أجنبي ★)")
-                        if (foreign) {
-                            bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
-                            break // وجدنا أجنبياً — لا نضيع وقتاً وبيانات أكثر
-                        }
-                        if (bestProbe == null && p.lat < (bestProbe?.lat ?: Int.MAX_VALUE)) {
-                            bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
-                        } else if (bestProbe != null && p.lat < bestProbe!!.lat &&
-                            (bestProbe!!.exit?.loc.equals(directCc, true) == p.exit?.loc.equals(directCc, true))) {
-                            bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
+                        for (ep in endpoints) {
+                            if (foundForeign) break
+                            tried++
+                            warpStatus.value = "تجربة WARP ($tried): $ep" +
+                                if (round == 1) " (إعادة بعد انتشار المفتاح)" else ""
+                            val t = tmpCfg.copy(text = r.withEndpoint(ep))
+                            val p = probeTunnel(t, listOf(null, 1280), emptyList(), direct)
+                            if (p.vpn == null) {
+                                log("WARP $ep: ✗ ${p.note}")
+                                continue
+                            }
+                            // TCP يمر لكن بلا خروج مؤكد: مقبول كاحتياط، ونواصل بحثاً عن خروج مؤكد
+                            if (p.exit == null) {
+                                if (bestProbe?.vpn == null) {
+                                    bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
+                                }
+                                log("WARP $ep: TCP ✔ ${p.lat}ms بلا خروج مؤكد — احتياط")
+                                continue
+                            }
+                            val cc = p.exit.loc
+                            val foreign = directCc.isEmpty() || cc.isEmpty() || !cc.equals(directCc, true)
+                            log("WARP $ep: ${p.lat}ms • ${Country.ipLine(p.exit.ip, cc)}" + if (!foreign) " (محلي)" else " (أجنبي ★)")
+                            if (foreign) {
+                                bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
+                                foundForeign = true
+                                break // وجدنا أجنبياً — لا نضيع وقتاً وبيانات أكثر
+                            }
+                            if (bestProbe?.vpn == null || bestProbe?.exit == null) {
+                                bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
+                            } else if (p.lat < bestProbe!!.lat &&
+                                (bestProbe!!.exit?.loc.equals(directCc, true) == p.exit.loc.equals(directCc, true))) {
+                                bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
+                            }
                         }
                     }
                     val err = addConfig(n, bestText)
@@ -333,7 +357,11 @@ class Engine(ctx: Context, private val store: Store) {
                     when {
                         p?.vpn == null -> {
                             setResult(cfg?.id ?: "", "✗ ${p?.note ?: "تعذّر الاتصال بعد التوليد"} — الكونفيج محفوظ، جرّب فحصه يدوياً لاحقاً")
-                            warpStatus.value = "⚠ أُضيف $n لكن تعذّر التحقق منه الآن (${p?.note ?: "الشبكة مشغولة"})"
+                            warpStatus.value = "⚠ أُضيف $n لكن تعذّر التحقق منه الآن (${p?.note ?: "الشبكة مشغولة"}) — فعّله يدوياً بعد دقائق (انتشار المفتاح)"
+                        }
+                        p.exit == null -> {
+                            setResult(cfg?.id ?: "", "○ TCP يمر عبر $bestNote (${p.lat}ms) بلا خروج مؤكد — محفوظ، فعّله يدوياً بعد دقائق")
+                            warpStatus.value = "○ أُضيف $n — النفق يمرّر TCP لكن بلا خروج مؤكد بعد (المفتاح ينتشر) — فعّله يدوياً بعد دقائق"
                         }
                         p.sameCountry -> {
                             setResult(cfg?.id ?: "", "⚠ ${Country.label(p.exit?.loc ?: "")} — نفس دولتك، لا يفيد للحجب لكنه محفوظ للسرعة")
@@ -1118,27 +1146,25 @@ class Engine(ctx: Context, private val store: Store) {
      */
     private suspend fun connectAndVerify(cfg: WgConfig, mtu: Int?, dns: List<String>, direct: ExitInfo?): Verified? {
         // 1000 إضافية: شبكات الجوال (خصوصاً مع NAT64/464XLAT عند بعض المشغّلين) غالباً ما
-        // تحتاج MTU أقل من المعتاد على الواي فاي.
+        // تحتاج MTU أقل من المعتاد على الواي فاي. الدرجات مضغوطة عمداً (بلا 1120 الهامشية)
+        // حتى لا يتجمد التثبيت: المجرّب أولاً، ثم الأصلي، ثم 1280، ثم 1000.
         // الزوج (mtu, useOwnDns): useOwnDns=true يعني DNS الكونفيج الأصلي كما هو.
         // المجرّب أولاً: إن جاء mtu جاهزاً من الفحص السريع فهو أثبت نجاحه قبل ثوانٍ.
         val rungs: List<Pair<Int?, Boolean>> =
             listOfNotNull(mtu?.let { it to false }) +
                 listOf(null to true) +
-                listOfNotNull(
-                    if (mtu != 1280) (1280 to false) else null,
-                    if (mtu != 1120) (1120 to false) else null,
-                    if (mtu != 1000) (1000 to false) else null
-                ).distinct() +
+                listOf(1280 to false, 1000 to false).filter { it.first != mtu }.distinct() +
                 listOf(null to false)
         for ((idx, rung) in rungs.withIndex()) {
             val (m, ownDns) = rung
             if (idx > 0) delay(700)
             val label = if (ownDns && m == null) "الأصلي للكونفيج" else (m?.toString() ?: "الافتراضي")
+            setProgress("تثبيت ${cfg.name} (MTU $label)…")
             var ips: List<String> = if (ownDns) emptyList() else dns
             for (round in 0..1) {
                 val v = bringUp(cfg, m, ips, appOnly = false) ?: break
                 delay(800)
-                val lat = Probes.quickAlive(v.network)
+                val lat = Probes.quickAlive(v.network, 3000)
                 if (lat == null) {
                     log("✗ MTU $label: لا يتصل TCP عبر النفق")
                     break
@@ -1149,7 +1175,7 @@ class Engine(ctx: Context, private val store: Store) {
                     // النفق يحمل TCP لكن HTTPS لا يمر — يُثبَّت أساسياً ولا يُستبعد:
                     // الجاني غالباً حجب 443 أو خلل قياس، لا الكونفيج نفسه.
                     log("⚠ MTU $label: TCP يمر لكن HTTPS لا يمر — تثبيت أساسي (تحقق يدوياً من التصفح)")
-                    val dnsStat0 = Probes.systemResolveStat(v.network, 2)
+                    val dnsStat0 = Probes.systemResolveStat(v.network, 1)
                     val diag0 = "TCP ✔ ${lat}ms • HTTPS ⚠ (لا يمر، قد يكون 443 محجوباً) • DNS " +
                         (dnsStat0?.let { "✔ ${it.median}ms" } ?: "✗") + " • MTU $label"
                     return Verified(v, null, lat, effMtu, ips, diag0)
@@ -1158,7 +1184,7 @@ class Engine(ctx: Context, private val store: Store) {
                     log("✗ الـ IP لم يتغيّر (${exit.ip}) — النفق لا يحمل الحركة")
                     return null
                 }
-                val dnsStat = Probes.systemResolveStat(v.network, 2)
+                val dnsStat = Probes.systemResolveStat(v.network, 1)
                 if (dnsStat == null && round == 0 && !ownDns) {
                     val alt = fallbackDns()
                     if (alt != ips) {
@@ -1167,8 +1193,8 @@ class Engine(ctx: Context, private val store: Store) {
                         continue
                     }
                 }
-                // متوسط 3 محاولات لنفس المرجع (1.1.1.1) لعرض عادل يُقارَن بزمن TCP بلا تحيّز أول اتصال
-                val httpsAvg = Probes.httpsLatencyAvg(v.network) ?: exit.ms
+                // متوسط محاولتين لنفس المرجع (1.1.1.1) لعرض عادل بلا تحيّز أول اتصال
+                val httpsAvg = Probes.httpsLatencyAvg(v.network, tries = 2) ?: exit.ms
                 val diag = "TCP ✔ ${lat}ms • HTTPS ✔ ${httpsAvg}ms • DNS " +
                     (dnsStat?.let { "✔ ${it.median}ms" } ?: "✗ (لا يحل الأسماء)") + " • MTU $label"
                 return Verified(v, exit.copy(ms = httpsAvg), lat, effMtu, ips, diag)
@@ -1401,7 +1427,7 @@ class Engine(ctx: Context, private val store: Store) {
         for ((i, c) in candidates.withIndex()) {
             currentCoroutineContext().ensureActive()
             // فاصل بين المرشحين: يمنع رشق السيرفر بمصافحات متتالية فيُحجب مؤقتاً
-            if (i > 0) delay(900)
+            if (i > 0) delay(600)
             setProgress("فحص سريع ${i + 1}/${candidates.size}: ${c.name}")
             updateRow(c.id) { it.copy(state = "testing") }
             try {
@@ -1472,19 +1498,23 @@ class Engine(ctx: Context, private val store: Store) {
 
         // ---- التثبيت: نفق واحد لكل التطبيقات — الأول المُثبَّت يفوز، والبقية احتياط.
         // مرشح واحد عاطل لا يوقف القائمة: يُسجَّل ويُجرَّب التالي.
+        // مهلة 75 ثانية لكل مرشح كحد أقصى حتى لا يتجمد التثبيت أبداً.
         for (r in ordered) {
             currentCoroutineContext().ensureActive()
             try {
             setProgress("تثبيت الاتصال: ${r.cfg.name}")
-            val ver = connectAndVerify(r.cfg, r.mtu, r.dns?.ips() ?: emptyList(), direct)
-            if (ver != null) {
-                markConnected(r.cfg, r.dns, r.dnsRows, ver, null, label, direct, r.mtuRows)
-                log("★ الأفضل: ${r.cfg.name} • ${ver.diag} • DNS ${r.dns?.name ?: "حسب الكونفيج"} • IP ${ver.exit?.ip ?: "؟"}")
-                // التكميل في الخلفية للفائز فقط: DNS + خروج مؤكد + سرعة — بلا مصافحات جديدة
-                postConnectRefine(dnsAll)
-                return
+            val ver = withTimeoutOrNull(75_000) {
+                connectAndVerify(r.cfg, r.mtu, r.dns?.ips() ?: emptyList(), direct)
             }
-            log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name} — التالي في الترتيب")
+            if (ver == null) {
+                log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name} — التالي في الترتيب")
+                continue
+            }
+            markConnected(r.cfg, r.dns, r.dnsRows, ver, null, label, direct, r.mtuRows)
+            log("★ الأفضل: ${r.cfg.name} • ${ver.diag} • DNS ${r.dns?.name ?: "حسب الكونفيج"} • IP ${ver.exit?.ip ?: "؟"}")
+            // التكميل في الخلفية للفائز فقط: DNS + خروج مؤكد + سرعة — بلا مصافحات جديدة
+            postConnectRefine(dnsAll)
+            return
             } catch (e: Exception) {
                 log("✗ خطأ تثبيت ${r.cfg.name} (${e.message?.take(60)}) — التالي في الترتيب")
             }
