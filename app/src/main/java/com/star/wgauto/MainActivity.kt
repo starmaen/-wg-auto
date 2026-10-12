@@ -989,11 +989,11 @@ fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit) {
         pinging = true
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             val res = VpnBook.servers.map { s ->
-                kotlinx.coroutines.async(kotlinx.coroutines.Dispatchers.IO) {
+                async(kotlinx.coroutines.Dispatchers.IO) {
                     s.host to Probes.pingOnce(s.host)
                 }
             }.map { it.await() }.toMap()
-            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
                 pings = res
                 pinging = false
             }
