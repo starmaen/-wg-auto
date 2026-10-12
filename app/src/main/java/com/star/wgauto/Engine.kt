@@ -196,7 +196,12 @@ class Engine(ctx: Context, private val store: Store) {
                 n = "$base ($i)"
                 i++
             }
-            list + WgConfig(name = n, text = clean)
+            // كونفيجات VPNBook تنتهي بعد 7 أيام — تُوسم تلقائياً عند الاستيراد
+            val exp = if (VpnBook.isVpnBook(clean, n)) {
+                log("📖 كونفيج VPNBook — صالح 7 أيام من الآن")
+                now() + VpnBook.EXPIRY_DAYS * 24L * 3600 * 1000
+            } else 0L
+            list + WgConfig(name = n, text = clean, expiresAt = exp)
         }
         return null
     }
@@ -1465,6 +1470,12 @@ class Engine(ctx: Context, private val store: Store) {
     private suspend fun selectAndConnect(reason: String, allowFast: Boolean) {
         val s = store.settings.value
         val allCfg = store.configs.value.filter { it.enabled }
+        // المنتهية (VPNBook بعد 7 أيام) خارج الاختيار التلقائي — ولّد بديلاً بدل إضاعة الفحص
+        val expired = allCfg.filter { VpnBook.expired(it.expiresAt, now()) }
+        if (expired.isNotEmpty()) {
+            log("⚠ ${expired.size} كونفيج منتهي الصلاحية مُستبعَد: ${expired.take(3).joinToString { it.name }}")
+        }
+        val freshCfg = allCfg.filter { !VpnBook.expired(it.expiresAt, now()) }
         if (allCfg.isEmpty()) {
             log("لا توجد كونفيجات مفعّلة")
             status.update { it.copy(connected = false, busy = false, message = "أضف كونفيجاً وفعّله") }

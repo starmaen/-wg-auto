@@ -764,6 +764,12 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             modifier = Modifier.fillMaxWidth()
         ) { Text("🇨🇭 خوادم Proton المجانية (خروج أجنبي)") }
         if (showProton) ProtonDialog(app, onClose = { showProton = false })
+        var showBook by remember { mutableStateOf(false) }
+        OutlinedButton(
+            onClick = { showBook = true },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("📖 VPNBook مجاني — أمريكا/ألمانيا/فرنسا (7 أيام)") }
+        if (showBook) VpnBookDialog(onClose = { showBook = false }, onImport = { a.importFiles() })
         var repairMsg by remember { mutableStateOf("") }
         OutlinedButton(
             onClick = {
@@ -812,6 +818,14 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                                 ep?.let { "🖥 ${it.first}:${it.second}" } ?: "—",
                                 fontSize = 12.sp, modifier = Modifier.weight(1f),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        // سطر الانتهاء (VPNBook): تحذير أحمر عند القرب
+                        VpnBook.expiryText(c.expiresAt)?.let { ex ->
+                            val urgent = VpnBook.expiringSoon(c.expiresAt) || VpnBook.expired(c.expiresAt)
+                            Text(
+                                ex, fontSize = 12.sp,
+                                color = if (urgent) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         // السطر 3: نتيجة الفحص فقط (بلا سلسلة كتابات)
@@ -955,6 +969,83 @@ fun ProtonDialog(app: WgApp, onClose: () -> Unit) {
                     }
                 }
                 Text("بعد التحميل من الموقع: عُد هنا واضغط استيراد واختر ملف .conf — سيظهر العلم تلقائياً.", fontSize = 12.sp)
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("إغلاق") } },
+        dismissButton = null
+    )
+}
+
+@Composable
+fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit) {
+    val ctx = LocalContext.current
+    var pings by remember { mutableStateOf<Map<String, Int?>>(emptyMap()) }
+    var pinging by remember { mutableStateOf(false) }
+
+    fun refresh() {
+        if (pinging) return
+        pinging = true
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            val res = VpnBook.servers.map { s ->
+                kotlinx.coroutines.async(kotlinx.coroutines.Dispatchers.IO) {
+                    s.host to Probes.pingOnce(s.host)
+                }
+            }.map { it.await() }.toMap()
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                pings = res
+                pinging = false
+            }
+        }
+    }
+    androidx.compose.runtime.LaunchedEffect(Unit) { refresh() }
+
+    val sorted = VpnBook.servers.sortedWith(
+        compareBy<VpnBook.Server> { pings[it.host] ?: Int.MAX_VALUE }.thenBy { it.country }
+    )
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("VPNBook مجاني — خروج أجنبي حقيقي") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "سيرفرات مجانية بلا حساب (أمريكا/كندا/بريطانيا/ألمانيا/فرنسا). " +
+                        "التوليد في موقعهم بخطوة تحقق واحدة، ثم تستورد الملف هنا — والصلاحية 7 أيام يتتبعها التطبيق وينبهك.",
+                    fontSize = 12.sp
+                )
+                Text("1) اختر سيرفراً سريعاً أدناه  2) افتح المولد واختر نفس السيرفر والمنفذ 443  3) حمّل .conf واستورده هنا", fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            try {
+                                ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(VpnBook.GEN_URL)))
+                            } catch (e: Exception) {
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("فتح المولد") }
+                    OutlinedButton(onClick = { onImport() }, modifier = Modifier.weight(1f)) { Text("استيراد .conf") }
+                }
+                OutlinedButton(
+                    onClick = { refresh() },
+                    enabled = !pinging,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text(if (pinging) "جارٍ قياس السرعة…" else "قياس سرعة السيرفرات") }
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(sorted, key = { it.host }) { s ->
+                        val rtt = pings[s.host]
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(8.dp)) {
+                                Text("${Country.label(s.country)} • ${s.label}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                Text(
+                                    s.host + " • " + if (pings.isEmpty() || (pinging && rtt == null)) "…"
+                                    else rtt?.let { "$it ms" } ?: "لا يرد ping",
+                                    fontSize = 12.sp
+                                )
+                                Text("المنفذ المقترح: 443 (ثم 123 ثم 80)", fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
             }
         },
         confirmButton = { TextButton(onClick = onClose) { Text("إغلاق") } },

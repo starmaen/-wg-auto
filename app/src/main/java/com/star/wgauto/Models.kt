@@ -10,7 +10,9 @@ data class WgConfig(
     /** آخر دولة IP خروج معروفة لهذا الكونفيج (رمز دولتين، من فحص فعلي سابق). */
     val lastCountry: String = "",
     /** null = لم يُختبر بعد؛ true = دولة مختلفة عن دولتك (مفيد لتخطي الحجب)؛ false = نفس دولتك. */
-    val lastCountryUseful: Boolean? = null
+    val lastCountryUseful: Boolean? = null,
+    /** تاريخ انتهاء الكونفيج (epoch ms) — لكونفيجات VPNBook ذات الـ 7 أيام. 0 = بلا انتهاء. */
+    val expiresAt: Long = 0L
 )
 
 data class DnsServer(

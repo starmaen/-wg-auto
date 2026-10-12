@@ -20,6 +20,7 @@ class Store(ctx: Context) {
         configs.value.forEach {
             val o = JSONObject().put("id", it.id).put("name", it.name)
                 .put("text", it.text).put("enabled", it.enabled).put("lastCountry", it.lastCountry)
+                .put("expiresAt", it.expiresAt)
             it.lastCountryUseful?.let { u -> o.put("lastCountryUseful", u) }
             a.put(o)
         }
@@ -35,7 +36,8 @@ class Store(ctx: Context) {
                 WgConfig(
                     o.getString("id"), o.getString("name"), o.getString("text"), o.optBoolean("enabled", true),
                     o.optString("lastCountry", ""),
-                    if (o.has("lastCountryUseful")) o.getBoolean("lastCountryUseful") else null
+                    if (o.has("lastCountryUseful")) o.getBoolean("lastCountryUseful") else null,
+                    o.optLong("expiresAt", 0L)
                 )
             }
         } catch (e: Exception) {
