@@ -1123,11 +1123,26 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                         .replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
                         .replace("\\\"", "\"").replace("\\\\", "\\")
                 }
-                // فك ترميز \uXXXX
-                if (text.contains("\\u") || text.contains("\\n")) {
+                // فك ترميز \uXXXX إن وجد (مفاتيح WireGuard عادة ASCII لكن احتياط)
+                if (text.contains("\\u")) {
                     try {
-                        text = org.json.JSONTokener("\"$text\"").nextString()
-                    } catch (_: Exception) { }
+                        val sb = StringBuilder()
+                        var i = 0
+                        while (i < text.length) {
+                            if (text[i] == '\\' && i + 5 < text.length && text[i + 1] == 'u') {
+                                val hex = text.substring(i + 2, i + 6)
+                                val code = hex.toIntOrNull(16)
+                                if (code != null) {
+                                    sb.append(code.toChar())
+                                    i += 6
+                                    continue
+                                }
+                            }
+                            sb.append(text[i])
+                            i++
+                        }
+                        text = sb.toString()
+                    } catch (_e: Exception) { }
                 }
                 if (!text.contains("[Interface]") || !text.contains("[Peer]")) {
                     msg = "لم أجد كونفيج في الصفحة بعد — انتظر ظهوره ثم اضغط التقاط مجدداً"
