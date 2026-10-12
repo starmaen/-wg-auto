@@ -77,27 +77,29 @@ class AutoService : Service() {
         )
     }
 
-    /** كل 15 ثانية فحص صحة خفيف، وكل دقيقة منطق إعادة المحاولة والفحص الدوري. */
+    /** كل 15 ثانية: حارس التجمد + فحص صحة خفيف، وكل دقيقة منطق إعادة المحاولة والفحص الدوري. */
     private suspend fun periodicLoop() {
         var tick = 0
         var minutes = 0
         while (true) {
             delay(15_000)
             tick++
+            app.engine.watchdog()
             val st = app.engine.status.value
             val s = app.store.settings.value
             if (st.running && st.connected && !st.busy) app.engine.healthCheck()
             if (tick % 4 != 0 || st.busy) continue
             if (st.running && !st.connected) {
+                // اليدوي: لا إعادة اتصال تلقائية إطلاقاً — المستخدم يشغّل ويفصل بيده
                 if (s.autoConfig) app.engine.autoReselect("إعادة محاولة")
-                else if (s.selConfigId.isNotEmpty()) app.engine.connectManual(s.selConfigId)
                 continue
             }
             minutes++
             if (s.periodMin > 0 && minutes >= s.periodMin) {
                 minutes = 0
-                if (st.running) app.engine.opportunisticCheck("فحص دوري")
-                else if (s.backgroundScan) app.engine.scanNetwork("فحص دوري")
+                // الدوري (نصف ساعة/ساعة): آلي فقط — يعيد الفحص ويبدّل للأفضل؛ اليدوي لا يُمس
+                if (st.running && s.autoConfig) app.engine.opportunisticCheck("فحص دوري")
+                else if (!st.running && s.backgroundScan) app.engine.scanNetwork("فحص دوري")
             }
         }
     }

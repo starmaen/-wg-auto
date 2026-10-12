@@ -110,6 +110,26 @@ class Engine(ctx: Context, private val store: Store) {
     @Volatile
     private var dnsChangeCooldownUntil = 0L
 
+    /** الوضع اليدوي: المستخدم وحده يشغّل ويفصل — ممنوع أي لمس تلقائي للنفق. */
+    private fun isManual() = !store.settings.value.autoConfig
+
+    /** عدّاد الفشل المتتالي + موعد إعادة المحاولة (backoff بدل الحجب الثابت). */
+    @Volatile
+    private var failCount = 0
+    @Volatile
+    private var nextRetryAt = 0L
+
+    /** بداية آخر عملية مشغولة — لكشف التجمد وإعادة الضبط. */
+    @Volatile
+    private var busySince = 0L
+
+    /** آخر فحص ناتج عن حدث شبكة — فاصل 10 ثوانٍ يمنع الحلقات دون قتل الاستجابة. */
+    @Volatile
+    private var lastNetScanAt = 0L
+
+    private fun retryDelayMs(): Long =
+        (30_000L shl failCount.coerceIn(0, 3)).coerceAtMost(240_000L)
+
     private fun now() = System.currentTimeMillis()
 
     init {
@@ -398,8 +418,13 @@ class Engine(ctx: Context, private val store: Store) {
     fun start() {
         scanJob?.cancel()
         healthFails = 0
+        failCount = 0
+        nextRetryAt = 0
+        cooldownUntil = 0
+        busySince = 0
         lastNetLabel = networkLabel()
-        status.value = Status(running = true, busy = true, message = "جارٍ الفحص…")
+        status.value = Status(running = true, busy = true, message = "جارٍ الفحص الشامل…")
+        log("▶ بدء التشغيل: فحص شامل لكل الكونفيجات المفعّلة")
         if (store.settings.value.killSwitch) {
             scope.launch {
                 if (RootTools.killSwitchEnable()) {
@@ -427,6 +452,9 @@ class Engine(ctx: Context, private val store: Store) {
             RootTools.killSwitchDisable()
             killSwitchApplied = false
         }
+        busySince = 0
+        failCount = 0
+        nextRetryAt = 0
         status.value = Status(running = false, message = "متوقف")
         report.update { it.copy(progress = "", chosenConfigId = "", chosenDnsId = "") }
         log("تم الإيقاف")
@@ -481,17 +509,44 @@ class Engine(ctx: Context, private val store: Store) {
                 try {
                     selectAndConnect(reason, allowFast)
                 } finally {
+                    val ok = status.value.connected
+                    if (ok) failCount = 0
                     status.update { it.copy(busy = false) }
-                    cooldownUntil = now() + if (status.value.connected) 20_000 else 60_000
+                    busySince = 0
+                    cooldownUntil = now() + if (ok) 20_000 else 30_000
+                    nextRetryAt = now() + if (ok) 20_000 else retryDelayMs().also { failCount++ }
                 }
             }
         }
     }
 
-    /** إعادة اختيار تلقائية (انقطاع/دورية): مسار سريع لآخر ناجح أولاً، ثم شامل. */
+    /**
+     * إعادة اختيار تلقائية (انقطاع/دورية) — تعمل فقط عند استحقاق الموعد
+     * (backoff: 30ث ثم 1د ثم 2د ثم 4د كحد أقصى)، لا بالحجب الثابت.
+     */
     fun autoReselect(reason: String) {
-        if (status.value.busy || now() < cooldownUntil) return
+        if (isManual()) return   // اليدوي: لا إعادة تلقائية إطلاقاً
+        if (status.value.busy || now() < nextRetryAt) return
         reselect(reason, allowFast = true)
+    }
+
+    /**
+     * حارس التجمد: إن بقيت عملية مشغولة أكثر من 4 دقائق (مستحيل في الظروف
+     * الطبيعية — كل الاستدعاءات محدودة المهلة)، تُلغى وتُصفَّر الحالة
+     * ليعود زر التشغيل مستجيباً دائماً.
+     */
+    fun watchdog() {
+        val st = status.value
+        if (!st.busy || busySince == 0L) return
+        if (now() - busySince < 240_000) return
+        log("⚠ تجمد الفحص أكثر من 4 دقائق — إعادة ضبط قسرية")
+        runJob?.cancel()
+        netJob?.cancel()
+        scanJob?.cancel()
+        busySince = 0
+        failCount++
+        nextRetryAt = now() + retryDelayMs()
+        status.update { it.copy(busy = false, message = "أُعيد الضبط بعد تجمد — اضغط تشغيل مجدداً") }
     }
 
     /**
@@ -508,6 +563,7 @@ class Engine(ctx: Context, private val store: Store) {
                     connectManualImpl(cfgId)
                 } finally {
                     status.update { it.copy(busy = false) }
+                    busySince = 0
                     cooldownUntil = now() + if (status.value.connected) 20_000 else 30_000
                 }
             }
@@ -532,6 +588,7 @@ class Engine(ctx: Context, private val store: Store) {
             }
         }
         status.update { it.copy(running = true, busy = true, connected = false, message = "جارٍ الاتصال بـ ${cfg.name}…") }
+        busySince = now()
         report.value = Report(rows = listOf(ConfigRow(cfg.id, cfg.name, state = "testing")))
         val under = NetUtil.underlying(NetUtil.all(cm))
         val direct = under?.let { Probes.exitInfo(it.network, fast = true) }
@@ -576,6 +633,7 @@ class Engine(ctx: Context, private val store: Store) {
      * تتم العودة فوراً للكونفيج السابق بدل إكمال فحص شامل لكل الكونفيجات.
      */
     fun opportunisticCheck(reason: String) {
+        if (isManual()) return   // اليدوي: ممنوع التبديل التلقائي لكونفيج آخر
         if (status.value.busy || now() < cooldownUntil) return
         val st = status.value
         if (!st.running) return
@@ -689,33 +747,45 @@ class Engine(ctx: Context, private val store: Store) {
         netJob?.cancel()
         netJob = scope.launch {
             delay(3000)   // تجميع التغييرات المتتابعة
-            if (status.value.busy || now() < cooldownUntil) return@launch
+            // فاصل 10 ثوانٍ بين فحوصات الشبكة (يمنع الحلقات) — بدل حجب التهدئة الطويل
+            if (status.value.busy || now() - lastNetScanAt < 10_000) return@launch
             val st = status.value
             if (!st.running) {
+                lastNetScanAt = now()
                 scanNetwork("تغيّر الشبكة")
                 return@launch
             }
             val label = networkLabel()
+            val manual = isManual()
             when {
-                !st.connected && s.autoConfig -> reselect("تغيّر الشبكة", allowFast = true)
-                !st.connected -> connectManual(s.selConfigId)
+                !st.connected && s.autoConfig -> {
+                    lastNetScanAt = now()
+                    reselect("تغيّر الشبكة", allowFast = true)
+                }
+                // يدوي غير متصل: إعلان فقط — التفعيل قرار المستخدم وحده
+                !st.connected -> {
+                    log("تغيّرت الشبكة ولا اتصال — الوضع يدوي: فعّل بنفسك عند الحاجة")
+                    status.update { it.copy(message = "غير متصل — فعّله يدوياً") }
+                }
                 label != lastNetLabel && label != "غير متصل" && s.autoConfig -> {
                     lastNetLabel = label
-                    log("تبدّلت الشبكة إلى $label")
+                    lastNetScanAt = now()
+                    // تبدّل الشبكة قد يحتاج MTU وDNS مختلفين — إعادة فحص كاملة فورية
+                    log("تبدّلت الشبكة إلى $label — إعادة فحص (MTU/DNS جديدان محتملان)")
                     reselect("تبدّل الشبكة إلى $label", allowFast = true)
                 }
                 label != lastNetLabel && label != "غير متصل" -> {
-                    // المسار اليدوي: لا هدم تلقائي — نتحقق أولاً، وإعادة البناء فقط للميت
+                    // المسار اليدوي: لا هدم تلقائي إطلاقاً — فحص ثم إعلان فقط
                     lastNetLabel = label
-                    log("تبدّلت الشبكة إلى $label — التحقق من النفق اليدوي أولاً (بلا هدم)")
+                    log("تبدّلت الشبكة إلى $label — التحقق من النفق اليدوي (بلا هدم)")
                     mutex.withLock {
                         val lat = aliveNow()
                         if (lat != null) {
                             status.update { it.copy(latencyMs = lat, lastScanAt = now()) }
                             log("النفق اليدوي سليم بعد تبدّل الشبكة (${lat}ms) — بقي دون إعادة بناء")
                         } else {
-                            log("النفق اليدوي ميت بعد تبدّل الشبكة — إعادة الاتصال بالكونفيج المحدَّد يدوياً")
-                            connectManual(s.selConfigId)
+                            log("النفق اليدوي لا يمرر بيانات بعد تبدّل الشبكة — بانتظار تفعيلك اليدوي")
+                            status.update { it.copy(connected = false, message = "تبدّلت الشبكة والنفق لا يمرر — أعد التفعيل يدوياً") }
                         }
                     }
                 }
@@ -725,10 +795,12 @@ class Engine(ctx: Context, private val store: Store) {
                     if (lat != null) {
                         status.update { it.copy(latencyMs = lat, lastScanAt = now()) }
                         log("النفق سليم بعد تغيّر الشبكة (${lat}ms)")
-                    } else if (s.autoConfig) {
-                        recover("تغيّر الشبكة")
+                    } else if (manual) {
+                        log("تغيّر IP والنفق اليدوي لا يمرر — بانتظار تفعيلك اليدوي")
+                        status.update { it.copy(connected = false, message = "تغيّر IP والنفق متوقف — أعد التفعيل يدوياً") }
                     } else {
-                        connectManual(s.selConfigId)
+                        lastNetScanAt = now()
+                        recover("تغيّر الشبكة")
                     }
                 }
             }
@@ -749,6 +821,7 @@ class Engine(ctx: Context, private val store: Store) {
         val st = status.value
         if (!st.running || st.busy || !st.connected) return
         if (now() < cooldownUntil) return
+        val manual = isManual()
         scope.launch {
             mutex.withLock {
                 val s2 = status.value
@@ -757,7 +830,12 @@ class Engine(ctx: Context, private val store: Store) {
                 val v = vpnInfo()
                 if (v == null || !tunnelIsUp()) {
                     log("⚠ لا توجد واجهة VPN فعلية رغم الحالة «متصل»")
-                    recover("النفق غير موجود")
+                    if (manual) {
+                        // يدوي: إعلان فقط — إعادة التفعيل بقرار المستخدم وحده
+                        status.update { it.copy(connected = false, message = "انقطع النفق — أعد التفعيل يدوياً") }
+                    } else {
+                        recover("النفق غير موجود")
+                    }
                     return@withLock
                 }
                 val lat = Probes.quickAlive(v.network)
@@ -766,19 +844,28 @@ class Engine(ctx: Context, private val store: Store) {
                     status.update { it.copy(latencyMs = lat, lastScanAt = now()) }
                 } else {
                     healthFails++
-                    log("⚠ لا تمر بيانات عبر النفق ($healthFails/3)")
+                    log("⚠ لا تمر بيانات عبر النفق ($healthFails/6)")
                     // عتبة أعلى من قبل: فحص واحد فاشل بين كل 15 ثانية أمر طبيعي حتى على شبكة
                     // سليمة، وإعادة بناء النفق لمجرد ذلك تسبّب انقطاعات وهمية أثناء عمل فعلي.
                     if (healthFails >= 6) {
                         healthFails = 0
-                        recover("انقطاع الاتصال")
+                        if (manual) {
+                            status.update { it.copy(connected = false, message = "توقف مرور البيانات — أعد التفعيل يدوياً") }
+                            log("⚠ اليدوي لا يُعاد بناؤه تلقائياً — بانتظار المستخدم")
+                        } else {
+                            recover("انقطاع الاتصال")
+                        }
                     }
                 }
             }
         }
     }
 
-    /** يُستدعى داخل القفل: يعيد بناء نفس النفق مع التحقق، فإن فشل يجري اختياراً كاملاً. */
+    /**
+     * يُستدعى داخل القفل.
+     * آلي: يعيد بناء نفس النفق مع التحقق، فإن فشل يجري اختياراً كاملاً.
+     * يدوي: لا يلمس النفق إطلاقاً — يُعلن الانقطاع وينتظر المستخدم.
+     */
     private suspend fun recover(reason: String) {
         if (!tunnelIsUp() && NetUtil.all(cm).any { it.isVpn }) {
             log("⚠ VPN آخر استلم الاتصال — أوقف التطبيق نفقه")
@@ -788,6 +875,11 @@ class Engine(ctx: Context, private val store: Store) {
                 log("قاطع الطوارئ أُوقف تلقائياً (لم يعد التطبيق يتحكم بالنفق)")
             }
             status.value = Status(running = false, message = "أوقفه VPN آخر")
+            return
+        }
+        if (isManual()) {
+            log("⚠ ($reason) — الوضع يدوي: لا إعادة بناء تلقائية")
+            status.update { it.copy(connected = false, message = "انقطع ($reason) — أعد التفعيل يدوياً") }
             return
         }
         val st = status.value
@@ -1387,6 +1479,7 @@ class Engine(ctx: Context, private val store: Store) {
         val under = NetUtil.underlying(NetUtil.all(cm))
 
         status.update { it.copy(busy = true, connected = false, message = "جارٍ الفحص ($reason)…") }
+        busySince = now()
 
         // الـ IP المباشر (مرجع التحقق): عبر الشبكة الأصلية متجاوزاً أي نفق
         val direct = under?.let { Probes.exitInfo(it.network) }
@@ -1488,7 +1581,9 @@ class Engine(ctx: Context, private val store: Store) {
 
         if (alive.isEmpty()) {
             setProgress("لم ينجح أي كونفيج")
-            status.update { it.copy(connected = false, message = "لا يوجد كونفيج يحمل الحركة فعلاً — إعادة المحاولة بعد دقيقة") }
+            val m = if (isManual()) "لا يمر أي TCP — تحقق من الشبكة ثم أعد التفعيل يدوياً"
+                else "لا يوجد كونفيج يحمل الحركة فعلاً — إعادة محاولة تلقائية قادمة"
+            status.update { it.copy(connected = false, message = m) }
             log("لم ينجح أي كونفيج من ${candidates.size} (راجع سبب كل كونفيج في نتيجة الفحص)")
             return
         }
@@ -1544,7 +1639,9 @@ class Engine(ctx: Context, private val store: Store) {
         }
         downSafe()
         setProgress("تعذّر تثبيت الاتصال")
-        status.update { it.copy(connected = false, message = "تعذّر تثبيت الاتصال — إعادة المحاولة بعد دقيقة") }
+        val m2 = if (isManual()) "تعذّر التثبيت — بدّل الشبكة أو الكونفيج وحاول يدوياً"
+            else "تعذّر تثبيت الاتصال — إعادة محاولة تلقائية قادمة"
+        status.update { it.copy(connected = false, message = m2) }
     }
 
     /**

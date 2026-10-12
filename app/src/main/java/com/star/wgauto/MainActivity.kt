@@ -1125,7 +1125,7 @@ fun SettingsTab(app: WgApp, a: Actions) {
         }
         Text("يعمل عند فتح التطبيق وعند تبدّل الشبكة، ويعرض أفضل DNS وMTU للشبكة الحالية.", fontSize = 12.sp)
 
-        Text("إعادة الاختيار", fontWeight = FontWeight.Bold)
+        Text("إعادة الاختيار (الوضع التلقائي فقط — اليدوي يشغّل ويفصل بيدك دائماً)", fontWeight = FontWeight.Bold)
         SwitchRow("عند تبدّل الشبكة أو تغيّر IP", s.reselectOnNetwork) { v -> upd { it.copy(reselectOnNetwork = v) } }
         Picker(
             "إعادة الفحص الكاملة دورياً", if (s.periodMin == 0) "إيقاف" else "كل ${s.periodMin} دقيقة",
