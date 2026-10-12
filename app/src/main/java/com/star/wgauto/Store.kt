@@ -12,7 +12,6 @@ class Store(ctx: Context) {
     val configs = MutableStateFlow(loadConfigs())
     val dns = MutableStateFlow(loadDns())
     val settings = MutableStateFlow(loadSettings())
-    val ovpn = MutableStateFlow(loadOvpn())
 
     // ---------- configs ----------
     fun updateConfigs(f: (List<WgConfig>) -> List<WgConfig>) {
@@ -130,54 +129,6 @@ class Store(ctx: Context) {
     fun prefGet(key: String): String? = sp.getString(key, null)
     fun prefPut(key: String, value: String?) {
         sp.edit().putString(key, value).apply()
-    }
-
-    // ---------- ملفات OpenVPN (.ovpn) — خزنة إدارة ----------
-    fun updateOvpn(f: (List<OvpnProfile>) -> List<OvpnProfile>) {
-        var list = f(ovpn.value)
-        // أسماء فريدة تلقائياً
-        val seen = HashSet<String>()
-        list = list.map { p ->
-            var n = p.name
-            var i = 2
-            while (!seen.add(n)) {
-                n = "${p.name} ($i)"
-                i++
-            }
-            if (n != p.name) p.copy(name = n) else p
-        }
-        ovpn.value = list
-        val a = JSONArray()
-        list.forEach {
-            a.put(
-                JSONObject().put("id", it.id).put("name", it.name).put("text", it.text)
-                    .put("remoteHost", it.remoteHost).put("remotePort", it.remotePort)
-                    .put("proto", it.proto).put("cipher", it.cipher).put("auth", it.auth)
-                    .put("hasCa", it.hasCa).put("hasCert", it.hasCert).put("hasKey", it.hasKey)
-                    .put("needsAuth", it.needsAuth)
-            )
-        }
-        sp.edit().putString("ovpn", a.toString()).apply()
-    }
-
-    private fun loadOvpn(): List<OvpnProfile> {
-        val s = sp.getString("ovpn", null) ?: return emptyList()
-        return try {
-            val a = JSONArray(s)
-            (0 until a.length()).map {
-                val o = a.getJSONObject(it)
-                OvpnProfile(
-                    o.getString("id"), o.getString("name"), o.getString("text"),
-                    o.optString("remoteHost", ""), o.optInt("remotePort", 1194),
-                    o.optString("proto", "udp"), o.optString("cipher", ""),
-                    o.optString("auth", ""), o.optBoolean("hasCa", false),
-                    o.optBoolean("hasCert", false), o.optBoolean("hasKey", false),
-                    o.optBoolean("needsAuth", false)
-                )
-            }
-        } catch (e: Exception) {
-            emptyList()
-        }
     }
 
     // ---------- سجل الفحص (ملف، يُحذف تلقائياً ما تجاوز 24 ساعة) ----------
