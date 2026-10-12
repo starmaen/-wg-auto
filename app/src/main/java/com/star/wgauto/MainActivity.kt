@@ -87,6 +87,7 @@ import kotlinx.coroutines.launch
 class Actions(
     val toggle: () -> Unit,
     val importFiles: () -> Unit,
+    val importOvpn: () -> Unit,
     val batteryExempt: () -> Unit,
     val testAll: () -> Unit,
     val testOne: (String) -> Unit,
@@ -122,6 +123,37 @@ class MainActivity : ComponentActivity() {
                 toast("تم استيراد $ok كونفيج" + (if (fail > 0) " • تعذّر $fail" else "") + " — تُفحص عند تشغيل الـ VPN")
             }
         }
+    private val ovpnImportLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            var ok = 0
+            var fail = 0
+            var lastErr = ""
+            uris.forEach { uri ->
+                try {
+                    val name0 = displayName(uri)
+                    var clean = name0
+                    repeat(3) {
+                        clean = stripCi(stripCi(stripCi(clean, ".txt"), ".ovpn"), ".conf").trim()
+                    }
+                    val text = contentResolver.openInputStream(uri)!!.use {
+                        it.readBytes().toString(Charsets.UTF_8)
+                    }
+                    val (profile, err) = OvpnParser.parse(clean.ifEmpty { name0 }, text)
+                    if (profile != null) {
+                        app.store.updateOvpn { it + profile }
+                        ok++
+                    } else {
+                        fail++
+                        lastErr = err ?: ""
+                    }
+                } catch (e: Exception) {
+                    fail++
+                }
+            }
+            toast(
+                "استيراد OpenVPN: نجح $ok" + (if (fail > 0) " • تعذّر $fail${if (lastErr.isNotEmpty()) ": $lastErr" else ""}" else "")
+            )
+        }
 
     private val lightScheme = lightColorScheme(
         primary = Color(0xFF1565C0), onPrimary = Color.White,
@@ -140,6 +172,7 @@ class MainActivity : ComponentActivity() {
         val actions = Actions(
             toggle = { onToggle() },
             importFiles = { importLauncher.launch(arrayOf("*/*")) },
+            importOvpn = { ovpnImportLauncher.launch(arrayOf("*/*")) },
             batteryExempt = { batteryExempt() },
             testAll = { withVpnPermission { app.engine.testAll() } },
             testOne = { id -> withVpnPermission { app.engine.testConfigs(listOf(id)) } },
@@ -185,6 +218,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+    private fun stripCi(s: String, suf: String): String =
+        if (s.endsWith(suf, ignoreCase = true)) s.substring(0, s.length - suf.length) else s
 
     private fun withVpnPermission(action: () -> Unit) {
         val i = VpnService.prepare(this)
@@ -389,7 +425,7 @@ fun LicenseGate(app: WgApp, content: @Composable () -> Unit) {
 @Composable
 fun Root(app: WgApp, a: Actions) {
     var tab by remember { mutableIntStateOf(0) }
-    val titles = listOf("الرئيسية", "الكونفيجات", "DNS", "الإعدادات")
+    val titles = listOf("الرئيسية", "الكونفيجات", "DNS", "OpenVPN", "الإعدادات")
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().systemBarsPadding()) {
             TabRow(selectedTabIndex = tab) {
@@ -401,6 +437,7 @@ fun Root(app: WgApp, a: Actions) {
                 0 -> HomeTab(app, a)
                 1 -> ConfigsTab(app, a)
                 2 -> DnsTab(app)
+                3 -> OvpnTab(app, a)
                 else -> SettingsTab(app, a)
             }
         }
@@ -960,6 +997,98 @@ fun ProtonDialog(app: WgApp, onClose: () -> Unit) {
         confirmButton = { TextButton(onClick = onClose) { Text("إغلاق") } },
         dismissButton = null
     )
+}
+
+@Composable
+fun OvpnTab(app: WgApp, a: Actions) {
+    val list by app.store.ovpn.collectAsState()
+    val ctx = LocalContext.current
+    var msg by remember { mutableStateOf("") }
+
+    fun openExternal(profile: OvpnProfile) {
+        try {
+            val dir = java.io.File(ctx.cacheDir, "ovpn").apply { mkdirs() }
+            val safe = profile.name.replace(Regex("[^A-Za-z0-9_.-]+"), "_").take(60).ifEmpty { "profile" }
+            val f = java.io.File(dir, "$safe.ovpn")
+            f.writeText(profile.text)
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                ctx, ctx.packageName + ".fileprovider", f
+            )
+            // 1) محاولة التطبيقات المعروفة مباشرة
+            val targets = listOf("de.blinkt.openvpn", "net.openvpn.openvpn")
+            for (pkg in targets) {
+                try {
+                    val pm = ctx.packageManager
+                    pm.getPackageInfo(pkg, 0)
+                    val i = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(uri, "application/x-openvpn-profile")
+                        setPackage(pkg)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    ctx.startActivity(i)
+                    msg = "فُتح في ${if (pkg.contains("blinkt")) "OpenVPN for Android" else "OpenVPN Connect"} — أكمل الاتصال هناك"
+                    return
+                } catch (e: Exception) {
+                    // غير مثبّت — جرّب التالي
+                }
+            }
+            // 2) مشاركة عامة يختار منها المستخدم (يعمل مع أي عميل OpenVPN)
+            val share = Intent(Intent.ACTION_SEND).apply {
+                type = "*/*"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ctx.startActivity(Intent.createChooser(share, "فتح ملف OpenVPN في…"))
+            msg = "اختر تطبيق OpenVPN من القائمة — وإن لم يوجد ثبّت OpenVPN for Android مجاناً"
+        } catch (e: Exception) {
+            msg = "تعذّر الفتح الخارجي: ${e.message?.take(80)}"
+        }
+    }
+
+    Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "خزنة OpenVPN: استورد ملفات .ovpn وأدرها هنا، والاتصال بضغطة عبر تطبيق OpenVPN خارجي. " +
+                "بهذا يجمع تطبيقك WireGuard (مباشر) + OpenVPN (خارجي) في مكان واحد.",
+            fontSize = 12.sp
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Button(onClick = { a.importOvpn() }, modifier = Modifier.weight(1f)) { Text("استيراد .ovpn", maxLines = 1) }
+            OutlinedButton(
+                onClick = {
+                    try {
+                        ctx.startActivity(
+                            Intent(
+                                Intent.ACTION_VIEW,
+                                Uri.parse("https://play.google.com/store/apps/details?id=de.blinkt.openvpn")
+                            )
+                        )
+                    } catch (e: Exception) {
+                        msg = "تعذّر فتح المتجر"
+                    }
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("تثبيت عميل OpenVPN", maxLines = 1) }
+        }
+        if (msg.isNotEmpty()) Text(msg, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+        if (list.isEmpty()) Text("لا توجد ملفات بعد — استورد .ovpn من مزودك (مثل VPN Super إن صدّر ملفات).")
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(list, key = { it.id }) { p ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(p.name, fontWeight = FontWeight.Bold, maxLines = 1)
+                        Text(p.summary(), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { openExternal(p) }) { Text("▶ فتح واتصال خارجي") }
+                            TextButton(onClick = { app.store.updateOvpn { l -> l.filter { it.id != p.id } } }) {
+                                Text("حذف", color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 private fun statText(name: String, st: Stat?): String =
