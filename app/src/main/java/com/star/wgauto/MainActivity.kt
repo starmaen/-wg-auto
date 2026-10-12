@@ -9,7 +9,13 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings as AndroidSettings
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
+import androidx.compose.ui.viewinterop.AndroidView
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -47,6 +53,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.DropdownMenuItem
@@ -741,6 +748,18 @@ fun ConfigsTab(app: WgApp, a: Actions) {
     val results by app.engine.configResults.collectAsState()
     val st by app.engine.status.collectAsState()
     var showPaste by remember { mutableStateOf(false) }
+    var webServer by remember { mutableStateOf<VpnBook.Server?>(null) }
+
+    // شاشة المولد الداخلي تحتل التبويب كاملاً (إنجاز: توليد وتنزيل دون مغادرة التطبيق)
+    if (webServer != null) {
+        val ws = webServer!!
+        VpnBookWebView(
+            app = app,
+            hint = "اختر في الصفحة: ${Country.label(ws.country)} ${ws.label} — المنفذ 443",
+            onClose = { webServer = null }
+        )
+        return
+    }
 
     Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -771,7 +790,11 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             onClick = { showBook = true },
             modifier = Modifier.fillMaxWidth()
         ) { Text("📖 VPNBook مجاني — أمريكا/ألمانيا/فرنسا (7 أيام)") }
-        if (showBook) VpnBookDialog(onClose = { showBook = false }, onImport = { a.importFiles() })
+        if (showBook) VpnBookDialog(
+            onClose = { showBook = false },
+            onImport = { a.importFiles() },
+            onOpenInApp = { srv -> showBook = false; webServer = srv }
+        )
         var repairMsg by remember { mutableStateOf("") }
         OutlinedButton(
             onClick = {
@@ -979,10 +1002,11 @@ fun ProtonDialog(app: WgApp, onClose: () -> Unit) {
 }
 
 @Composable
-fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit) {
+fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit, onOpenInApp: (VpnBook.Server) -> Unit) {
     val ctx = LocalContext.current
     var pings by remember { mutableStateOf<Map<String, Int?>>(emptyMap()) }
     var pinging by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf<VpnBook.Server?>(null) }
 
     fun refresh() {
         if (pinging) return
@@ -996,6 +1020,12 @@ fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit) {
             withContext(kotlinx.coroutines.Dispatchers.Main) {
                 pings = res
                 pinging = false
+                // اختيار تلقائي لأسرع مستجيب عند أول قياس
+                if (selected == null) {
+                    res.entries.filter { it.value != null }.minByOrNull { it.value!! }?.let { best ->
+                        selected = VpnBook.servers.firstOrNull { it.host == best.key }
+                    }
+                }
             }
         }
     }
@@ -1010,34 +1040,52 @@ fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "سيرفرات مجانية بلا حساب (أمريكا/كندا/بريطانيا/ألمانيا/فرنسا). " +
-                        "التوليد في موقعهم بخطوة تحقق واحدة، ثم تستورد الملف هنا — والصلاحية 7 أيام يتتبعها التطبيق وينبهك.",
+                    "اختر سيرفراً (يُقاس تلقائياً ويُختار الأسرع)، ثم افتح المولد داخل التطبيق " +
+                        "واختر نفس السيرفر والمنفذ 443 — الملف المولّد يُستورد مباشرة لقائمتك.",
                     fontSize = 12.sp
                 )
-                Text("1) اختر سيرفراً سريعاً أدناه  2) افتح المولد واختر نفس السيرفر والمنفذ 443  3) حمّل .conf واستورده هنا", fontSize = 12.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(
-                        onClick = {
-                            try {
-                                ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(VpnBook.GEN_URL)))
-                            } catch (e: Exception) {
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("فتح المولد") }
-                    OutlinedButton(onClick = { onImport() }, modifier = Modifier.weight(1f)) { Text("استيراد .conf") }
+                if (selected != null) {
+                    Text(
+                        "المختار: ${Country.label(selected!!.country)} ${selected!!.label} — افتح المولد واختره هناك",
+                        fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
                 }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Button(
+                        onClick = { onOpenInApp(selected ?: sorted.firstOrNull() ?: VpnBook.servers.first()) },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("فتح المولد داخل التطبيق", maxLines = 1) }
+                    OutlinedButton(onClick = { onImport() }, modifier = Modifier.weight(1f)) { Text("استيراد .conf", maxLines = 1) }
+                }
+                TextButton(
+                    onClick = {
+                        try {
+                            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(VpnBook.GEN_URL)))
+                        } catch (e: Exception) {
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("أو فتح في المتصفح الخارجي", fontSize = 12.sp) }
                 OutlinedButton(
                     onClick = { refresh() },
                     enabled = !pinging,
                     modifier = Modifier.fillMaxWidth()
-                ) { Text(if (pinging) "جارٍ قياس السرعة…" else "قياس سرعة السيرفرات") }
+                ) { Text(if (pinging) "جارٍ قياس السرعة…" else "إعادة قياس سرعة السيرفرات") }
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     items(sorted, key = { it.host }) { s ->
                         val rtt = pings[s.host]
-                        Card(Modifier.fillMaxWidth()) {
+                        val isSel = selected?.host == s.host
+                        Card(
+                            Modifier.fillMaxWidth().clickable { selected = s },
+                            colors = if (isSel) CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                            else CardDefaults.cardColors()
+                        ) {
                             Column(Modifier.padding(8.dp)) {
-                                Text("${Country.label(s.country)} • ${s.label}", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                Text(
+                                    (if (isSel) "✔ " else "") + "${Country.label(s.country)} • ${s.label}",
+                                    fontWeight = FontWeight.Bold, fontSize = 14.sp
+                                )
                                 Text(
                                     s.host + " • " + if (pings.isEmpty() || (pinging && rtt == null)) "…"
                                     else rtt?.let { "$it ms" } ?: "لا يرد ping",
@@ -1053,6 +1101,84 @@ fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit) {
         confirmButton = { TextButton(onClick = onClose) { Text("إغلاق") } },
         dismissButton = null
     )
+}
+
+@Composable
+fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
+    var statusMsg by remember { mutableStateOf("") }
+    var downloading by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(onClick = onClose) { Text("رجوع ✕") }
+            Column(Modifier.weight(1f)) {
+                Text("مولد VPNBook داخل التطبيق", fontWeight = FontWeight.Bold, maxLines = 1)
+                Text(hint, fontSize = 12.sp, maxLines = 2)
+            }
+        }
+        if (statusMsg.isNotEmpty() || downloading) {
+            Text(
+                if (downloading) "⏳ جارٍ تنزيل الملف وإدخاله للقائمة…" else statusMsg,
+                fontSize = 13.sp, modifier = Modifier.padding(horizontal = 12.dp),
+                color = MaterialTheme.colorScheme.primary
+            )
+        }
+        AndroidView(
+            factory = { c ->
+                WebView(c).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    settings.loadsImagesAutomatically = true
+                    settings.builtInZoomControls = true
+                    settings.displayZoomControls = false
+                    val cm = CookieManager.getInstance()
+                    cm.setAcceptCookie(true)
+                    cm.setAcceptThirdPartyCookies(this, true)
+                    webViewClient = WebViewClient()
+                    setDownloadListener { url, userAgent, contentDisposition, _, _ ->
+                        downloading = true
+                        statusMsg = ""
+                        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                            var msg: String
+                            try {
+                                val cookie = CookieManager.getInstance().getCookie(url)
+                                val conn = URL(url).openConnection() as HttpURLConnection
+                                if (cookie != null) conn.setRequestProperty("Cookie", cookie)
+                                conn.setRequestProperty("User-Agent", userAgent)
+                                conn.connectTimeout = 15000
+                                conn.readTimeout = 15000
+                                val code = conn.responseCode
+                                val text = conn.inputStream.bufferedReader().use { it.readText() }
+                                conn.disconnect()
+                                if (code in 200..299 && text.contains("[Interface]") && text.contains("[Peer]")) {
+                                    var fname = Regex("filename=\"?([^\";]+)\"?").find(contentDisposition ?: "")
+                                        ?.groupValues?.getOrNull(1) ?: "vpnbook-${System.currentTimeMillis()}.conf"
+                                    fname = fname.substringAfterLast('/').substringAfterLast('\\')
+                                    val err = app.engine.addConfig(fname.substringBeforeLast('.'), text)
+                                    msg = if (err == null) "✔ تم إدخال $fname في قائمة الكونفيجات (ارجع وافحصه)"
+                                    else "✗ $err"
+                                } else {
+                                    msg = "الملف المحمّل ليس كونفيج WireGuard صالحاً (HTTP $code)"
+                                }
+                            } catch (e: Exception) {
+                                msg = "فشل التنزيل: ${e.message?.take(100)}"
+                            }
+                            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                downloading = false
+                                statusMsg = msg
+                            }
+                        }
+                    }
+                    loadUrl(VpnBook.GEN_URL)
+                }
+            },
+            onRelease = { it.destroy() },
+            modifier = Modifier.fillMaxSize().weight(1f)
+        )
+    }
 }
 
 private fun statText(name: String, st: Stat?): String =
