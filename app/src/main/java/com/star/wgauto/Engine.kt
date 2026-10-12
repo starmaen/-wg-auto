@@ -1496,10 +1496,10 @@ class Engine(ctx: Context, private val store: Store) {
         val direct = under?.let { Probes.exitInfo(it.network) }
         if (direct != null) status.update { it.copy(directIp = direct.ip, directLoc = direct.loc) }
 
-        // ---- مسار سريع: آخر كونفيج نجح على هذا النوع من الشبكات
+        // ---- مسار سريع: آخر كونفيج نجح على هذا النوع من الشبكات (غير منتهٍ حصراً)
         if (allowFast) {
             val lb = readLastBest(label)
-            val cfg = lb?.let { l -> allCfg.firstOrNull { it.id == l.cfgId } }
+            val cfg = lb?.let { l -> freshCfg.firstOrNull { it.id == l.cfgId } }
             val dns = lb?.let { l -> store.dns.value.firstOrNull { it.id == l.dnsId } }
             if (lb != null && cfg != null && now() - lb.time < 6 * 3600 * 1000L &&
                 (s.autoConfig || cfg.id == s.selConfigId)
@@ -1517,7 +1517,10 @@ class Engine(ctx: Context, private val store: Store) {
         }
 
         val candidates =
-            if (s.autoConfig) allCfg
+            if (s.autoConfig) freshCfg.ifEmpty {
+                log("⚠ كل الكونفيجات منتهية — تُفحص رغم ذلك كمحاولة أخيرة")
+                allCfg
+            }
             else listOf(allCfg.firstOrNull { it.id == s.selConfigId } ?: allCfg.first())
 
         report.value = Report(
