@@ -10,6 +10,7 @@ import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings as AndroidSettings
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
@@ -1107,6 +1108,46 @@ fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit, onOpenInApp: (VpnBo
 fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
     var statusMsg by remember { mutableStateOf("") }
     var downloading by remember { mutableStateOf(false) }
+    var webRef by remember { mutableStateOf<WebView?>(null) }
+    val ctx = LocalContext.current
+
+    // يستقبل نص الكونفيج من JS (blob أو التقاط ظاهر) ويدخله للقائمة — يعمل على أي خيط
+    fun importFromJs(raw: String, fnameHint: String) {
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            var msg: String
+            try {
+                // نص evaluateJavascript قد يصل JSON-mquoted — فكّه إن لزم
+                var text = raw
+                if (text.startsWith("\"") && text.endsWith("\"") && text.length >= 2) {
+                    text = text.substring(1, text.length - 1)
+                        .replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+                        .replace("\\\"", "\"").replace("\\\\", "\\")
+                }
+                // فك ترميز \uXXXX
+                if (text.contains("\\u") || text.contains("\\n")) {
+                    try {
+                        text = org.json.JSONTokener("\"$text\"").nextString()
+                    } catch (_: Exception) { }
+                }
+                if (!text.contains("[Interface]") || !text.contains("[Peer]")) {
+                    msg = "لم أجد كونفيج في الصفحة بعد — انتظر ظهوره ثم اضغط التقاط مجدداً"
+                } else {
+                    val cleanName = fnameHint.substringAfterLast('/').substringAfterLast('\\')
+                        .substringBeforeLast('.').ifBlank { "vpnbook-${System.currentTimeMillis()}" }
+                    val err = app.engine.addConfig(cleanName, text)
+                    msg = if (err == null) "✔ تم إدخال $cleanName في قائمة الكونفيجات (ارجع وافحصه)"
+                    else "✗ $err"
+                }
+            } catch (e: Exception) {
+                msg = "فشل الاستيراد: ${e.message?.take(100)}"
+            }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                downloading = false
+                statusMsg = msg
+            }
+        }
+    }
+
     Column(Modifier.fillMaxSize()) {
         Row(
             Modifier.fillMaxWidth().padding(8.dp),
@@ -1118,6 +1159,41 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                 Text("مولد VPNBook داخل التطبيق", fontWeight = FontWeight.Bold, maxLines = 1)
                 Text(hint, fontSize = 12.sp, maxLines = 2)
             }
+        }
+        // زر التقاط احتياطي — لا يعطّل التنزيل التلقائي، فقط بديل عند فشل blob
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = {
+                    val wv = webRef
+                    if (wv == null) {
+                        statusMsg = "المتصفح لم يجهز بعد"
+                        return@OutlinedButton
+                    }
+                    downloading = true
+                    statusMsg = ""
+                    wv.evaluateJavascript(
+                        "(function(){try{" +
+                            "var t=(document.body?document.body.innerText:'');" +
+                            "var i=t.indexOf('[Interface]');" +
+                            "if(i<0){AndroidBlob.onError('NO_CONFIG');return;}" +
+                            "AndroidBlob.onBlob(t.substring(i,i+9000));" +
+                            "}catch(e){AndroidBlob.onError(''+e)}})();",
+                        null
+                    )
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("📋 التقاط الكونفيج الظاهر", maxLines = 1) }
+            OutlinedButton(
+                onClick = {
+                    try {
+                        ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(VpnBook.GEN_URL)))
+                    } catch (_: Exception) { }
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("فتح خارجي", maxLines = 1) }
         }
         if (statusMsg.isNotEmpty() || downloading) {
             Text(
@@ -1138,9 +1214,73 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                     cm.setAcceptCookie(true)
                     cm.setAcceptThirdPartyCookies(this, true)
                     webViewClient = WebViewClient()
+                    val wv = this
+                    addJavascriptInterface(object {
+                        @JavascriptInterface
+                        fun onBlob(text: String) {
+                            importFromJs(text, "vpnbook-${System.currentTimeMillis()}.conf")
+                        }
+                        @JavascriptInterface
+                        fun onError(err: String) {
+                            wv.post {
+                                downloading = false
+                                statusMsg = if (err == "NO_CONFIG")
+                                    "لا كونفيج ظاهر بعد — اضغط Generate في الصفحة أولاً ثم التقاط"
+                                else "تعذّر قراءة الملف من الصفحة ($err) — جرّب التقاط مجدداً"
+                            }
+                        }
+                    }, "AndroidBlob")
+                    webRef = this
                     setDownloadListener { url, userAgent, contentDisposition, _, _ ->
                         downloading = true
                         statusMsg = ""
+                        if (url.startsWith("blob:", true)) {
+                            // ملفات VPNBook تُولَّد كـ blob داخل الصفحة — HttpURLConnection لا يفهمها،
+                            // فنقرأها عبر fetch داخل الـ WebView نفسه ثم نستوردها.
+                            val safe = url.replace("'", "")
+                            wv.evaluateJavascript(
+                                "(function(){fetch('$safe').then(function(r){return r.text();})" +
+                                    ".then(function(t){AndroidBlob.onBlob(t);})" +
+                                    ".catch(function(e){AndroidBlob.onError(''+e);});})();",
+                                null
+                            )
+                            return@setDownloadListener
+                        }
+                        if (url.startsWith("data:", true)) {
+                            // data:text/plain;base64,... — فك مباشر بلا شبكة
+                            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                                var msg: String
+                                try {
+                                    val comma = url.indexOf(',')
+                                    val meta = url.substring(5, if (comma >= 0) comma else url.length)
+                                    var data = if (comma >= 0) url.substring(comma + 1) else ""
+                                    val text = if (meta.contains(";base64", true)) {
+                                        String(
+                                            android.util.Base64.decode(data, android.util.Base64.DEFAULT),
+                                            Charsets.UTF_8
+                                        )
+                                    } else {
+                                        java.net.URLDecoder.decode(data, "UTF-8")
+                                    }
+                                    if (text.contains("[Interface]") && text.contains("[Peer]")) {
+                                        val err = app.engine.addConfig(
+                                            "vpnbook-${System.currentTimeMillis()}", text
+                                        )
+                                        msg = if (err == null) "✔ تم إدخال الكونفيج في القائمة (ارجع وافحصه)"
+                                        else "✗ $err"
+                                    } else {
+                                        msg = "الملف المحمّل ليس كونفيج WireGuard صالحاً"
+                                    }
+                                } catch (e: Exception) {
+                                    msg = "فشل التنزيل: ${e.message?.take(100)}"
+                                }
+                                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                    downloading = false
+                                    statusMsg = msg
+                                }
+                            }
+                            return@setDownloadListener
+                        }
                         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
                             var msg: String
                             try {
@@ -1175,7 +1315,7 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                     loadUrl(VpnBook.GEN_URL)
                 }
             },
-            onRelease = { it.destroy() },
+            onRelease = { webRef = null; it.destroy() },
             modifier = Modifier.fillMaxSize().weight(1f)
         )
     }
