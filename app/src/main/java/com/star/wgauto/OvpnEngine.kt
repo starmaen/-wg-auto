@@ -35,9 +35,11 @@ class OvpnEngine(ctx: Context, private val store: Store) {
     val state = MutableStateFlow(OvpnState())
 
     private val listener = object : VpnStatus.StateListener {
+        // ملاحظة: مكتبة ics-openvpn تمرر intent=null عند أول تسجيل (mLastIntent)،
+        // لذلك يجب أن تكون المعاملة nullable وإلا سقط التطبيق فور فتحه.
         override fun updateState(
             state: String, logmessage: String, localizedResId: Int,
-            level: ConnectionStatus, intent: Intent
+            level: ConnectionStatus, intent: Intent?
         ) {
             scope.launch { applyLevel(level, logmessage.ifEmpty { state }) }
         }
@@ -46,7 +48,12 @@ class OvpnEngine(ctx: Context, private val store: Store) {
     }
 
     init {
-        VpnStatus.addStateListener(listener)
+        // حماية إقلاع: أي عطل في مكتبة الـ VPN يجب ألا يمنع فتح التطبيق أبداً
+        try {
+            VpnStatus.addStateListener(listener)
+        } catch (e: Exception) {
+            state.value = OvpnState(statusText = "تعذّر تهيئة OpenVPN")
+        }
     }
 
     private fun applyLevel(level: ConnectionStatus, msg: String) {
