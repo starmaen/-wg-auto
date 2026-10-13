@@ -192,7 +192,7 @@ class Store(ctx: Context) {
                     .put("country", it.country).put("sessions", it.sessions)
                     .put("speedMbps", it.speedMbps).put("pingAdvertised", it.pingAdvertised)
                     .put("lat", it.lat).put("jitter", it.jitter).put("loss", it.loss)
-                    .put("via", it.via).put("testedAt", it.testedAt)
+                    .put("via", it.via).put("testedAt", it.testedAt).put("lastSeen", it.lastSeen)
             )
         }
         sp.edit().putString("ovpn", a.toString()).apply()
@@ -210,7 +210,9 @@ class Store(ctx: Context) {
                     o.optInt("sessions", 0), o.optDouble("speedMbps", 0.0),
                     o.optInt("pingAdvertised", -1), o.optInt("lat", -1),
                     o.optInt("jitter", 0), o.optInt("loss", 100),
-                    o.optString("via", ""), o.optLong("testedAt", 0L)
+                    o.optString("via", ""), o.optLong("testedAt", 0L),
+                    // الكاش القديم بلا lastSeen: نعتبره حديثاً ولا نحذفه من أول تحديث
+                    o.optLong("lastSeen", System.currentTimeMillis())
                 )
             }
         } catch (e: Exception) {

@@ -12,8 +12,8 @@ android {
         applicationId = "com.star.wgauto"
         minSdk = 26
         targetSdk = 34
-        versionCode = 28
-        versionName = "1.27"
+        versionCode = 29
+        versionName = "1.28"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
@@ -49,6 +49,8 @@ dependencies {
     // أحدث إصدار مؤكَّد على Maven Central (تحقّق منه المستخدم مباشرة، تاريخ النشر 2026-01-02):
     // https://central.sonatype.com/artifact/com.wireguard.android/tunnel/versions
     implementation("com.wireguard.android:tunnel:1.0.20260102")
+    // OpenVPN مدمج داخل التطبيق (نواة ics-openvpn المفتوحة GPLv2 — بلا تطبيق خارجي وبلا NDK)
+    implementation(project(":vpnLib"))
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 
     implementation("androidx.core:core-ktx:1.13.1")

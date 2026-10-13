@@ -45,16 +45,5 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
-
-        <!-- مشاركة ملفات .ovpn مع تطبيقات OpenVPN الخارجية -->
-        <provider
-            android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.ovpn"
-            android:exported="false"
-            android:grantUriPermissions="true">
-            <meta-data
-                android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/ovpn_paths" />
-        </provider>
     </application>
 </manifest>

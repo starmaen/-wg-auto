@@ -92,9 +92,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import java.io.ByteArrayInputStream
-import java.io.File
 import java.util.zip.ZipInputStream
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
@@ -157,8 +155,8 @@ class MainActivity : ComponentActivity() {
             toggle = { onToggle() },
             importFiles = { importLauncher.launch(arrayOf("*/*")) },
             batteryExempt = { batteryExempt() },
-            testAll = { withVpnPermission { app.engine.testAll() } },
-            testOne = { id -> withVpnPermission { app.engine.testConfigs(listOf(id)) } },
+            testAll = { app.ovpn.stop(); withVpnPermission { app.engine.testAll() } },
+            testOne = { id -> app.ovpn.stop(); withVpnPermission { app.engine.testConfigs(listOf(id)) } },
             syncService = { syncService() },
             restoreSystem = { app.engine.restoreSystemDns() },
             shutdownAll = {
@@ -176,6 +174,7 @@ class MainActivity : ComponentActivity() {
             },
             activateConfig = { id ->
                 app.store.updateSettings { it.copy(autoConfig = false, selConfigId = id) }
+                app.ovpn.stop()
                 withVpnPermission {
                     ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
                     app.engine.connectManual(id)
@@ -233,6 +232,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startVpn() {
+        app.ovpn.stop() // نفق واحد فقط: فصل OpenVPN الداخلي قبل تشغيل WireGuard
         ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
         app.engine.start()
     }
@@ -1726,26 +1726,32 @@ fun OwnerToolPanel(app: WgApp) {
 // DNS الخاص به عند الاتصال.
 // =====================================================================
 
-/** يجلب القائمة من VPNGate ويحفظها مع الحفاظ على نتائج الفحص السابقة. يعيد رسالة عرض. */
+/** يجلب القائمة من VPNGate ويدمجها مع الكاش (يحتفظ بسيرفرات اختفت منذ أقل من 48 ساعة
+ *  لتنويع الدول في الأيام التي تطغى فيها دولة واحدة). يعيد رسالة عرض. */
 suspend fun refreshOvpnServers(app: WgApp): String = withContext(kotlinx.coroutines.Dispatchers.IO) {
     val csv = VpnGate.fetchCsv()
         ?: return@withContext "تعذّر الجلب — تحقق من الإنترنت (الكاش القديم ما زال يعمل)"
     val parsed = VpnGate.parse(csv)
     if (parsed.isEmpty()) return@withContext "رد فارغ من VPNGate — حاول لاحقاً"
     app.store.saveVpnGateCsv(csv)
+    val now = System.currentTimeMillis()
     val old = app.store.ovpn.value.associateBy { it.key }
+    val freshKeys = parsed.map { it.key }.toSet()
+    // القدامى الغائبون منذ أقل من 48 ساعة يبقون (موسومون ضمنياً بقدم lastSeen)
+    val kept = old.values.filter { it.key !in freshKeys && now - it.lastSeen < 48L * 3600 * 1000 }
     app.store.updateOvpn {
         parsed.map { s ->
             val o = old[s.key]
             OvpnServer(
                 s.key, s.host, s.ip, s.country, s.sessions, s.speedMbps, s.pingAdvertised,
                 lat = o?.lat ?: -1, jitter = o?.jitter ?: 0, loss = o?.loss ?: 100,
-                via = o?.via ?: "", testedAt = o?.testedAt ?: 0L
+                via = o?.via ?: "", testedAt = o?.testedAt ?: 0L, lastSeen = now
             )
-        }
+        } + kept
     }
-    app.store.setOvpnUpdatedAt(System.currentTimeMillis())
-    "تم التحديث: ${parsed.size} سيرفراً في ${parsed.map { it.country }.distinct().size} دولة"
+    app.store.setOvpnUpdatedAt(now)
+    val nCountries = (parsed.map { it.country } + kept.map { it.country }).distinct().size
+    "تم التحديث: ${parsed.size + kept.size} سيرفراً في $nCountries دولة"
 }
 
 /** يفحص أفضل المرشحين ويحفظ النتائج تدريجياً. يعيد المرتبين (الأفضل أولاً). */
@@ -1774,50 +1780,17 @@ suspend fun examOvpnBest(
 }
 
 /**
- * يتصل بسيرفر: يوقف WireGuard أولاً (نفق واحد فقط)، يكتب .ovpn المفلتر
- * حسب تفضيل البروتوكول، ويفتحه في تطبيق OpenVPN خارجي. يعيد رسالة عرض.
+ * يتصل بسيرفر OpenVPN داخل التطبيق: يوقف WireGuard أولاً (نفق واحد فقط)،
+ * ثم يشغّل الكونفيج المفلتر حسب تفضيل البروتوكول عبر المحرك المدمج. يعيد رسالة عرض.
  */
-fun connectOvpn(ctx: android.content.Context, app: WgApp, server: OvpnServer, prefer: String): String {
+fun startOvpnInternal(app: WgApp, server: OvpnServer, prefer: String): String {
     if (app.engine.status.value.running) app.engine.stop()
+    if (app.ovpn.isUp()) app.ovpn.stop()
     val b64 = app.store.ovpnConfigB64(server.key)
-        ?: return "انتهت صلاحية الكاش — حدّث القائمة أولاً"
+        ?: return "هذا السيرفر غاب عن آخر تحديث — حدّث القائمة أو اختر سيرفراً آخر"
     val cfg = VpnGate.decodeConfig(b64) ?: return "كونفيج تالف — حدّث القائمة"
     val filtered = VpnGate.filterConfig(cfg, prefer)
-    return try {
-        val dir = File(ctx.cacheDir, "ovpn").apply { mkdirs() }
-        val safe = server.key.replace(Regex("[^A-Za-z0-9.-]"), "_").take(60)
-        val f = File(dir, "wgauto-$safe.ovpn")
-        f.writeText(filtered)
-        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.ovpn", f)
-        val view = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/x-openvpn-profile")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try {
-            ctx.startActivity(Intent.createChooser(view, "اتصال عبر…"))
-            "أُوقف WireGuard وفُتح الكونفيج — أكمل الاتصال في تطبيق OpenVPN"
-        } catch (e: Exception) {
-            try {
-                ctx.startActivity(
-                    Intent(
-                        Intent.ACTION_VIEW,
-                        Uri.parse("market://details?id=de.blinkt.openvpn")
-                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            } catch (e2: Exception) {
-                ctx.startActivity(
-                    Intent(
-                        Intent.ACTION_VIEW,
-                        Uri.parse("https://play.google.com/store/apps/details?id=de.blinkt.openvpn")
-                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-            "ثبّت تطبيق OpenVPN for Android أولاً ثم أعد الاتصال"
-        }
-    } catch (e: Exception) {
-        "تعذّر تجهيز الملف: ${e.message?.take(80)}"
-    }
+    return app.ovpn.start(server, filtered)
 }
 
 @Composable
@@ -1829,6 +1802,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
     val settings by app.store.settings.collectAsState()
     val ni by app.engine.netInfo.collectAsState()
     val wgSt by app.engine.status.collectAsState()
+    val ovSt by app.ovpn.state.collectAsState()
     var busy by remember { mutableStateOf("") }
     var countryFilter by remember { mutableStateOf("ALL") }
     var query by remember { mutableStateOf("") }
@@ -1878,7 +1852,6 @@ fun OvpnTab(app: WgApp, a: Actions) {
     }.sortedWith(compareBy({ val r = rankOf(it.key); if (r >= 0) r else 99 }, { it.score }))
 
     LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        val extUp = ni.vpn != null && ni.vpnOwner == "خارجي"
         val wgUp = wgSt.running && wgSt.connected
         // ---- ترويسة مميزة للتبويب ----
         item {
@@ -1906,22 +1879,37 @@ fun OvpnTab(app: WgApp, a: Actions) {
         // ---- شريط الحالة: هل يوجد اتصال؟ وهل يمكن فصله؟ ----
         item {
         when {
-            extUp -> Card(
+            ovSt.active -> Card(
                 Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
             ) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("🟢 متصل عبر OpenVPN خارجي • الواجهة ${ni.vpn?.iface ?: ""}", fontWeight = FontWeight.Bold)
+                    Text("🟢 متصل عبر OpenVPN داخل التطبيق", fontWeight = FontWeight.Bold)
+                    if (ovSt.serverLabel.isNotEmpty()) Text(ovSt.serverLabel, fontSize = 13.sp)
                     Text("النفق يعمل الآن — افصله من هنا بضغطة واحدة", fontSize = 12.sp)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
                             onClick = { app.engine.scanNetwork("فحص يدوي من تبويب VPN") },
                             modifier = Modifier.weight(1f)
                         ) { Text("فحص", maxLines = 1) }
-                        Button(onClick = { a.openVpnSettings() }, modifier = Modifier.weight(1f)) {
-                            Text("فصل ⏻", maxLines = 1)
-                        }
+                        Button(
+                            onClick = { toast(app.ovpn.stop()) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("فصل ⏻", maxLines = 1) }
                     }
+                }
+            }
+            ovSt.connecting -> Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1))
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("🟡 ${ovSt.statusText.ifEmpty { "جارٍ الاتصال…" }}", fontWeight = FontWeight.Bold)
+                    if (ovSt.serverLabel.isNotEmpty()) Text(ovSt.serverLabel, fontSize = 13.sp)
+                    OutlinedButton(
+                        onClick = { toast(app.ovpn.stop()) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("إلغاء") }
                 }
             }
             wgUp -> Card(
@@ -1939,7 +1927,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
             }
             ni.vpn != null -> Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp)) {
-                    Text("🟡 يوجد نفق (${ni.vpnOwner}) — يُفحص الآن…", fontSize = 13.sp)
+                    Text("🟡 يوجد نفق — يُفحص الآن…", fontSize = 13.sp)
                 }
             }
             else -> Card(Modifier.fillMaxWidth()) {
@@ -2035,7 +2023,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                             fontSize = 12.sp
                         )
                     }
-                    Button(onClick = { toast(connectOvpn(ctx, app, best, prefer)) }) { Text("اتصال") }
+                    Button(onClick = { toast(startOvpnInternal(app, best, prefer)) }) { Text("اتصال") }
                 }
             }
             }
@@ -2157,7 +2145,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                 modifier = Modifier.weight(1f)
                             ) { Text("فحص", maxLines = 1) }
                             Button(
-                                onClick = { toast(connectOvpn(ctx, app, s, prefer)) },
+                                onClick = { toast(startOvpnInternal(app, s, prefer)) },
                                 modifier = Modifier.weight(1f)
                             ) { Text("اتصال", maxLines = 1) }
                         }

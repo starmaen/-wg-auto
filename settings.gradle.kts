@@ -14,3 +14,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "WGAuto"
 include(":app")
+include(":vpnLib")
