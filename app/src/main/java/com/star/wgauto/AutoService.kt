@@ -11,6 +11,7 @@ import android.net.ConnectivityManager
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -69,6 +70,18 @@ class AutoService : Service() {
         monitor?.stop()
         scope.cancel()
         super.onDestroy()
+    }
+
+    /**
+     * المستخدم سحب التطبيق من الأخيرة: حاول البقاء حياً فوراً.
+     * (بعض الأجهزة تمنع ذلك — عندها يتكفل الإشعار/الإقلاع/اللزوجة بالعودة.)
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        try {
+            ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
+        } catch (e: Exception) {
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun promote() {
