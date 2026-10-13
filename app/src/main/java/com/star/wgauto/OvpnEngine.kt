@@ -2,7 +2,6 @@ package com.star.wgauto
 
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import de.blinkt.openvpn.OpenVpnApi
 import de.blinkt.openvpn.core.ConnectionStatus
 import de.blinkt.openvpn.core.OpenVPNService
@@ -111,16 +110,23 @@ class OvpnEngine(ctx: Context, private val store: Store) {
 
     /** يفصل النفق الداخلي مباشرة (بلا إعدادات نظام وبلا تطبيق خارجي). */
     fun stop(): String {
+        val hadKey = store.prefGet("ovpnActive")?.isNotEmpty() == true
+        store.prefPut("ovpnActive", null)
+        val wasUp = isUp()
+        state.value = OvpnState(statusText = if (wasUp || hadKey) "تم الفصل" else "")
+        // إن لم يكن يعمل أصلاً: لا نوقظ الخدمة عبثاً.
+        if (!wasUp && !hadKey) return "متوقف أصلاً"
         return try {
-            val i = Intent(appCtx, OpenVPNService::class.java)
-                .setAction(OpenVPNService.DISCONNECT_VPN)
-            if (Build.VERSION.SDK_INT >= 26) appCtx.startForegroundService(i)
-            else appCtx.startService(i)
-            state.value = OvpnState(statusText = "تم الفصل")
-            store.prefPut("ovpnActive", null)
+            // startService وليس startForegroundService: أمر الفصل لا يستدعي
+            // startForeground لاحقاً، وطلب Foreground دون لحاقه يسقط التطبيق
+            // كله بخطأ ForegroundServiceDidNotStartInTime — وهذا ما كان
+            // يُخرج الواجهة عند كل تشغيل/فحص لـ WireGuard.
+            appCtx.startService(
+                Intent(appCtx, OpenVPNService::class.java)
+                    .setAction(OpenVPNService.DISCONNECT_VPN)
+            )
             "تم فصل OpenVPN"
         } catch (e: Exception) {
-            state.value = OvpnState()
             "تم الفصل"
         }
     }
