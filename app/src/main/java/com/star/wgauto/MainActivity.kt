@@ -31,6 +31,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -56,6 +57,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
@@ -72,11 +74,13 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -88,7 +92,9 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.util.zip.ZipInputStream
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
@@ -399,7 +405,7 @@ fun LicenseGate(app: WgApp, content: @Composable () -> Unit) {
 @Composable
 fun Root(app: WgApp, a: Actions) {
     var tab by remember { mutableIntStateOf(0) }
-    val titles = listOf("الرئيسية", "الكونفيجات", "DNS", "الإعدادات")
+    val titles = listOf("الرئيسية", "الكونفيجات", "VPN 🌍", "DNS", "الإعدادات")
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().systemBarsPadding()) {
             TabRow(selectedTabIndex = tab) {
@@ -410,7 +416,8 @@ fun Root(app: WgApp, a: Actions) {
             when (tab) {
                 0 -> HomeTab(app, a)
                 1 -> ConfigsTab(app, a)
-                2 -> DnsTab(app)
+                2 -> OvpnTab(app, a)
+                3 -> DnsTab(app)
                 else -> SettingsTab(app, a)
             }
         }
@@ -1707,6 +1714,455 @@ fun OwnerToolPanel(app: WgApp) {
                     Text("${h.code}  •  حتى ${h.expiry}  •  صدر ${h.issuedAt}", fontSize = 12.sp)
                 }
             }
+        }
+    }
+}
+
+// =====================================================================
+// تبويب VPN 🌍 — سيرفرات OpenVPN مجانية من VPNGate تتحدث تلقائياً.
+// الفحص بنفس معادلة الامتحان الموحدة (الزمن 50% + الفقد 30% + التذبذب 20%)،
+// والاتصال يتم عبر تطبيق OpenVPN خارجي بعد إيقاف نفق WireGuard (نفق واحد فقط
+// مسموح في أندرويد). DNS وMTU يُقترحان من فحص شبكتك، وكونفيج VPNGate يدفع
+// DNS الخاص به عند الاتصال.
+// =====================================================================
+
+/** يجلب القائمة من VPNGate ويحفظها مع الحفاظ على نتائج الفحص السابقة. يعيد رسالة عرض. */
+suspend fun refreshOvpnServers(app: WgApp): String = withContext(kotlinx.coroutines.Dispatchers.IO) {
+    val csv = VpnGate.fetchCsv()
+        ?: return@withContext "تعذّر الجلب — تحقق من الإنترنت (الكاش القديم ما زال يعمل)"
+    val parsed = VpnGate.parse(csv)
+    if (parsed.isEmpty()) return@withContext "رد فارغ من VPNGate — حاول لاحقاً"
+    app.store.saveVpnGateCsv(csv)
+    val old = app.store.ovpn.value.associateBy { it.key }
+    app.store.updateOvpn {
+        parsed.map { s ->
+            val o = old[s.key]
+            OvpnServer(
+                s.key, s.host, s.ip, s.country, s.sessions, s.speedMbps, s.pingAdvertised,
+                lat = o?.lat ?: -1, jitter = o?.jitter ?: 0, loss = o?.loss ?: 100,
+                via = o?.via ?: "", testedAt = o?.testedAt ?: 0L
+            )
+        }
+    }
+    app.store.setOvpnUpdatedAt(System.currentTimeMillis())
+    "تم التحديث: ${parsed.size} سيرفراً في ${parsed.map { it.country }.distinct().size} دولة"
+}
+
+/** يفحص أفضل المرشحين ويحفظ النتائج تدريجياً. يعيد المرتبين (الأفضل أولاً). */
+suspend fun examOvpnBest(
+    app: WgApp,
+    prefer: String,
+    onProgress: (String) -> Unit
+): List<OvpnServer> {
+    val csv = app.store.loadVpnGateCsv() ?: return emptyList()
+    val cands = VpnGate.candidates(VpnGate.parse(csv), prefer)
+    if (cands.isEmpty()) return emptyList()
+    onProgress("فحص ${cands.size} مرشحاً…")
+    val now = System.currentTimeMillis()
+    VpnGate.examMany(cands, prefer) { key, r ->
+        if (r != null) {
+            app.store.updateOvpn { l ->
+                l.map {
+                    if (it.key == key) it.copy(lat = r.lat, jitter = r.jitter, loss = r.loss, via = r.via, testedAt = now)
+                    else it
+                }
+            }
+        }
+    }
+    onProgress("")
+    return app.store.ovpn.value.filter { it.tested && it.loss < 100 }.sortedBy { it.score }
+}
+
+/**
+ * يتصل بسيرفر: يوقف WireGuard أولاً (نفق واحد فقط)، يكتب .ovpn المفلتر
+ * حسب تفضيل البروتوكول، ويفتحه في تطبيق OpenVPN خارجي. يعيد رسالة عرض.
+ */
+fun connectOvpn(ctx: android.content.Context, app: WgApp, server: OvpnServer, prefer: String): String {
+    if (app.engine.status.value.running) app.engine.stop()
+    val b64 = app.store.ovpnConfigB64(server.key)
+        ?: return "انتهت صلاحية الكاش — حدّث القائمة أولاً"
+    val cfg = VpnGate.decodeConfig(b64) ?: return "كونفيج تالف — حدّث القائمة"
+    val filtered = VpnGate.filterConfig(cfg, prefer)
+    return try {
+        val dir = File(ctx.cacheDir, "ovpn").apply { mkdirs() }
+        val safe = server.key.replace(Regex("[^A-Za-z0-9.-]"), "_").take(60)
+        val f = File(dir, "wgauto-$safe.ovpn")
+        f.writeText(filtered)
+        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.ovpn", f)
+        val view = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/x-openvpn-profile")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            ctx.startActivity(Intent.createChooser(view, "اتصال عبر…"))
+            "أُوقف WireGuard وفُتح الكونفيج — أكمل الاتصال في تطبيق OpenVPN"
+        } catch (e: Exception) {
+            try {
+                ctx.startActivity(
+                    Intent(
+                        Intent.ACTION_VIEW,
+                        Uri.parse("market://details?id=de.blinkt.openvpn")
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (e2: Exception) {
+                ctx.startActivity(
+                    Intent(
+                        Intent.ACTION_VIEW,
+                        Uri.parse("https://play.google.com/store/apps/details?id=de.blinkt.openvpn")
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            "ثبّت تطبيق OpenVPN for Android أولاً ثم أعد الاتصال"
+        }
+    } catch (e: Exception) {
+        "تعذّر تجهيز الملف: ${e.message?.take(80)}"
+    }
+}
+
+@Composable
+fun OvpnTab(app: WgApp, a: Actions) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val servers by app.store.ovpn.collectAsState()
+    val updatedAt by app.store.ovpnUpdatedAt.collectAsState()
+    val settings by app.store.settings.collectAsState()
+    val ni by app.engine.netInfo.collectAsState()
+    val wgSt by app.engine.status.collectAsState()
+    var busy by remember { mutableStateOf("") }
+    var countryFilter by remember { mutableStateOf("ALL") }
+    var query by remember { mutableStateOf("") }
+
+    fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_LONG).show()
+    val prefer = settings.ovpnProto
+
+    // تحميل أولي من الكاش + تحديث تلقائي إن قَدُم (أكثر من 6 ساعات)
+    LaunchedEffect(Unit) {
+        if (servers.isEmpty()) {
+            app.store.loadVpnGateCsv()?.let { csv ->
+                val list = VpnGate.parse(csv)
+                if (list.isNotEmpty()) {
+                    app.store.updateOvpn { _ ->
+                        list.map { s ->
+                            OvpnServer(s.key, s.host, s.ip, s.country, s.sessions, s.speedMbps, s.pingAdvertised)
+                        }
+                    }
+                }
+            }
+        }
+        if (System.currentTimeMillis() - app.store.ovpnUpdatedAt.value > VpnGate.STALE_MS) {
+            busy = "تحديث تلقائي للقائمة…"
+            val msg = refreshOvpnServers(app)
+            busy = ""
+            if (app.store.ovpn.value.isNotEmpty()) toast(msg)
+        }
+    }
+
+    val ageText = if (updatedAt <= 0L) "لم تُحدَّث بعد" else {
+        val age = System.currentTimeMillis() - updatedAt
+        when {
+            age < 60_000 -> "حُدّثت قبل لحظات"
+            age < 3_600_000 -> "حُدّثت قبل ${age / 60_000} دقيقة"
+            else -> "حُدّثت قبل ${age / 3_600_000} ساعة"
+        }
+    }
+    val tested = servers.filter { it.tested && it.loss < 100 }.sortedBy { it.score }
+    val best = tested.firstOrNull()
+    val topList = tested.take(3)
+    val topKeys = topList.map { it.key }.toSet()
+    fun rankOf(key: String) = topList.indexOfFirst { it.key == key }
+    val countries = servers.map { it.country }.distinct().sorted()
+    val shown = servers.filter {
+        (countryFilter == "ALL" || it.country == countryFilter) &&
+            (query.isBlank() || it.host.contains(query.trim(), true) || it.ip.contains(query.trim()))
+    }.sortedWith(compareBy({ val r = rankOf(it.key); if (r >= 0) r else 99 }, { it.score }))
+
+    LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        val extUp = ni.vpn != null && ni.vpnOwner == "خارجي"
+        val wgUp = wgSt.running && wgSt.connected
+        // ---- ترويسة مميزة للتبويب ----
+        item {
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3F73))
+        ) {
+            Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("🌍", fontSize = 30.sp)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "سيرفرات OpenVPN المجانية",
+                        fontWeight = FontWeight.Bold, fontSize = 17.sp,
+                        color = Color.White
+                    )
+                    Text(
+                        "تتحدث تلقائياً من VPNGate • بجانب WireGuard وليس بديلاً عنه",
+                        fontSize = 12.sp, color = Color(0xFFD6E4FF)
+                    )
+                }
+            }
+        }
+        }
+        // ---- شريط الحالة: هل يوجد اتصال؟ وهل يمكن فصله؟ ----
+        item {
+        when {
+            extUp -> Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("🟢 متصل عبر OpenVPN خارجي • الواجهة ${ni.vpn?.iface ?: ""}", fontWeight = FontWeight.Bold)
+                    Text("النفق يعمل الآن — افصله من هنا بضغطة واحدة", fontSize = 12.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { app.engine.scanNetwork("فحص يدوي من تبويب VPN") },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("فحص", maxLines = 1) }
+                        Button(onClick = { a.openVpnSettings() }, modifier = Modifier.weight(1f)) {
+                            Text("فصل ⏻", maxLines = 1)
+                        }
+                    }
+                }
+            }
+            wgUp -> Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("🔵 متصل عبر WireGuard (${wgSt.activeConfig ?: ""})", fontWeight = FontWeight.Bold)
+                    Text("أوقف WireGuard أولاً قبل تشغيل OpenVPN (نفق واحد فقط مسموح)", fontSize = 12.sp)
+                    OutlinedButton(
+                        onClick = { app.engine.stop(); toast("أُوقف WireGuard — اختر سيرفر OpenVPN الآن") },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("إيقاف WireGuard") }
+                }
+            }
+            ni.vpn != null -> Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("🟡 يوجد نفق (${ni.vpnOwner}) — يُفحص الآن…", fontSize = 13.sp)
+                }
+            }
+            else -> Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("⚪ لا يوجد اتصال VPN حالياً", fontSize = 13.sp)
+                }
+            }
+        }
+        }
+
+        // ---- القائمة والتحديث ----
+        item {
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Button(
+                onClick = {
+                    scope.launch {
+                        busy = "جلب القائمة…"
+                        toast(refreshOvpnServers(app))
+                        busy = ""
+                    }
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("تحديث السيرفرات", maxLines = 1) }
+            OutlinedButton(
+                onClick = {
+                    scope.launch {
+                        busy = "فحص المرشحين…"
+                        val res = examOvpnBest(app, prefer) { p -> busy = p }
+                        busy = ""
+                        toast(if (res.isEmpty()) "لا استجابة من المرشحين — جرّب TCP" else "الأفضل: ${res.first().host} (${res.first().lat}ms)")
+                    }
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("فحص السرعة", maxLines = 1) }
+        }
+        }
+        item {
+        Text(
+            "$ageText • ${servers.size} سيرفراً في ${countries.size} دولة • المصدر: VPNGate مجاني",
+            fontSize = 11.sp
+        )
+        }
+
+        // ---- تفضيل البروتوكول: شرائح واضحة (يدوي أو تلقائي) ----
+        item {
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("البروتوكول", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val opts = listOf(
+                        "auto" to "⚡ تلقائي",
+                        "udp" to "🚀 UDP أسرع",
+                        "tcp" to "🧱 TCP للحجب"
+                    )
+                    opts.forEach { (v, t) ->
+                        FilterChip(
+                            selected = prefer == v,
+                            onClick = { app.store.updateSettings { it.copy(ovpnProto = v) } },
+                            label = { Text(t, maxLines = 1) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                Text(
+                    when (prefer) {
+                        "udp" -> "UDP: سرعة أعلى وزمن أقل — الأفضل للتصفح والمكالمات."
+                        "tcp" -> "TCP: يعبر معظم الجدران والشبكات المقيدة (443/80) — أبطأ قليلاً."
+                        else -> "تلقائي: يفحص TCP أولاً ثم Ping، ويختار أعلى درجة بالمعادلة الموحدة."
+                    },
+                    fontSize = 11.sp
+                )
+            }
+        }
+        }
+
+        // ---- الاختيار التلقائي: الأفضل بضغطة ----
+        if (best != null) {
+            item {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1))
+            ) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("🥇", fontSize = 22.sp)
+                    Spacer(Modifier.width(8.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "${Country.flag(best.country)} ${best.host}",
+                            fontWeight = FontWeight.Bold, fontSize = 14.sp
+                        )
+                        Text(
+                            "${Country.name(best.country)} • ${best.ip} • ${best.lat}ms • فقد ${best.loss}% • ${VpnGate.speedText(best.speedMbps)}",
+                            fontSize = 12.sp
+                        )
+                    }
+                    Button(onClick = { toast(connectOvpn(ctx, app, best, prefer)) }) { Text("اتصال") }
+                }
+            }
+            }
+        }
+
+        // ---- فلترة يدوية: شرائح الدول + بحث ----
+        item { Text("الدولة", fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+        item {
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(
+                selected = countryFilter == "ALL",
+                onClick = { countryFilter = "ALL" },
+                label = { Text("🌐 الكل (${servers.size})", maxLines = 1) }
+            )
+            countries.forEach { cc ->
+                val n = servers.count { it.country == cc }
+                FilterChip(
+                    selected = countryFilter == cc,
+                    onClick = { countryFilter = cc },
+                    label = { Text("${Country.flag(cc)} ${Country.name(cc)} ($n)", maxLines = 1) }
+                )
+            }
+        }
+        }
+        item {
+        OutlinedTextField(
+            value = query, onValueChange = { query = it },
+            label = { Text("بحث باسم السيرفر أو IP") }, singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        }
+
+        // ---- DNS وMTU المقترحان من فحص شبكتك ----
+        item {
+        ni.direct?.let { d ->
+            if (d.bestDns.isNotEmpty() || d.suggestedMtu > 0) {
+                Text(
+                    "مقترح شبكتك: DNS ${d.bestDns.ifEmpty { "—" }}${if (d.dnsMs >= 0) " (${d.dnsMs}ms)" else ""} • MTU ${if (d.suggestedMtu > 0) d.suggestedMtu else "—"} — كونفيج VPNGate يدفع DNS الخاص به عند الاتصال",
+                    fontSize = 11.sp
+                )
+            }
+        }
+        }
+
+        if (busy.isNotEmpty()) item { Text("⏳ $busy", fontSize = 12.sp, fontWeight = FontWeight.Bold) }
+
+        // ---- القائمة اليدوية: علم + حالة + فحص + اتصال ----
+        if (shown.isEmpty()) {
+            item {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("لا توجد سيرفرات بعد — اضغط «تحديث السيرفرات» لجلب القائمة المجانية", fontSize = 13.sp)
+                }
+            }
+            }
+        }
+        items(shown, key = { it.key }) { s ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("${Country.flag(s.country)}", fontSize = 20.sp)
+                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                val rank = rankOf(s.key)
+                                Text(
+                                    (if (rank >= 0) "${Exam.rankMedal(rank)} " else "") + s.host,
+                                    fontWeight = FontWeight.Bold, fontSize = 14.sp
+                                )
+                                Text(
+                                    "${Country.name(s.country)} • ${s.ip} • ${s.sessions} جلسة • ${VpnGate.speedText(s.speedMbps)}",
+                                    fontSize = 12.sp
+                                )
+                            }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    if (!s.tested) "⚪" else if (s.loss >= 100) "🔴" else "🟢",
+                                    fontSize = 18.sp
+                                )
+                                Text(
+                                    if (!s.tested) "لم يُفحص" else if (s.loss >= 100) "لا يعمل" else "يعمل",
+                                    fontSize = 10.sp
+                                )
+                            }
+                        }
+                        Text(
+                            if (s.tested) VpnGate.examText(VpnGate.ExamResult(s.lat, s.jitter, s.loss, s.via))
+                            else if (s.pingAdvertised >= 0) "معلن: ${s.pingAdvertised}ms — لم يُفحص من جهازك"
+                            else "لم يُفحص بعد",
+                            fontSize = 12.sp
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(
+                                onClick = {
+                                    scope.launch {
+                                        busy = "فحص ${s.host}…"
+                                        val csv = app.store.loadVpnGateCsv()
+                                        val full = csv?.let { VpnGate.parse(it).firstOrNull { p -> p.key == s.key } }
+                                        val r = full?.let { VpnGate.exam(it, prefer) }
+                                        if (r != null) {
+                                            val now = System.currentTimeMillis()
+                                            app.store.updateOvpn { l ->
+                                                l.map {
+                                                    if (it.key == s.key) it.copy(
+                                                        lat = r.lat, jitter = r.jitter,
+                                                        loss = r.loss, via = r.via, testedAt = now
+                                                    ) else it
+                                                }
+                                            }
+                                            toast("${s.host}: ${r.lat}ms • فقد ${r.loss}%")
+                                        } else {
+                                            toast("${s.host}: لا استجابة — جرّب سيرفراً آخر")
+                                        }
+                                        busy = ""
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) { Text("فحص", maxLines = 1) }
+                            Button(
+                                onClick = { toast(connectOvpn(ctx, app, s, prefer)) },
+                                modifier = Modifier.weight(1f)
+                            ) { Text("اتصال", maxLines = 1) }
+                        }
+                    }
+                }
         }
     }
 }

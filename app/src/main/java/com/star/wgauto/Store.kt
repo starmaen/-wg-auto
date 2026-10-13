@@ -12,6 +12,8 @@ class Store(ctx: Context) {
     val configs = MutableStateFlow(loadConfigs())
     val dns = MutableStateFlow(loadDns())
     val settings = MutableStateFlow(loadSettings())
+    val ovpn = MutableStateFlow(loadOvpn())
+    val ovpnUpdatedAt = MutableStateFlow(sp.getLong("ovpnUpdatedAt", 0L))
 
     // ---------- configs ----------
     fun updateConfigs(f: (List<WgConfig>) -> List<WgConfig>) {
@@ -101,7 +103,7 @@ class Store(ctx: Context) {
             .put("reselectOnNetwork", s.reselectOnNetwork).put("periodMinV2", s.periodMin)
             .put("useRoot", s.useRoot).put("backgroundScan", s.backgroundScan).put("applyRoot", s.applyRoot)
             .put("allowFilteredDns", s.allowFilteredDns).put("killSwitch", s.killSwitch)
-            .put("excludeSameCountry", s.excludeSameCountry)
+            .put("excludeSameCountry", s.excludeSameCountry).put("ovpnProto", s.ovpnProto)
         sp.edit().putString("settings", o.toString()).apply()
     }
 
@@ -120,7 +122,8 @@ class Store(ctx: Context) {
                 o.optBoolean("applyRoot", d.applyRoot),
                 o.optBoolean("allowFilteredDns", d.allowFilteredDns),
                 o.optBoolean("killSwitch", d.killSwitch),
-                o.optBoolean("excludeSameCountry", d.excludeSameCountry)
+                o.optBoolean("excludeSameCountry", d.excludeSameCountry),
+                o.optString("ovpnProto", "auto").takeIf { it in listOf("auto", "udp", "tcp") } ?: "auto"
             )
         } catch (e: Exception) {
             AppSettings()
@@ -175,5 +178,70 @@ class Store(ctx: Context) {
         } catch (e: Exception) {
             emptyList()
         }
+    }
+
+    // ---------- سيرفرات OpenVPN (VPNGate) ----------
+    // الوصف في SharedPreferences، وملف CSV الخام في filesDir (الكونفيجات كبيرة).
+
+    fun updateOvpn(f: (List<OvpnServer>) -> List<OvpnServer>) {
+        ovpn.value = f(ovpn.value)
+        val a = JSONArray()
+        ovpn.value.forEach {
+            a.put(
+                JSONObject().put("key", it.key).put("host", it.host).put("ip", it.ip)
+                    .put("country", it.country).put("sessions", it.sessions)
+                    .put("speedMbps", it.speedMbps).put("pingAdvertised", it.pingAdvertised)
+                    .put("lat", it.lat).put("jitter", it.jitter).put("loss", it.loss)
+                    .put("via", it.via).put("testedAt", it.testedAt)
+            )
+        }
+        sp.edit().putString("ovpn", a.toString()).apply()
+    }
+
+    private fun loadOvpn(): List<OvpnServer> {
+        val s = sp.getString("ovpn", null) ?: return emptyList()
+        return try {
+            val a = JSONArray(s)
+            (0 until a.length()).map {
+                val o = a.getJSONObject(it)
+                OvpnServer(
+                    o.optString("key", o.optString("host", "")),
+                    o.optString("host", ""), o.optString("ip", ""), o.optString("country", ""),
+                    o.optInt("sessions", 0), o.optDouble("speedMbps", 0.0),
+                    o.optInt("pingAdvertised", -1), o.optInt("lat", -1),
+                    o.optInt("jitter", 0), o.optInt("loss", 100),
+                    o.optString("via", ""), o.optLong("testedAt", 0L)
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun setOvpnUpdatedAt(t: Long) {
+        ovpnUpdatedAt.value = t
+        sp.edit().putLong("ovpnUpdatedAt", t).apply()
+    }
+
+    fun saveVpnGateCsv(csv: String) {
+        try {
+            java.io.File(appCtx.filesDir, VpnGate.CACHE_FILE).writeText(csv)
+        } catch (e: Exception) {
+        }
+    }
+
+    fun loadVpnGateCsv(): String? = try {
+        java.io.File(appCtx.filesDir, VpnGate.CACHE_FILE).takeIf { it.exists() }?.readText()
+    } catch (e: Exception) {
+        null
+    }
+
+    /** كونفيج .ovpn الكامل لسيرفر من الكاش الخام (يُستخدم عند الاتصال فقط). */
+    fun ovpnConfigB64(key: String): String? {
+        val csv = loadVpnGateCsv() ?: return null
+        for (s in VpnGate.parse(csv)) {
+            if (s.key == key) return s.configB64
+        }
+        return null
     }
 }

@@ -44,7 +44,9 @@ data class AppSettings(
     val allowFilteredDns: Boolean = false,
     val killSwitch: Boolean = false,
     /** استبعاد كونفيجات تعطي IP من نفس دولتك (Anycast قد يعيدك لأقرب سيرفر محلي، فلا يفيد لتخطي الحجب). */
-    val excludeSameCountry: Boolean = true
+    val excludeSameCountry: Boolean = true,
+    /** تفضيل بروتوكول OpenVPN في تبويب VPN: auto / udp / tcp. */
+    val ovpnProto: String = "auto"
 )
 
 data class Status(
@@ -154,6 +156,28 @@ object Exam {
 }
 
 data class ExitInfo(val ip: String, val loc: String, val ms: Int)
+
+/**
+ * سيرفر OpenVPN مجاني من VPNGate (يُحفظ منه الوصف فقط، والكونفيج الكامل
+ * Base64 يُحفظ في ملف الكاش لأن حجمه كبير على SharedPreferences).
+ */
+data class OvpnServer(
+    val key: String,
+    val host: String,
+    val ip: String,
+    val country: String,
+    val sessions: Int = 0,
+    val speedMbps: Double = 0.0,
+    val pingAdvertised: Int = -1,
+    val lat: Int = -1,
+    val jitter: Int = 0,
+    val loss: Int = 100,
+    val via: String = "",
+    val testedAt: Long = 0L
+) {
+    val score: Double get() = if (lat < 0) Double.MAX_VALUE else Exam.score(lat, jitter, loss)
+    val tested: Boolean get() = lat >= 0
+}
 
 /**
  * تشخيص النفق طبقة بطبقة (مثل أدوات فحص الشبكة المعتمدة):
