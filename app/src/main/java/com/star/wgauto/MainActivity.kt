@@ -108,7 +108,8 @@ class Actions(
     val restoreSystem: () -> Unit,
     val shutdownAll: () -> Unit,
     val openVpnSettings: () -> Unit,
-    val activateConfig: (String) -> Unit
+    val activateConfig: (String) -> Unit,
+    val startOvpn: (OvpnServer) -> Unit
 )
 
 class MainActivity : ComponentActivity() {
@@ -178,6 +179,12 @@ class MainActivity : ComponentActivity() {
                 withVpnPermission {
                     ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
                     app.engine.connectManual(id)
+                }
+            },
+            // إذن VPN من النظام (مرة واحدة) ثم تشغيل OpenVPN الداخلي — بدونه يفشل establish بصمت
+            startOvpn = { s ->
+                withVpnPermission {
+                    toast(startOvpnInternal(app, s, app.store.settings.value.ovpnProto))
                 }
             }
         )
@@ -2023,7 +2030,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                             fontSize = 12.sp
                         )
                     }
-                    Button(onClick = { toast(startOvpnInternal(app, best, prefer)) }) { Text("اتصال") }
+                    Button(onClick = { a.startOvpn(best) }) { Text("اتصال") }
                 }
             }
             }
@@ -2057,6 +2064,21 @@ fun OvpnTab(app: WgApp, a: Actions) {
             label = { Text("بحث باسم السيرفر أو IP") }, singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
+        }
+
+        // ---- سجل OpenVPN الحي: تشخيص الاتصال داخل التطبيق ----
+        item {
+        val ovpnLog by app.ovpn.logLines.collectAsState()
+        if (ovSt.connecting || ovSt.active || ovpnLog.isNotEmpty()) {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("سجل الاتصال المباشر", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    val tail = ovpnLog.takeLast(6)
+                    if (tail.isEmpty()) Text("بانتظار بدء الاتصال…", fontSize = 12.sp)
+                    else tail.forEach { line -> Text(line, fontSize = 11.sp) }
+                }
+            }
+        }
         }
 
         // ---- DNS وMTU المقترحان من فحص شبكتك ----
@@ -2145,7 +2167,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                 modifier = Modifier.weight(1f)
                             ) { Text("فحص", maxLines = 1) }
                             Button(
-                                onClick = { toast(startOvpnInternal(app, s, prefer)) },
+                                onClick = { a.startOvpn(s) },
                                 modifier = Modifier.weight(1f)
                             ) { Text("اتصال", maxLines = 1) }
                         }

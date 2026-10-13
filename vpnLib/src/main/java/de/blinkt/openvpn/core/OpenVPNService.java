@@ -21,6 +21,7 @@ import android.content.IntentFilter;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ShortcutManager;
+import android.content.pm.ServiceInfo;
 import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.graphics.Color;
@@ -363,7 +364,10 @@ public class OpenVPNService extends VpnService implements StateListener, Callbac
 
             mNotificationManager.notify(notificationId, notification);
 
-            startForeground(notificationId, notification);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                startForeground(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            else
+                startForeground(notificationId, notification);
 
             if (lastChannel != null && !channel.equals(lastChannel)) {
                 // Cancel old notification

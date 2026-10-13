@@ -33,6 +33,8 @@ class OvpnEngine(ctx: Context, private val store: Store) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     val state = MutableStateFlow(OvpnState())
+    /** آخر 30 سطراً من سجل OpenVPN — للتشخيص داخل التطبيق. */
+    val logLines = MutableStateFlow<List<String>>(emptyList())
 
     private val listener = object : VpnStatus.StateListener {
         // ملاحظة: مكتبة ics-openvpn تمرر intent=null عند أول تسجيل (mLastIntent)،
@@ -51,6 +53,16 @@ class OvpnEngine(ctx: Context, private val store: Store) {
         // حماية إقلاع: أي عطل في مكتبة الـ VPN يجب ألا يمنع فتح التطبيق أبداً
         try {
             VpnStatus.addStateListener(listener)
+            VpnStatus.addLogListener { item ->
+                scope.launch {
+                    val line = try {
+                        item.getString(appCtx)
+                    } catch (e: Exception) {
+                        item.toString()
+                    }
+                    if (line.isNotBlank()) logLines.value = (logLines.value + line).takeLast(30)
+                }
+            }
         } catch (e: Exception) {
             state.value = OvpnState(statusText = "تعذّر تهيئة OpenVPN")
         }
