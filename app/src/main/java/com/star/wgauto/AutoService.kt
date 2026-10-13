@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -81,6 +82,8 @@ class AutoService : Service() {
     private suspend fun periodicLoop() {
         var tick = 0
         var minutes = 0
+        var lastOvpnRevive = 0L
+        val cm = getSystemService(ConnectivityManager::class.java)
         while (true) {
             delay(15_000)
             tick++
@@ -89,6 +92,22 @@ class AutoService : Service() {
             val s = app.store.settings.value
             if (st.running && st.connected && !st.busy) app.engine.healthCheck()
             if (tick % 4 != 0 || st.busy) continue
+            // حارس OpenVPN الداخلي: إن كان مطلوباً (لم يفصله المستخدم) ولا نفق فعلياً، أحيِه.
+            // يعالج موت العملية من قاتل الذاكرة/البطارية: الخدمتان لاصقتان وتعيدان بعضهما.
+            if (s.ovpnAutoReconnect && !st.running && !app.ovpn.isUp() &&
+                app.store.prefGet("ovpnActive")?.isNotEmpty() == true
+            ) {
+                val anyVpn = try {
+                    NetUtil.all(cm).any { it.isVpn }
+                } catch (e: Exception) {
+                    true // عند الشك لا نتدخل
+                }
+                if (!anyVpn && System.currentTimeMillis() - lastOvpnRevive > 60_000) {
+                    lastOvpnRevive = System.currentTimeMillis()
+                    val msg = app.ovpn.reconnectLast()
+                    if (msg != null) app.engine.log("🛡 $msg")
+                }
+            }
             if (st.running && !st.connected) {
                 // اليدوي: لا إعادة اتصال تلقائية إطلاقاً — المستخدم يشغّل ويفصل بيده
                 if (s.autoConfig) app.engine.autoReselect("إعادة محاولة")

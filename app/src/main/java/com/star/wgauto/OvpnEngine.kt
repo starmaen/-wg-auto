@@ -126,4 +126,31 @@ class OvpnEngine(ctx: Context, private val store: Store) {
     }
 
     fun isUp(): Boolean = state.value.active || state.value.connecting
+
+    /**
+     * إحياء تلقائي: إن كان هناك سيرفر مطلوب (لم يفصله المستخدم) ولا يوجد نفق،
+     * يعيد تشغيله. يُستدعى من حارس AutoService. يعيد رسالة أو null إن لا شيء لفعله.
+     */
+    fun reconnectLast(): String? {
+        val key = store.prefGet("ovpnActive") ?: return null
+        if (key.isEmpty() || isUp()) return null
+        val server = store.ovpn.value.firstOrNull { it.key == key } ?: return null
+        val b64 = store.ovpnConfigB64(key) ?: return null
+        val cfg = VpnGate.decodeConfig(b64) ?: return null
+        val prefer = store.settings.value.ovpnProto
+        return try {
+            OpenVpnApi.startVpn(
+                appCtx, VpnGate.filterConfig(cfg, prefer), "WG Auto • ${server.host}",
+                null, null, emptyList()
+            )
+            val label = "${Country.flag(server.country)} ${server.host}"
+            state.value = OvpnState(
+                connecting = true, serverKey = server.key, serverLabel = label,
+                statusText = "إعادة وصل تلقائية…", startedAt = System.currentTimeMillis()
+            )
+            "أُعيد وصل ${server.host} تلقائياً"
+        } catch (e: Exception) {
+            null
+        }
+    }
 }

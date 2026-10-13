@@ -2010,6 +2010,30 @@ fun OvpnTab(app: WgApp, a: Actions) {
         }
         }
 
+        // ---- ثبات الاتصال: البطارية + إحياء تلقائي ----
+        item {
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("🛡 ثبات الاتصال", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(
+                    "أندرويد يقتل التطبيقات في الخلفية لتوفير البطارية/الذاكرة. خطوتان تمنعان الفصل بعد دقائق:",
+                    fontSize = 11.sp
+                )
+                OutlinedButton(
+                    onClick = { a.batteryExempt() },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("استثناء التطبيق من توفير البطارية") }
+                SwitchRow("إعادة الوصل تلقائياً إن أسقطه النظام", settings.ovpnAutoReconnect) { v ->
+                    app.store.updateSettings { it.copy(ovpnAutoReconnect = v) }
+                }
+                Text(
+                    "نصيحة للجهاز: اقفل التطبيق في شاشة التطبيقات الأخيرة (القفل 🔒) وفعّل التشغيل التلقائي من إعدادات البطارية.",
+                    fontSize = 11.sp
+                )
+            }
+        }
+        }
+
         // ---- الاختيار التلقائي: الأفضل بضغطة ----
         if (best != null) {
             item {

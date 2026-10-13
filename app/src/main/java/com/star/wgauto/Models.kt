@@ -46,7 +46,9 @@ data class AppSettings(
     /** استبعاد كونفيجات تعطي IP من نفس دولتك (Anycast قد يعيدك لأقرب سيرفر محلي، فلا يفيد لتخطي الحجب). */
     val excludeSameCountry: Boolean = true,
     /** تفضيل بروتوكول OpenVPN في تبويب VPN: auto / udp / tcp. */
-    val ovpnProto: String = "auto"
+    val ovpnProto: String = "auto",
+    /** إعادة وصل OpenVPN تلقائياً إن أسقطه النظام (موت العملية/الذاكرة). */
+    val ovpnAutoReconnect: Boolean = true
 )
 
 data class Status(

@@ -104,6 +104,7 @@ class Store(ctx: Context) {
             .put("useRoot", s.useRoot).put("backgroundScan", s.backgroundScan).put("applyRoot", s.applyRoot)
             .put("allowFilteredDns", s.allowFilteredDns).put("killSwitch", s.killSwitch)
             .put("excludeSameCountry", s.excludeSameCountry).put("ovpnProto", s.ovpnProto)
+            .put("ovpnAutoReconnect", s.ovpnAutoReconnect)
         sp.edit().putString("settings", o.toString()).apply()
     }
 
@@ -123,7 +124,8 @@ class Store(ctx: Context) {
                 o.optBoolean("allowFilteredDns", d.allowFilteredDns),
                 o.optBoolean("killSwitch", d.killSwitch),
                 o.optBoolean("excludeSameCountry", d.excludeSameCountry),
-                o.optString("ovpnProto", "auto").takeIf { it in listOf("auto", "udp", "tcp") } ?: "auto"
+                o.optString("ovpnProto", "auto").takeIf { it in listOf("auto", "udp", "tcp") } ?: "auto",
+                o.optBoolean("ovpnAutoReconnect", true)
             )
         } catch (e: Exception) {
             AppSettings()
