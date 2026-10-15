@@ -41,6 +41,7 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
     var provider by remember { mutableStateOf(app.store.prefGet("aiProvider") ?: AIClient.PROVIDER_POLLINATIONS) }
     var apiKey by remember { mutableStateOf(app.store.prefGet("aiKey") ?: "") }
     var aiModel by remember { mutableStateOf(app.store.prefGet("aiModel") ?: AIClient.DEFAULT_GEMINI_MODEL) }
+    var baseUrl by remember { mutableStateOf(app.store.prefGet("aiBaseUrl") ?: "") }
     var busy by remember { mutableStateOf(false) }
     var answer by remember { mutableStateOf("") }
     var isError by remember { mutableStateOf(false) }
@@ -62,25 +63,59 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                 )
                 Picker(
                     "المزود",
-                    if (provider == AIClient.PROVIDER_GEMINI) "Gemini (بمفتاحك)" else "مجاني بلا مفتاح",
+                    when (provider) {
+                        AIClient.PROVIDER_GEMINI -> "Gemini (بمفتاحك)"
+                        AIClient.PROVIDER_CUSTOM -> "خدمتي (رابط مخصص)"
+                        else -> "مجاني بلا مفتاح"
+                    },
                     listOf(
                         AIClient.PROVIDER_POLLINATIONS to "مجاني بلا مفتاح",
-                        AIClient.PROVIDER_GEMINI to "Gemini (بمفتاحك)"
+                        AIClient.PROVIDER_GEMINI to "Gemini (بمفتاحك)",
+                        AIClient.PROVIDER_CUSTOM to "خدمتي: Muse Spark وغيرها (رابط مخصص)"
                     )
                 ) { v ->
                     provider = v
                     app.store.prefPut("aiProvider", v)
                 }
-                if (provider == AIClient.PROVIDER_GEMINI) {
-                    Picker(
-                        "نموذج Gemini",
-                        aiModel,
-                        AIClient.GEMINI_MODELS.map { it to it }
-                    ) { v -> aiModel = v; app.store.prefPut("aiModel", v) }
+                if (provider == AIClient.PROVIDER_CUSTOM) {
+                    OutlinedTextField(
+                        value = baseUrl,
+                        onValueChange = { baseUrl = it.trim(); app.store.prefPut("aiBaseUrl", baseUrl) },
+                        label = { Text("رابط الـ API (مثال: https://.../v1)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                if (provider == AIClient.PROVIDER_GEMINI || provider == AIClient.PROVIDER_CUSTOM) {
+                    Text(
+                        if (provider == AIClient.PROVIDER_GEMINI) "النموذج (اختر أو اكتب أي اسم):"
+                        else "اسم الموديل كما في خدمتك تماماً (مثل 3.5-flash):",
+                        fontSize = 12.sp
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        AIClient.GEMINI_MODELS.forEach { m ->
+                            OutlinedButton(
+                                onClick = { aiModel = m; app.store.prefPut("aiModel", m) },
+                                modifier = Modifier.weight(1f)
+                            ) { Text(m.substringAfter("gemini-").take(12), maxLines = 1, fontSize = 11.sp) }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = aiModel,
+                        onValueChange = { aiModel = it.trim(); app.store.prefPut("aiModel", aiModel) },
+                        label = { Text("اسم الموديل (حر — اكتب أي اسم تقبله خدمتك)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                     OutlinedTextField(
                         value = apiKey,
                         onValueChange = { apiKey = it.trim(); app.store.prefPut("aiKey", apiKey) },
-                        label = { Text("مفتاح Gemini (من aistudio.google.com)") },
+                        label = {
+                            Text(
+                                if (provider == AIClient.PROVIDER_GEMINI) "مفتاح Gemini (من aistudio.google.com)"
+                                else "المفتاح (إن طلبته خدمتك)"
+                            )
+                        },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -97,7 +132,8 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                                     provider, apiKey,
                                     AIClient.systemPrompt(),
                                     AIClient.buildAdvisorPrompt(app),
-                                    aiModel
+                                    aiModel,
+                                    baseUrl
                                 )
                                 answer = r.text
                                 isError = !r.ok
@@ -116,7 +152,8 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                                         app.ovpn.logLines.value.takeLast(10).joinToString("\n")
                                             .ifEmpty { "(لا يوجد سجل بعد)" } +
                                         "\nاشرح باختصار: هل الاتصال سليم؟ وإن لا فما الخطوة التالية؟",
-                                    aiModel
+                                    aiModel,
+                                    baseUrl
                                 )
                                 answer = r.text
                                 isError = !r.ok
@@ -143,7 +180,8 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                                 provider, apiKey,
                                 "أنت محرك اختيار. ترد بسطر JSON واحد فقط بلا أي كلام آخر.",
                                 prompt,
-                                aiModel
+                                aiModel,
+                                baseUrl
                             )
                             if (!r.ok) {
                                 answer = r.text

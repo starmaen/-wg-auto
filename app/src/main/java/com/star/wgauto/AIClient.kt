@@ -15,6 +15,7 @@ import java.net.URLEncoder
 object AIClient {
     const val PROVIDER_GEMINI = "gemini"
     const val PROVIDER_POLLINATIONS = "pollinations"
+    const val PROVIDER_CUSTOM = "custom"
 
     data class Result(val ok: Boolean, val text: String)
 
@@ -27,15 +28,56 @@ object AIClient {
         apiKey: String,
         systemPrompt: String,
         userPrompt: String,
-        model: String = DEFAULT_GEMINI_MODEL
+        model: String = DEFAULT_GEMINI_MODEL,
+        baseUrl: String = ""
     ): Result = withContext(Dispatchers.IO) {
         try {
             when (provider) {
                 PROVIDER_GEMINI -> askGemini(apiKey.trim(), model, systemPrompt, userPrompt)
+                PROVIDER_CUSTOM -> askOpenAICompatible(baseUrl.trim(), apiKey.trim(), model, systemPrompt, userPrompt)
                 else -> askPollinations(systemPrompt, userPrompt)
             }
         } catch (e: Exception) {
             Result(false, "تعذّر الاتصال بخدمة الذكاء: ${(e.message ?: "").take(120)}")
+        }
+    }
+
+    /** أي خدمة بنمط OpenAI (Muse Spark / Grok / Qwen / OpenRouter...): يقرأ الرابط والموديل كما تكتبهما. */
+    private fun askOpenAICompatible(baseUrl: String, apiKey: String, model: String, system: String, user: String): Result {
+        if (baseUrl.isEmpty()) return Result(false, "أدخل رابط الـ API الخاص بخدمتك أولاً")
+        if (model.isEmpty()) return Result(false, "أدخل اسم الموديل كما يظهر في خدمتك (مثل 3.5-flash)")
+        val root = baseUrl.trimEnd('/')
+        val url = URL(if (root.endsWith("/chat/completions")) root else "$root/chat/completions")
+        val body = JSONObject()
+            .put("model", model.trim())
+            .put("temperature", 0.3)
+            .put("max_tokens", 600)
+            .put(
+                "messages", org.json.JSONArray()
+                    .put(JSONObject().put("role", "system").put("content", system))
+                    .put(JSONObject().put("role", "user").put("content", user))
+            ).toString()
+        val c = (url.openConnection() as HttpURLConnection).apply {
+            connectTimeout = 25000; readTimeout = 60000
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            if (apiKey.isNotEmpty()) setRequestProperty("Authorization", "Bearer $apiKey")
+            doOutput = true
+        }
+        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val code = c.responseCode
+        val raw = ((if (code in 200..299) c.inputStream else c.errorStream)
+            ?.bufferedReader()?.use { it.readText() } ?: "")
+        c.disconnect()
+        if (code !in 200..299)
+            return Result(false, "الخدمة ردت بخطأ $code: ${raw.take(200)}")
+        return try {
+            val text = JSONObject(raw)
+                .optJSONArray("choices")?.optJSONObject(0)
+                ?.optJSONObject("message")?.optString("content", "")?.trim() ?: ""
+            if (text.isEmpty()) Result(false, "رد فارغ من الخدمة") else Result(true, text)
+        } catch (e: Exception) {
+            Result(false, "تعذّر فهم رد الخدمة")
         }
     }
 
