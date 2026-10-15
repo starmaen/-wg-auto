@@ -29,3 +29,15 @@ jobs:
           name: WGAuto-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      # رابط مباشر ثابت للتحميل (أنسب للهاتف والحظر الجغرافي من صفحة Artifacts)
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "WG Auto — أحدث نسخة"
+          body: "تُحدَّث تلقائياً مع كل بناء ناجح. حمّل WG-Auto.apk وثبّته."
+          files: app/build/outputs/apk/debug/*.apk
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
