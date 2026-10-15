@@ -1294,6 +1294,7 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                     val cm = CookieManager.getInstance()
                     cm.setAcceptCookie(true)
                     cm.setAcceptThirdPartyCookies(this, true)
+                    val wv = this
                     webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
@@ -1313,7 +1314,6 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                             }
                         }
                     }
-                    val wv = this
                     addJavascriptInterface(object {
                         @JavascriptInterface
                         fun onBlob(text: String) {
