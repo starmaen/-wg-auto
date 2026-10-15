@@ -764,6 +764,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
     val st by app.engine.status.collectAsState()
     var showPaste by remember { mutableStateOf(false) }
     var webServer by remember { mutableStateOf<VpnBook.Server?>(null) }
+    var webProton by remember { mutableStateOf(false) }
 
     // شاشة المولد الداخلي تحتل التبويب كاملاً (إنجاز: توليد وتنزيل دون مغادرة التطبيق)
     if (webServer != null) {
@@ -772,6 +773,17 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             app = app,
             hint = "اختر في الصفحة: ${Country.label(ws.country)} ${ws.label} — المنفذ 443",
             onClose = { webServer = null }
+        )
+        return
+    }
+    if (webProton) {
+        VpnBookWebView(
+            app = app,
+            title = "تحميل Proton داخل التطبيق",
+            url = "https://account.protonvpn.com/downloads",
+            namePrefix = "proton",
+            hint = "سجّل الدخول بحسابك المجاني ← Downloads ← اختر WireGuard لأخف سيرفر — الملف يُستورد تلقائياً لقائمتك",
+            onClose = { webProton = false }
         )
         return
     }
@@ -799,7 +811,11 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             onClick = { showProton = true },
             modifier = Modifier.fillMaxWidth()
         ) { Text("🇨🇭 خوادم Proton المجانية (خروج أجنبي)") }
-        if (showProton) ProtonDialog(app, onClose = { showProton = false })
+        if (showProton) ProtonDialog(
+            app,
+            onClose = { showProton = false },
+            onOpenInApp = { showProton = false; webProton = true }
+        )
         var showBook by remember { mutableStateOf(false) }
         OutlinedButton(
             onClick = { showBook = true },
@@ -949,7 +965,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
 }
 
 @Composable
-fun ProtonDialog(app: WgApp, onClose: () -> Unit) {
+fun ProtonDialog(app: WgApp, onClose: () -> Unit, onOpenInApp: () -> Unit = {}) {
     val ctx = LocalContext.current
     var list by remember { mutableStateOf(ProtonServers.cache) }
     var loading by remember { mutableStateOf(false) }
@@ -993,8 +1009,12 @@ fun ProtonDialog(app: WgApp, onClose: () -> Unit) {
                             } catch (e: Exception) { }
                         },
                         modifier = Modifier.weight(1f)
-                    ) { Text("فتح تحميل Proton") }
+                    ) { Text("فتح خارجي", maxLines = 1) }
                 }
+                Button(
+                    onClick = { onOpenInApp() },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("فتح تحميل Proton داخل التطبيق") }
                 if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                 if (list.isEmpty() && !loading) Text("لا توجد بيانات بعد — اضغط تحديث القائمة", fontSize = 12.sp)
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1120,6 +1140,14 @@ fun VpnBookDialog(onClose: () -> Unit, onImport: () -> Unit, onOpenInApp: (VpnBo
 
 @Composable
 fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
+    VpnBookWebView(
+        app = app, title = "مولد VPNBook داخل التطبيق", url = VpnBook.GEN_URL,
+        namePrefix = "vpnbook", hint = hint, onClose = onClose
+    )
+}
+
+@Composable
+fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, hint: String, onClose: () -> Unit) {
     var statusMsg by remember { mutableStateOf("") }
     var downloading by remember { mutableStateOf(false) }
     var webRef by remember { mutableStateOf<WebView?>(null) }
@@ -1162,7 +1190,7 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                     msg = "لم أجد كونفيج في الصفحة بعد — انتظر ظهوره ثم اضغط التقاط مجدداً"
                 } else {
                     val cleanName = fnameHint.substringAfterLast('/').substringAfterLast('\\')
-                        .substringBeforeLast('.').ifBlank { "vpnbook-${System.currentTimeMillis()}" }
+                        .substringBeforeLast('.').ifBlank { "$namePrefix-${System.currentTimeMillis()}" }
                     val err = app.engine.addConfig(cleanName, text)
                     msg = if (err == null) "✔ تم إدخال $cleanName في قائمة الكونفيجات (ارجع وافحصه)"
                     else "✗ $err"
@@ -1185,7 +1213,7 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
         ) {
             OutlinedButton(onClick = onClose) { Text("رجوع ✕") }
             Column(Modifier.weight(1f)) {
-                Text("مولد VPNBook داخل التطبيق", fontWeight = FontWeight.Bold, maxLines = 1)
+                Text(title, fontWeight = FontWeight.Bold, maxLines = 1)
                 Text(hint, fontSize = 12.sp, maxLines = 2)
             }
         }
@@ -1218,7 +1246,7 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
             OutlinedButton(
                 onClick = {
                     try {
-                        ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(VpnBook.GEN_URL)))
+                        ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
                     } catch (_: Exception) { }
                 },
                 modifier = Modifier.weight(1f)
@@ -1247,7 +1275,7 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                     addJavascriptInterface(object {
                         @JavascriptInterface
                         fun onBlob(text: String) {
-                            importFromJs(text, "vpnbook-${System.currentTimeMillis()}.conf")
+                            importFromJs(text, "$namePrefix-${System.currentTimeMillis()}.conf")
                         }
                         @JavascriptInterface
                         fun onError(err: String) {
@@ -1293,7 +1321,7 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                                     }
                                     if (text.contains("[Interface]") && text.contains("[Peer]")) {
                                         val err = app.engine.addConfig(
-                                            "vpnbook-${System.currentTimeMillis()}", text
+                                            "$namePrefix-${System.currentTimeMillis()}", text
                                         )
                                         msg = if (err == null) "✔ تم إدخال الكونفيج في القائمة (ارجع وافحصه)"
                                         else "✗ $err"
@@ -1324,7 +1352,7 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                                 conn.disconnect()
                                 if (code in 200..299 && text.contains("[Interface]") && text.contains("[Peer]")) {
                                     var fname = Regex("filename=\"?([^\";]+)\"?").find(contentDisposition ?: "")
-                                        ?.groupValues?.getOrNull(1) ?: "vpnbook-${System.currentTimeMillis()}.conf"
+                                        ?.groupValues?.getOrNull(1) ?: "$namePrefix-${System.currentTimeMillis()}.conf"
                                     fname = fname.substringAfterLast('/').substringAfterLast('\\')
                                     val err = app.engine.addConfig(fname.substringBeforeLast('.'), text)
                                     msg = if (err == null) "✔ تم إدخال $fname في قائمة الكونفيجات (ارجع وافحصه)"
@@ -1341,7 +1369,7 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
                             }
                         }
                     }
-                    loadUrl(VpnBook.GEN_URL)
+                    loadUrl(url)
                 }
             },
             onRelease = { webRef = null; it.destroy() },
