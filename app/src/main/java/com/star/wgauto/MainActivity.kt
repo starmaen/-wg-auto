@@ -13,6 +13,8 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.widget.Toast
 import androidx.compose.ui.viewinterop.AndroidView
 import java.net.HttpURLConnection
@@ -189,6 +191,10 @@ class MainActivity : ComponentActivity() {
             }
         )
         syncService()
+        if (app.store.settings.value.autoPurgeExpired) {
+            val n = app.store.purgeExpiredConfigs()
+            if (n > 0) toast("حُذفت $n كونفيجات منتهية الصلاحية تلقائياً — ولّد بديلاً من VPNBook")
+        }
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkScheme else lightScheme) {
                 CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
@@ -1257,6 +1263,18 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                 },
                 modifier = Modifier.weight(1f)
             ) { Text("فتح خارجي", maxLines = 1) }
+            OutlinedButton(
+                onClick = {
+                    val wv = webRef
+                    if (wv == null) statusMsg = "المتصفح لم يجهز بعد"
+                    else {
+                        downloading = true
+                        statusMsg = ""
+                        wv.reload()
+                    }
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("↻ تحميل", maxLines = 1) }
         }
         if (statusMsg.isNotEmpty() || downloading) {
             Text(
@@ -1276,7 +1294,25 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                     val cm = CookieManager.getInstance()
                     cm.setAcceptCookie(true)
                     cm.setAcceptThirdPartyCookies(this, true)
-                    webViewClient = WebViewClient()
+                    webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            wv.post {
+                                if (downloading) downloading = false
+                            }
+                        }
+                        override fun onReceivedError(
+                            view: WebView?, request: WebResourceRequest?,
+                            error: WebResourceError?
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                wv.post {
+                                    downloading = false
+                                    statusMsg = "تعذّر تحميل الصفحة (${error?.description ?: "خطأ شبكة"}) — تحقق من الإنترنت ثم ↻ تحميل، أو افتح خارجياً"
+                                }
+                            }
+                        }
+                    }
                     val wv = this
                     addJavascriptInterface(object {
                         @JavascriptInterface
@@ -1571,6 +1607,13 @@ fun SettingsTab(app: WgApp, a: Actions) {
         OutlinedButton(onClick = a.batteryExempt, modifier = Modifier.fillMaxWidth()) {
             Text("استثناء التطبيق من توفير الطاقة")
         }
+        SwitchRow("حذف الكونفيجات المنتهية تلقائياً عند الفتح", s.autoPurgeExpired) { v ->
+            upd { it.copy(autoPurgeExpired = v) }
+        }
+        Text(
+            "كونفيجات VPNBook تنتهي بعد 7 أيام — تُحذف وحدها عند فتح التطبيق (ولّد بديلاً من زر VPNBook).",
+            fontSize = 12.sp
+        )
         Text(
             "MTU النفق = أقصى حزمة تصل للخادم − 60 بايت (IPv4) أو − 80 بايت (IPv6).",
             fontSize = 12.sp

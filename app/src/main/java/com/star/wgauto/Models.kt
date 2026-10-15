@@ -48,7 +48,9 @@ data class AppSettings(
     /** تفضيل بروتوكول OpenVPN في تبويب VPN: auto / udp / tcp. */
     val ovpnProto: String = "auto",
     /** إعادة وصل OpenVPN تلقائياً إن أسقطه النظام (موت العملية/الذاكرة). */
-    val ovpnAutoReconnect: Boolean = true
+    val ovpnAutoReconnect: Boolean = true,
+    /** حذف كونفيجات VPNBook المنتهية (7 أيام) تلقائياً عند فتح التطبيق. */
+    val autoPurgeExpired: Boolean = true
 )
 
 data class Status(

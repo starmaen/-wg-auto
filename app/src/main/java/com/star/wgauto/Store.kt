@@ -105,6 +105,7 @@ class Store(ctx: Context) {
             .put("allowFilteredDns", s.allowFilteredDns).put("killSwitch", s.killSwitch)
             .put("excludeSameCountry", s.excludeSameCountry).put("ovpnProto", s.ovpnProto)
             .put("ovpnAutoReconnect", s.ovpnAutoReconnect)
+            .put("autoPurgeExpired", s.autoPurgeExpired)
         sp.edit().putString("settings", o.toString()).apply()
     }
 
@@ -125,7 +126,8 @@ class Store(ctx: Context) {
                 o.optBoolean("killSwitch", d.killSwitch),
                 o.optBoolean("excludeSameCountry", d.excludeSameCountry),
                 o.optString("ovpnProto", "auto").takeIf { it in listOf("auto", "udp", "tcp") } ?: "auto",
-                o.optBoolean("ovpnAutoReconnect", true)
+                o.optBoolean("ovpnAutoReconnect", true),
+                o.optBoolean("autoPurgeExpired", true)
             )
         } catch (e: Exception) {
             AppSettings()
@@ -220,6 +222,16 @@ class Store(ctx: Context) {
         } catch (e: Exception) {
             emptyList()
         }
+    }
+
+    /** يحذف الكونفيجات المنتهية الصلاحية نهائياً. يعيد عدد المحذوفات. */
+    fun purgeExpiredConfigs(): Int {
+        val now = System.currentTimeMillis()
+        val expired = configs.value.filter { VpnBook.expired(it.expiresAt, now) }
+        if (expired.isEmpty()) return 0
+        val ids = expired.map { it.id }.toSet()
+        updateConfigs { l -> l.filter { it.id !in ids } }
+        return expired.size
     }
 
     fun setOvpnUpdatedAt(t: Long) {

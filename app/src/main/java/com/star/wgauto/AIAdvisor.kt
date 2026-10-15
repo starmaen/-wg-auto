@@ -40,6 +40,7 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
     val scope = rememberCoroutineScope()
     var provider by remember { mutableStateOf(app.store.prefGet("aiProvider") ?: AIClient.PROVIDER_POLLINATIONS) }
     var apiKey by remember { mutableStateOf(app.store.prefGet("aiKey") ?: "") }
+    var aiModel by remember { mutableStateOf(app.store.prefGet("aiModel") ?: AIClient.DEFAULT_GEMINI_MODEL) }
     var busy by remember { mutableStateOf(false) }
     var answer by remember { mutableStateOf("") }
     var isError by remember { mutableStateOf(false) }
@@ -71,6 +72,11 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                     app.store.prefPut("aiProvider", v)
                 }
                 if (provider == AIClient.PROVIDER_GEMINI) {
+                    Picker(
+                        "نموذج Gemini",
+                        aiModel,
+                        AIClient.GEMINI_MODELS.map { it to it }
+                    ) { v -> aiModel = v; app.store.prefPut("aiModel", v) }
                     OutlinedTextField(
                         value = apiKey,
                         onValueChange = { apiKey = it.trim(); app.store.prefPut("aiKey", apiKey) },
@@ -90,7 +96,8 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                                 val r = AIClient.ask(
                                     provider, apiKey,
                                     AIClient.systemPrompt(),
-                                    AIClient.buildAdvisorPrompt(app)
+                                    AIClient.buildAdvisorPrompt(app),
+                                    aiModel
                                 )
                                 answer = r.text
                                 isError = !r.ok
@@ -108,7 +115,8 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                                     "سجل OpenVPN الأخير:\n" +
                                         app.ovpn.logLines.value.takeLast(10).joinToString("\n")
                                             .ifEmpty { "(لا يوجد سجل بعد)" } +
-                                        "\nاشرح باختصار: هل الاتصال سليم؟ وإن لا فما الخطوة التالية؟"
+                                        "\nاشرح باختصار: هل الاتصال سليم؟ وإن لا فما الخطوة التالية؟",
+                                    aiModel
                                 )
                                 answer = r.text
                                 isError = !r.ok
@@ -134,7 +142,8 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                             val r = AIClient.ask(
                                 provider, apiKey,
                                 "أنت محرك اختيار. ترد بسطر JSON واحد فقط بلا أي كلام آخر.",
-                                prompt
+                                prompt,
+                                aiModel
                             )
                             if (!r.ok) {
                                 answer = r.text

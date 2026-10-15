@@ -18,15 +18,20 @@ object AIClient {
 
     data class Result(val ok: Boolean, val text: String)
 
+    /** نماذج Gemini المتاحة للاختيار (الأحدث أولاً). */
+    val GEMINI_MODELS = listOf("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash")
+    const val DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
     suspend fun ask(
         provider: String,
         apiKey: String,
         systemPrompt: String,
-        userPrompt: String
+        userPrompt: String,
+        model: String = DEFAULT_GEMINI_MODEL
     ): Result = withContext(Dispatchers.IO) {
         try {
             when (provider) {
-                PROVIDER_GEMINI -> askGemini(apiKey.trim(), systemPrompt, userPrompt)
+                PROVIDER_GEMINI -> askGemini(apiKey.trim(), model, systemPrompt, userPrompt)
                 else -> askPollinations(systemPrompt, userPrompt)
             }
         } catch (e: Exception) {
@@ -34,9 +39,10 @@ object AIClient {
         }
     }
 
-    private fun askGemini(apiKey: String, system: String, user: String): Result {
+    private fun askGemini(apiKey: String, model: String, system: String, user: String): Result {
         if (apiKey.isEmpty()) return Result(false, "أدخل مفتاح Gemini أولاً (مجاني من aistudio.google.com)")
-        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$apiKey")
+        val m = model.ifBlank { DEFAULT_GEMINI_MODEL }
+        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent?key=$apiKey")
         val body = JSONObject()
             .put("system_instruction", JSONObject().put("parts", org.json.JSONArray().put(JSONObject().put("text", system))))
             .put("contents", org.json.JSONArray().put(JSONObject().put("parts", org.json.JSONArray().put(JSONObject().put("text", user)))))
