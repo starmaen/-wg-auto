@@ -19,9 +19,15 @@ object AIClient {
 
     data class Result(val ok: Boolean, val text: String)
 
-    /** نماذج Gemini المتاحة للاختيار (الأحدث أولاً). */
-    val GEMINI_MODELS = listOf("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash")
-    const val DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+    /** نماذج Gemini الحالية (الأحدث أولاً — تحقق 2026-10). */
+    val GEMINI_MODELS = listOf(
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash"
+    )
+    const val DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 
     suspend fun ask(
         provider: String,
@@ -88,7 +94,7 @@ object AIClient {
         val body = JSONObject()
             .put("system_instruction", JSONObject().put("parts", org.json.JSONArray().put(JSONObject().put("text", system))))
             .put("contents", org.json.JSONArray().put(JSONObject().put("parts", org.json.JSONArray().put(JSONObject().put("text", user)))))
-            .put("generationConfig", JSONObject().put("maxOutputTokens", 600).put("temperature", 0.3))
+            .put("generationConfig", JSONObject().put("maxOutputTokens", 600))
             .toString()
         val c = (url.openConnection() as HttpURLConnection).apply {
             connectTimeout = 25000; readTimeout = 40000

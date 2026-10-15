@@ -1291,6 +1291,12 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                     settings.loadsImagesAutomatically = true
                     settings.builtInZoomControls = true
                     settings.displayZoomControls = false
+                    // بعض المواقع (ومنها بروتون) تعطي صفحة بيضاء عند كشف WebView
+                    // عبر علامة "; wv" — نحذفها ليظهر المتصفح ككروم عادي.
+                    try {
+                        settings.userAgentString =
+                            settings.userAgentString.replace("; wv", "")
+                    } catch (_: Exception) { }
                     val cm = CookieManager.getInstance()
                     cm.setAcceptCookie(true)
                     cm.setAcceptThirdPartyCookies(this, true)
