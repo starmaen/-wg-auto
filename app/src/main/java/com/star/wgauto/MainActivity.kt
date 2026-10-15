@@ -6,12 +6,15 @@ import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.Message
 import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings as AndroidSettings
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
 import android.webkit.WebViewClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -1297,10 +1300,41 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                         settings.userAgentString =
                             settings.userAgentString.replace("; wv", "")
                     } catch (_: Exception) { }
+                    // صفحات الدخول تفتح نوافذ منبثقة — بدون هذا تبقى الشاشة بيضاء.
+                    // نحمّلها في نفس المتصفح ونعرض أخطاء وحدة التحكم للتشخيص.
+                    try {
+                        settings.setSupportMultipleWindows(true)
+                        settings.javaScriptCanOpenWindowsAutomatically = true
+                    } catch (_: Exception) { }
                     val cm = CookieManager.getInstance()
                     cm.setAcceptCookie(true)
                     cm.setAcceptThirdPartyCookies(this, true)
                     val wv = this
+                    webChromeClient = object : WebChromeClient() {
+                        override fun onCreateWindow(
+                            view: WebView?, isDialog: Boolean, isUserGesture: Boolean,
+                            resultMsg: Message?
+                        ): Boolean {
+                            val href = view?.hitTestResult?.extra
+                            if (!href.isNullOrBlank()) {
+                                wv.post { wv.loadUrl(href) }
+                                return true
+                            }
+                            return false
+                        }
+
+                        override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
+                            if (msg?.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                                val line = (msg.message() ?: "").take(140)
+                                if (line.isNotBlank()) {
+                                    wv.post {
+                                        statusMsg = "خطأ الصفحة: $line"
+                                    }
+                                }
+                            }
+                            return super.onConsoleMessage(msg)
+                        }
+                    }
                     webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
