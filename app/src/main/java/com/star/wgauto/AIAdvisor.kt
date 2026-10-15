@@ -118,6 +118,37 @@ fun AIAdvisorDialog(app: WgApp, onClose: () -> Unit) {
                         modifier = Modifier.weight(1f)
                     ) { Text("اشرح سجل VPN") }
                 }
+                Button(
+                    onClick = {
+                        if (busy) return@Button
+                        val prompt = AIClient.buildApplyPrompt(app)
+                        if (prompt == null) {
+                            answer = "استورد كونفيجاً وDNS أولاً ثم افحص، وبعدها أطبّق تلقائياً."
+                            isError = true
+                            return@Button
+                        }
+                        busy = true
+                        answer = ""
+                        isError = false
+                        scope.launch {
+                            val r = AIClient.ask(
+                                provider, apiKey,
+                                "أنت محرك اختيار. ترد بسطر JSON واحد فقط بلا أي كلام آخر.",
+                                prompt
+                            )
+                            if (!r.ok) {
+                                answer = r.text
+                                isError = true
+                            } else {
+                                val a = AIClient.applyResult(app, r.text)
+                                answer = a.text
+                                isError = !a.ok
+                            }
+                            busy = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("⚡ اختر وطبّق تلقائياً (يتدخل في الإعدادات)") }
                 if (busy) Text("⏳ يقرأ قياساتك ويسأل…", fontSize = 12.sp)
                 if (answer.isNotEmpty()) {
                     Card(Modifier.fillMaxWidth()) {

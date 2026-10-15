@@ -127,6 +127,69 @@ object AIClient {
         return sb.toString()
     }
 
+    /**
+     * سؤال التطبيق التلقائي: يطلب JSON صارماً فقط بأسماء موجودة فعلاً
+     * ليطبقها التطبيق حرفياً دون تدخل يدوي.
+     */
+    fun buildApplyPrompt(app: WgApp): String? {
+        val cfgs = try { app.store.configs.value.filter { it.enabled } } catch (e: Exception) { emptyList() }
+        val dns = try { app.store.dns.value.filter { it.enabled } } catch (e: Exception) { emptyList() }
+        if (cfgs.isEmpty() || dns.isEmpty()) return null
+        val sb = StringBuilder()
+        sb.appendLine("أجب بسطر JSON واحد فقط بلا أي شرح، بهذا الشكل تماماً:")
+        sb.appendLine("""{"config":"<اسم الكونفيج حرفياً>","dns":"<اسم الـDNS حرفياً>","mtu":1420}""")
+        sb.appendLine("المعادلة: الزمن 50% + الفقد 30% + التذبذب 20% (أقل = أفضل). MTU رقم بين 1000 و1500.")
+        sb.appendLine("كونفيجات WireGuard المتاحة (الاسم | زمن | فقد | تذبذب | خروج):")
+        cfgs.take(12).forEach { c ->
+            val r = try { app.engine.report.value.rows.firstOrNull { it.id == c.id } } catch (e: Exception) { null }
+            sb.appendLine("- ${c.name} | ${r?.latencyMs ?: -1}ms | فقد ${r?.loss ?: -1}% | تذبذب ${r?.jitter ?: -1} | ${r?.exitLoc ?: "غير مفحوص"}")
+        }
+        sb.appendLine("خوادم DNS المتاحة (الاسم | الزمن المقاس):")
+        dns.take(10).forEach { d ->
+            val m = try { app.engine.dnsResults.value[d.id]?.best() } catch (e: Exception) { null }
+            sb.appendLine("- ${d.name} | ${m?.let { "${it.second.median}ms فقد ${it.second.loss}%" } ?: "غير مقاس"}")
+        }
+        val mtu = try { app.engine.netInfo.value.direct?.suggestedMtu ?: 0 } catch (e: Exception) { 0 }
+        if (mtu > 0) sb.appendLine("MTU المقترح من فحص الشبكة: $mtu")
+        return sb.toString()
+    }
+
+    data class Applied(val configName: String?, val dnsName: String?, val mtu: Int?)
+
+    /** يطبق نتيجة JSON على الإعدادات (وضع يدوي ليثبت الاختيار). يعيد وصف ما طُبق. */
+    fun applyResult(app: WgApp, jsonText: String): Result {
+        val o = try {
+            val s = jsonText.trim().substringAfter('{', "").substringBeforeLast('}', "")
+            if (s.isEmpty()) return Result(false, "رد غير مفهوم من الذكاء")
+            JSONObject("{$s}")
+        } catch (e: Exception) {
+            return Result(false, "تعذّر فهم رد الذكاء كـ JSON")
+        }
+        val cfgName = o.optString("config", "").takeIf { it.isNotEmpty() }
+        val dnsName = o.optString("dns", "").takeIf { it.isNotEmpty() }
+        val mtu = o.optInt("mtu", -1).takeIf { it in 1000..1500 }
+        val cfg = cfgName?.let { n -> app.store.configs.value.firstOrNull { it.name == n } }
+            ?: cfgName?.let { n -> app.store.configs.value.firstOrNull { it.name.contains(n, true) || n.contains(it.name, true) } }
+        val dns = dnsName?.let { n -> app.store.dns.value.firstOrNull { it.name == n } }
+            ?: dnsName?.let { n -> app.store.dns.value.firstOrNull { it.name.contains(n, true) || n.contains(it.name, true) } }
+        if (cfg == null && dns == null && mtu == null)
+            return Result(false, "لم يطابق رد الذكاء أي عنصر لديك — جرّب السؤال اليدوي")
+        app.store.updateSettings {
+            var s = it
+            if (cfg != null) s = s.copy(autoConfig = false, selConfigId = cfg.id)
+            if (dns != null) s = s.copy(autoDns = false, selDnsId = dns.id)
+            if (mtu != null) s = s.copy(autoMtu = false, selMtu = mtu)
+            s
+        }
+        // ملاحظة: اختيار OpenVPN يبقى بضغطة من تبويبه (يحتاج إذن VPN لحظياً)
+        val done = listOfNotNull(
+            cfg?.let { "الكونفيج: ${it.name}" },
+            dns?.let { "DNS: ${it.name}" },
+            mtu?.let { "MTU: $it" }
+        ).joinToString(" • ")
+        return Result(true, "✔ طُبق تلقائياً (وضع يدوي ليثبت): $done — اضغط تشغيل في الرئيسية")
+    }
+
     fun systemPrompt(): String =
         "أنت مستشار شبكات VPN داخل تطبيق أندرويد. تجيب بالعربية فقط، باختصار شديد، " +
             "وتختار دائماً بالأرقام المعطاة لا بالتخمين. إن غابت القياسات قل: افحص أولاً ثم اسألني."
