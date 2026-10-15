@@ -826,6 +826,12 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             onImport = { a.importFiles() },
             onOpenInApp = { srv -> showBook = false; webServer = srv }
         )
+        var showAI by remember { mutableStateOf(false) }
+        OutlinedButton(
+            onClick = { showAI = true },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("🧠 مستشار الذكاء: اختر لي أفضل كونفيج وDNS وMTU وسيرفر") }
+        if (showAI) AIAdvisorDialog(app, onClose = { showAI = false })
         var repairMsg by remember { mutableStateOf("") }
         OutlinedButton(
             onClick = {
