@@ -1278,6 +1278,22 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                 },
                 modifier = Modifier.weight(1f)
             ) { Text("↻ تحميل", maxLines = 1) }
+            OutlinedButton(
+                onClick = {
+                    val wv = webRef
+                    if (wv == null) statusMsg = "المتصفح لم يجهز بعد"
+                    else {
+                        try {
+                            CookieManager.getInstance().removeAllCookies(null)
+                            CookieManager.getInstance().flush()
+                            android.webkit.WebStorage.getInstance().deleteAllData()
+                            wv.clearCache(true)
+                        } catch (_: Exception) { }
+                        statusMsg = "مُسحت بيانات المتصفح — أعد التحميل وسجّل من جديد"
+                    }
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("مسح البيانات", maxLines = 1) }
         }
         if (statusMsg.isNotEmpty() || downloading) {
             Text(
@@ -1310,6 +1326,49 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                     cm.setAcceptCookie(true)
                     cm.setAcceptThirdPartyCookies(this, true)
                     val wv = this
+                    // Google/Apple ترفض تسجيل الدخول داخل WebView (سياسة ثابتة) —
+                    // أي رابط دخول خارجي يُفتح في المتصفح تلقائياً بدل البياض.
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            val u = request?.url?.toString() ?: ""
+                            val host = (request?.url?.host ?: "").lowercase()
+                            val externalAuth = host.contains("accounts.google.com") ||
+                                host.contains("appleid.apple.com") ||
+                                host.contains("facebook.com") ||
+                                host.contains("oauth") ||
+                                u.contains("sso")
+                            if (externalAuth) {
+                                try {
+                                    ctx.startActivity(Intent(Intent.ACTION_VIEW, request!!.url))
+                                    wv.post {
+                                        statusMsg = "تسجيل الدخول عبر Google يعمل في المتصفح فقط (قرار Google) — " +
+                                            "سجّل هناك، ثم ادخل هنا بالبريد وكلمة المرور، أو حمّل الملف خارجياً واستورده بزر استيراد"
+                                    }
+                                } catch (_: Exception) { }
+                                return true
+                            }
+                            return false
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            wv.post {
+                                if (downloading) downloading = false
+                            }
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView?, request: WebResourceRequest?,
+                            error: WebResourceError?
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                wv.post {
+                                    downloading = false
+                                    statusMsg = "تعذّر تحميل الصفحة (${error?.description ?: "خطأ شبكة"}) — تحقق من الإنترنت ثم ↻ تحميل، أو افتح خارجياً"
+                                }
+                            }
+                        }
+                    }
                     webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(
                             view: WebView?, isDialog: Boolean, isUserGesture: Boolean,
@@ -1335,25 +1394,7 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                             return super.onConsoleMessage(msg)
                         }
                     }
-                    webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            super.onPageFinished(view, url)
-                            wv.post {
-                                if (downloading) downloading = false
-                            }
-                        }
-                        override fun onReceivedError(
-                            view: WebView?, request: WebResourceRequest?,
-                            error: WebResourceError?
-                        ) {
-                            if (request?.isForMainFrame == true) {
-                                wv.post {
-                                    downloading = false
-                                    statusMsg = "تعذّر تحميل الصفحة (${error?.description ?: "خطأ شبكة"}) — تحقق من الإنترنت ثم ↻ تحميل، أو افتح خارجياً"
-                                }
-                            }
-                        }
-                    }
+
                     addJavascriptInterface(object {
                         @JavascriptInterface
                         fun onBlob(text: String) {
