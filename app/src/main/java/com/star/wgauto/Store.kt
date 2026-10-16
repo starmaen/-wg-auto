@@ -197,7 +197,7 @@ class Store(ctx: Context) {
                     .put("speedMbps", it.speedMbps).put("pingAdvertised", it.pingAdvertised)
                     .put("lat", it.lat).put("jitter", it.jitter).put("loss", it.loss)
                     .put("via", it.via).put("testedAt", it.testedAt).put("lastSeen", it.lastSeen)
-                    .put("stale", it.stale)
+                    .put("stale", it.stale).put("tcp", it.tcp)
             )
         }
         sp.edit().putString("ovpn", a.toString()).apply()
@@ -218,7 +218,8 @@ class Store(ctx: Context) {
                     o.optString("via", ""), o.optLong("testedAt", 0L),
                     // الكاش القديم بلا lastSeen: نعتبره حديثاً ولا نحذفه من أول تحديث
                     o.optLong("lastSeen", System.currentTimeMillis()),
-                    o.optBoolean("stale", false)
+                    o.optBoolean("stale", false),
+                    o.optBoolean("tcp", true)
                 )
             }
         } catch (e: Exception) {

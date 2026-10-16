@@ -181,7 +181,9 @@ data class OvpnServer(
     /** آخر ظهور في قائمة VPNGate — للدمج: نحتفظ بسيرفرات اختفت مؤخراً (حتى 48 ساعة) لتنويع الدول. */
     val lastSeen: Long = System.currentTimeMillis(),
     /** غاب عن آخر تحديث: بلا كونفيج قابل للاتصال — يُعرض رمادياً ولا يُرشَّح للأفضل. */
-    val stale: Boolean = false
+    val stale: Boolean = false,
+    /** يدعم TCP (يعبر الجدران) — يُفضَّل تلقائياً على UDP في الشبكات المقيدة. */
+    val tcp: Boolean = true
 ) {
     val score: Double get() = if (lat < 0) Double.MAX_VALUE else Exam.score(lat, jitter, loss)
     val tested: Boolean get() = lat >= 0

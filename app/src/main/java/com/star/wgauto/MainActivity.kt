@@ -1907,10 +1907,16 @@ suspend fun refreshOvpnServers(app: WgApp): String = withContext(kotlinx.corouti
     app.store.updateOvpn {
         parsed.map { s ->
             val o = old[s.key]
+            val tcpCapable = o?.tcp ?: run {
+                try {
+                    VpnGate.decodeConfig(s.configB64)?.let { VpnGate.hasProto(it, "tcp") } ?: true
+                } catch (e: Exception) { true }
+            }
             OvpnServer(
                 s.key, s.host, s.ip, s.country, s.sessions, s.speedMbps, s.pingAdvertised,
                 lat = o?.lat ?: -1, jitter = o?.jitter ?: 0, loss = o?.loss ?: 100,
-                via = o?.via ?: "", testedAt = o?.testedAt ?: 0L, lastSeen = now, stale = false
+                via = o?.via ?: "", testedAt = o?.testedAt ?: 0L, lastSeen = now, stale = false,
+                tcp = tcpCapable
             )
         } + kept.map { it.copy(stale = true) }
     }
@@ -1941,7 +1947,12 @@ suspend fun examOvpnBest(
         }
     }
     onProgress("")
-    return app.store.ovpn.value.filter { it.tested && it.loss < 100 }.sortedBy { it.score }
+    return app.store.ovpn.value
+        .filter { it.tested && it.loss < 100 && !it.stale && it.sessions < 200 }
+        .sortedWith(
+            if (prefer == "auto") compareBy({ if (it.tcp) 0 else 1 }, { it.score }, { it.sessions })
+            else compareBy({ it.score }, { it.sessions })
+        )
 }
 
 /**
@@ -2006,7 +2017,12 @@ fun OvpnTab(app: WgApp, a: Actions) {
             else -> "حُدّثت قبل ${age / 3_600_000} ساعة"
         }
     }
-    val tested = servers.filter { it.tested && it.loss < 100 && !it.stale }.sortedBy { it.score }
+    // الممتلئ (200+ جلسة) مستبعد من الترشيح — والTCP أولاً في الوضع التلقائي
+    val tested = servers.filter { it.tested && it.loss < 100 && !it.stale && it.sessions < 200 }
+        .sortedWith(
+            if (prefer == "auto") compareBy({ if (it.tcp) 0 else 1 }, { it.score }, { it.sessions })
+            else compareBy({ it.score }, { it.sessions })
+        )
     val best = tested.firstOrNull()
     val topList = tested.take(3)
     val topKeys = topList.map { it.key }.toSet()
@@ -2321,7 +2337,10 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                     fontWeight = FontWeight.Bold, fontSize = 14.sp
                                 )
                                 Text(
-                                    "${Country.name(s.country)} • ${s.ip} • ${s.sessions} جلسة • ${VpnGate.speedText(s.speedMbps)}",
+                                    "${Country.name(s.country)} • ${s.ip} • ${s.sessions} جلسة" +
+                                        (if (s.sessions >= 200) " (ممتلئ — مستبعد)" else "") +
+                                        (if (s.tcp) " • TCP" else " • UDP فقط") +
+                                        " • ${VpnGate.speedText(s.speedMbps)}",
                                     fontSize = 12.sp
                                 )
                             }

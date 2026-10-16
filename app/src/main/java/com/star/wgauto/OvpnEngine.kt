@@ -69,6 +69,23 @@ class OvpnEngine(ctx: Context, private val store: Store) {
 
     private fun applyLevel(level: ConnectionStatus, msg: String) {
         val cur = state.value
+        // فشل سريع (نفق لم يعش دقيقتين): السيرفر لا يصلح — نخفضه ونمسح الطلب
+        // حتى لا يعيد التلقائي والحارس اختياره. (السقوط بعد جلسة طويلة لا يُخفض.)
+        if (level == ConnectionStatus.LEVEL_NOTCONNECTED && cur.serverKey.isNotEmpty() &&
+            System.currentTimeMillis() - cur.startedAt < 120_000 &&
+            !(msg.contains("AUTH_FAILED", true) || msg.contains("auth-failure", true))
+        ) {
+            val now = System.currentTimeMillis()
+            store.updateOvpn { l ->
+                l.map {
+                    if (it.key == cur.serverKey) it.copy(loss = 100, via = "فشل الاتصال", testedAt = now)
+                    else it
+                }
+            }
+            state.value = OvpnState(statusText = "تعذّر هذا السيرفر — جرّب التلقائي مجدداً للذي بعده")
+            store.prefPut("ovpnActive", null)
+            return
+        }
         // رفض الدخول من السيرفر: نخفضه فوراً (فقد 100%) فلا يعود للأول تلقائياً
         if ((msg.contains("AUTH_FAILED", true) || msg.contains("auth-failure", true)) &&
             cur.serverKey.isNotEmpty()

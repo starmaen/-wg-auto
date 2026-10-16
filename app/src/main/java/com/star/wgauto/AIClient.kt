@@ -171,12 +171,16 @@ object AIClient {
         val mtu = try { app.engine.netInfo.value.direct?.suggestedMtu ?: 0 } catch (e: Exception) { 0 }
         sb.appendLine(if (mtu > 0) "MTU المقترح من فحص الشبكة: $mtu" else "لا يوجد MTU مقترح بعد.")
         // OpenVPN
-        val ovpn = try { app.store.ovpn.value.filter { it.tested && it.loss < 100 }.sortedBy { it.score }.take(5) } catch (e: Exception) { emptyList() }
+        val ovpn = try {
+            app.store.ovpn.value.filter { it.tested && it.loss < 100 && !it.stale && it.sessions < 200 }
+                .sortedWith(compareBy({ if (it.tcp) 0 else 1 }, { it.score }, { it.sessions })).take(5)
+        } catch (e: Exception) { emptyList() }
         if (ovpn.isNotEmpty()) {
             sb.appendLine("سيرفرات OpenVPN المفحوصة (المضيف | الدولة | زمن | فقد | سرعة معلنة):")
             ovpn.forEach { s ->
-                sb.appendLine("- ${s.host} | ${s.country} | ${s.lat}ms | فقد ${s.loss}% | ${VpnGate.speedText(s.speedMbps)}")
+                sb.appendLine("- ${s.host} | ${s.country} | ${s.lat}ms | فقد ${s.loss}% | ${s.sessions} جلسة | ${if (s.tcp) "TCP" else "UDP فقط"} | ${VpnGate.speedText(s.speedMbps)}")
             }
+            sb.appendLine("قاعدة: تجنب الممتلئ (200+ جلسة) وفضّل TCP في الشبكات المقيدة.")
         } else sb.appendLine("لا توجد سيرفرات OpenVPN مفحوصة بعد.")
         return sb.toString()
     }
