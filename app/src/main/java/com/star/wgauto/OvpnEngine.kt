@@ -69,6 +69,21 @@ class OvpnEngine(ctx: Context, private val store: Store) {
 
     private fun applyLevel(level: ConnectionStatus, msg: String) {
         val cur = state.value
+        // رفض الدخول من السيرفر: نخفضه فوراً (فقد 100%) فلا يعود للأول تلقائياً
+        if ((msg.contains("AUTH_FAILED", true) || msg.contains("auth-failure", true)) &&
+            cur.serverKey.isNotEmpty()
+        {
+            val now = System.currentTimeMillis()
+            store.updateOvpn { l ->
+                l.map {
+                    if (it.key == cur.serverKey) it.copy(loss = 100, via = "مرفوض الدخول", testedAt = now)
+                    else it
+                }
+            }
+            state.value = OvpnState(statusText = "السيرفر رفض الدخول — اختر سيرفراً آخر (الأول الجديد مقترح بالأعلى)")
+            store.prefPut("ovpnActive", null)
+            return
+        }
         state.value = when (level) {
             ConnectionStatus.LEVEL_CONNECTED ->
                 cur.copy(active = true, connecting = false, statusText = "متصل")
@@ -141,12 +156,16 @@ class OvpnEngine(ctx: Context, private val store: Store) {
         val key = store.prefGet("ovpnActive") ?: return null
         if (key.isEmpty() || isUp()) return null
         val server = store.ovpn.value.firstOrNull { it.key == key } ?: return null
-        val b64 = store.ovpnConfigB64(key) ?: return null
-        val cfg = VpnGate.decodeConfig(b64) ?: return null
+        if (server.stale) {
+            store.prefPut("ovpnActive", null)
+            return null
+        }
         val prefer = store.settings.value.ovpnProto
+        val authPath = java.io.File(appCtx.cacheDir, "ovpn/auth.txt").absolutePath
+        val ready = VpnGate.buildConnectConfig(store, key, prefer, authPath) ?: return null
         return try {
             OpenVpnApi.startVpn(
-                appCtx, VpnGate.filterConfig(cfg, prefer), "WG Auto • ${server.host}",
+                appCtx, ready, "WG Auto • ${server.host}",
                 null, null, emptyList()
             )
             val label = "${Country.flag(server.country)} ${server.host}"

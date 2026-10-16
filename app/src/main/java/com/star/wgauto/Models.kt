@@ -179,7 +179,9 @@ data class OvpnServer(
     val via: String = "",
     val testedAt: Long = 0L,
     /** آخر ظهور في قائمة VPNGate — للدمج: نحتفظ بسيرفرات اختفت مؤخراً (حتى 48 ساعة) لتنويع الدول. */
-    val lastSeen: Long = System.currentTimeMillis()
+    val lastSeen: Long = System.currentTimeMillis(),
+    /** غاب عن آخر تحديث: بلا كونفيج قابل للاتصال — يُعرض رمادياً ولا يُرشَّح للأفضل. */
+    val stale: Boolean = false
 ) {
     val score: Double get() = if (lat < 0) Double.MAX_VALUE else Exam.score(lat, jitter, loss)
     val tested: Boolean get() = lat >= 0

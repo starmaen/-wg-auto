@@ -277,6 +277,52 @@ object VpnGate {
         ).take(n)
     }
 
+    /**
+     * بعض سيرفرات VPNGate التطوعية تطلب دخولاً رغم أن الخدمة بلا تسجيل —
+     * والمفتاح العام الموثق هو vpn/vpn. إن وجد سطر auth-user-pass بلا ملف،
+     * نحقن ملف اعتمادياتنا تلقائياً بدل الفشل الصامت AUTH_FAILED.
+     */
+    fun injectAuth(configText: String, authFilePath: String): String {
+        var hasAuth = false
+        val sb = StringBuilder()
+        for (raw in configText.lines()) {
+            val low = raw.substringBefore('#').trim().lowercase()
+            if (Regex("^auth-user-pass(\\s|$)").containsMatchIn(low)) {
+                hasAuth = true
+                sb.appendLine("auth-user-pass $authFilePath")
+            } else {
+                sb.appendLine(raw)
+            }
+        }
+        return sb.toString()
+    }
+
+    fun needsAuth(configText: String): Boolean {
+        for (raw in configText.lines()) {
+            val low = raw.substringBefore('#').trim().lowercase()
+            if (Regex("^auth-user-pass(\\s|$)").containsMatchIn(low)) return true
+        }
+        return false
+    }
+
+    /** كونفيج الاتصال الجاهز: فك + فلترة بروتوكول + حقن مصادقة. null إن تعذّر. */
+    fun buildConnectConfig(store: Store, serverKey: String, prefer: String, authFilePath: String): String? {
+        val b64 = store.ovpnConfigB64(serverKey) ?: return null
+        val cfg = decodeConfig(b64) ?: return null
+        var out = filterConfig(cfg, prefer)
+        if (needsAuth(out)) {
+            try {
+                val f = java.io.File(authFilePath)
+                f.parentFile?.mkdirs()
+                f.writeText("vpn\nvpn\n")
+            } catch (e: Exception) {
+                return null
+            }
+            out = injectAuth(out, authFilePath)
+        }
+        return out
+    }
+
     fun speedText(mbps: Double): String = when {
         mbps >= 1000 -> "%.1f Gbps".format(mbps / 1000)
         mbps >= 1 -> "%.1f Mbps".format(mbps)

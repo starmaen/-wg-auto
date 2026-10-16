@@ -1910,9 +1910,9 @@ suspend fun refreshOvpnServers(app: WgApp): String = withContext(kotlinx.corouti
             OvpnServer(
                 s.key, s.host, s.ip, s.country, s.sessions, s.speedMbps, s.pingAdvertised,
                 lat = o?.lat ?: -1, jitter = o?.jitter ?: 0, loss = o?.loss ?: 100,
-                via = o?.via ?: "", testedAt = o?.testedAt ?: 0L, lastSeen = now
+                via = o?.via ?: "", testedAt = o?.testedAt ?: 0L, lastSeen = now, stale = false
             )
-        } + kept
+        } + kept.map { it.copy(stale = true) }
     }
     app.store.setOvpnUpdatedAt(now)
     val nCountries = (parsed.map { it.country } + kept.map { it.country }).distinct().size
@@ -1949,13 +1949,14 @@ suspend fun examOvpnBest(
  * ثم يشغّل الكونفيج المفلتر حسب تفضيل البروتوكول عبر المحرك المدمج. يعيد رسالة عرض.
  */
 fun startOvpnInternal(app: WgApp, server: OvpnServer, prefer: String): String {
+    if (server.stale)
+        return "هذا السيرفر غاب عن آخر تحديث — اختر سيرفراً غير موسوم بـ (قديم)"
     if (app.engine.status.value.running) app.engine.stop()
     if (app.ovpn.isUp()) app.ovpn.stop()
-    val b64 = app.store.ovpnConfigB64(server.key)
-        ?: return "هذا السيرفر غاب عن آخر تحديث — حدّث القائمة أو اختر سيرفراً آخر"
-    val cfg = VpnGate.decodeConfig(b64) ?: return "كونفيج تالف — حدّث القائمة"
-    val filtered = VpnGate.filterConfig(cfg, prefer)
-    return app.ovpn.start(server, filtered)
+    val authPath = java.io.File(app.cacheDir, "ovpn/auth.txt").absolutePath
+    val ready = VpnGate.buildConnectConfig(app.store, server.key, prefer, authPath)
+        ?: return "تعذّر تجهيز هذا السيرفر — حدّث القائمة أو اختر سيرفراً آخر"
+    return app.ovpn.start(server, ready)
 }
 
 @Composable
@@ -2005,7 +2006,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
             else -> "حُدّثت قبل ${age / 3_600_000} ساعة"
         }
     }
-    val tested = servers.filter { it.tested && it.loss < 100 }.sortedBy { it.score }
+    val tested = servers.filter { it.tested && it.loss < 100 && !it.stale }.sortedBy { it.score }
     val best = tested.firstOrNull()
     val topList = tested.take(3)
     val topKeys = topList.map { it.key }.toSet()
@@ -2341,7 +2342,13 @@ fun OvpnTab(app: WgApp, a: Actions) {
                             else "لم يُفحص بعد",
                             fontSize = 12.sp
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (s.stale) {
+                            Text(
+                                "⏳ غاب عن آخر تحديث — لا يمكن اتصاله الآن (قد يعود غداً)",
+                                fontSize = 12.sp
+                            )
+                        }
+                        if (!s.stale) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             OutlinedButton(
                                 onClick = {
                                     scope.launch {
