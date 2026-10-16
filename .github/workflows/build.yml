@@ -33,6 +33,11 @@ jobs:
           if-no-files-found: error
 
       # رابط مباشر ثابت للتحميل (أنسب للهاتف والحظر الجغرافي من صفحة Artifacts)
+      - name: Clear old rolling asset
+        run: gh release delete-asset latest app-debug.apk --yes 2>/dev/null || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
