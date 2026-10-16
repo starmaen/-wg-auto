@@ -812,11 +812,22 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             OutlinedButton(onClick = a.testAll, modifier = Modifier.weight(1f)) { Text("فحص الكل", maxLines = 1) }
         }
         val warpStatus by app.engine.warpStatus.collectAsState()
+        val warpPin by app.store.settings.collectAsState()
         OutlinedButton(
             onClick = { app.engine.generateWarp() },
             enabled = warpStatus != "جارٍ التسجيل في WARP…",
             modifier = Modifier.fillMaxWidth()
         ) { Text("توليد كونفيج Cloudflare WARP مجاني") }
+        Picker(
+            "خروج WARP المطلوب",
+            when (warpPin.warpCountry) {
+                "DE" -> "ألمانيا"
+                "FR" -> "فرنسا"
+                "NL" -> "هولندا"
+                else -> "أي أجنبي (غير سوريا)"
+            },
+            listOf("" to "أي أجنبي (غير سوريا)", "DE" to "ألمانيا", "FR" to "فرنسا", "NL" to "هولندا")
+        ) { v -> app.store.updateSettings { it.copy(warpCountry = v) } }
         if (warpStatus.isNotEmpty()) {
             Text(
                 warpStatus, fontSize = 12.sp,
@@ -1824,6 +1835,27 @@ fun SettingsTab(app: WgApp, a: Actions) {
             "كونفيجات VPNBook تنتهي بعد 7 أيام — تُحذف وحدها عند فتح التطبيق (ولّد بديلاً من زر VPNBook).",
             fontSize = 12.sp
         )
+        SwitchRow("حذف سيرفرات VPN الميتة تلقائياً", s.autoPurgeDeadOvpn) { v ->
+            upd { it.copy(autoPurgeDeadOvpn = v) }
+        }
+        Text(
+            "يحذف أي سيرفر ثبت فشله 3 مرات متتالية (فحص/اتصال حقيقي) أو غاب 7 أيام عن قائمة VPNGate — بدل تراكم المئات. لا يحذف النشط حالياً أبداً.",
+            fontSize = 12.sp
+        )
+        Picker(
+            "تثبيت WARP على دولة",
+            when (s.warpCountry) {
+                "DE" -> "🇩🇪 ألمانيا"
+                "FR" -> "فرنسا"
+                "NL" -> "هولندا"
+                else -> "أي أجنبي (غير سوريا)"
+            },
+            listOf("" to "أي أجنبي (غير سوريا)", "DE" to "ألمانيا", "FR" to "فرنسا", "NL" to "هولندا")
+        ) { v -> upd { it.copy(warpCountry = v) } }
+        Text(
+            "WARP يخرج من أقرب مركز Cloudflare — التثبيت يرفض السوري دائماً ويفضّل الدولة المختارة عند توفرها.",
+            fontSize = 12.sp
+        )
         Text(
             "MTU النفق = أقصى حزمة تصل للخادم − 60 بايت (IPv4) أو − 80 بايت (IPv6).",
             fontSize = 12.sp
@@ -2046,7 +2078,7 @@ suspend fun refreshOvpnServers(app: WgApp): String = withContext(kotlinx.corouti
                 s.key, s.host, s.ip, s.country, s.sessions, s.speedMbps, s.pingAdvertised,
                 lat = o?.lat ?: -1, jitter = o?.jitter ?: 0, loss = o?.loss ?: 100,
                 via = o?.via ?: "", testedAt = o?.testedAt ?: 0L, lastSeen = now, stale = false,
-                tcp = tcpCapable
+                tcp = tcpCapable, fails = o?.fails ?: 0
             )
         } + kept.map {
             // VPNBook صالح بملفه المحلي — لا يُعطَّل بتحديث قائمة VPNGate
@@ -2055,8 +2087,9 @@ suspend fun refreshOvpnServers(app: WgApp): String = withContext(kotlinx.corouti
         }
     }
     app.store.setOvpnUpdatedAt(now)
+    val purged = if (app.store.settings.value.autoPurgeDeadOvpn) app.store.purgeDeadOvpn() else 0
     val nCountries = (parsed.map { it.country } + kept.map { it.country }).distinct().size
-    "تم التحديث: ${parsed.size + kept.size} سيرفراً في $nCountries دولة"
+    "تم التحديث: ${parsed.size + kept.size} سيرفراً في $nCountries دولة" + if (purged > 0) " • حُذف $purged ميتاً تلقائياً" else ""
 }
 
 /** يفحص أفضل المرشحين ويحفظ النتائج تدريجياً. يعيد المرتبين (الأفضل أولاً). */
@@ -2075,14 +2108,7 @@ suspend fun examOvpnBest(
     onProgress("فحص ${cands.size} مرشحاً…")
     val now = System.currentTimeMillis()
     VpnGate.examMany(cands, prefer) { key, r ->
-        if (r != null) {
-            app.store.updateOvpn { l ->
-                l.map {
-                    if (it.key == key) it.copy(lat = r.lat, jitter = r.jitter, loss = r.loss, via = r.via, testedAt = now)
-                    else it
-                }
-            }
-        }
+        if (r != null) VpnGate.markOk(app.store, key, r)
     }
     // سيرفرات VPNBook المحلية (vbk-*) تُفحص أيضاً لتترشح للأفضل مثل VPNGate
     val vbk = app.store.ovpn.value.filter { it.key.startsWith("vbk-") && !it.stale }
@@ -2091,14 +2117,10 @@ suspend fun examOvpnBest(
         vbk.forEach { v ->
             val r = try { VpnGate.examStored(app.store, v.key, prefer) } catch (e: Exception) { null }
             if (r != null) {
-                app.store.updateOvpn { l ->
-                    l.map {
-                        if (it.key == v.key) it.copy(
-                            lat = r.lat, jitter = r.jitter, loss = r.loss,
-                            via = r.via, testedAt = System.currentTimeMillis()
-                        ) else it
-                    }
-                }
+                if (r.loss >= 100) VpnGate.bumpFail(app.store, v.key, r.via.ifEmpty { "لا استجابة" })
+                else VpnGate.markOk(app.store, v.key, r)
+            } else {
+                VpnGate.bumpFail(app.store, v.key, "لا استجابة")
             }
         }
     }
@@ -2282,6 +2304,10 @@ fun OvpnTab(app: WgApp, a: Actions) {
                     } else s
                 }
             }
+        }
+        if (app.store.settings.value.autoPurgeDeadOvpn) {
+            val n = app.store.purgeDeadOvpn()
+            if (n > 0) toast("حُذف $n سيرفراً ميتاً تلقائياً (فشل مثبت أو غياب طويل)")
         }
         if (servers.isEmpty()) {
             app.store.loadVpnGateCsv()?.let { csv ->
@@ -2631,17 +2657,11 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                             busy = "فحص ${v.host}…"
                                             val r = VpnGate.examStored(app.store, v.key, prefer)
                                             if (r != null) {
-                                                val now = System.currentTimeMillis()
-                                                app.store.updateOvpn { l ->
-                                                    l.map {
-                                                        if (it.key == v.key) it.copy(
-                                                            lat = r.lat, jitter = r.jitter,
-                                                            loss = r.loss, via = r.via, testedAt = now
-                                                        ) else it
-                                                    }
-                                                }
+                                                if (r.loss >= 100) VpnGate.bumpFail(app.store, v.key, r.via.ifEmpty { "لا استجابة" })
+                                                else VpnGate.markOk(app.store, v.key, r)
                                                 toast("${v.host}: ${r.lat}ms • فقد ${r.loss}%")
                                             } else {
+                                                VpnGate.bumpFail(app.store, v.key, "لا استجابة")
                                                 toast("${v.host}: لا استجابة — جرّب سيرفراً آخر")
                                             }
                                             busy = ""
@@ -2661,17 +2681,11 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                     busy = "فحص ${v.host}…"
                                     val r = VpnGate.examStored(app.store, v.key, prefer)
                                     if (r != null) {
-                                        val now = System.currentTimeMillis()
-                                        app.store.updateOvpn { l ->
-                                            l.map {
-                                                if (it.key == v.key) it.copy(
-                                                    lat = r.lat, jitter = r.jitter,
-                                                    loss = r.loss, via = r.via, testedAt = now
-                                                ) else it
-                                            }
-                                        }
+                                        if (r.loss >= 100) VpnGate.bumpFail(app.store, v.key, r.via.ifEmpty { "لا استجابة" })
+                                        else VpnGate.markOk(app.store, v.key, r)
                                         toast("${v.host}: ${r.lat}ms • فقد ${r.loss}%")
                                     } else {
+                                        VpnGate.bumpFail(app.store, v.key, "لا استجابة")
                                         toast("${v.host}: لا استجابة — جرّب سيرفراً آخر")
                                     }
                                     busy = ""
@@ -2822,17 +2836,11 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                         }
                                         val r = VpnGate.examStored(app.store, s.key, prefer)
                                         if (r != null) {
-                                            val now = System.currentTimeMillis()
-                                            app.store.updateOvpn { l ->
-                                                l.map {
-                                                    if (it.key == s.key) it.copy(
-                                                        lat = r.lat, jitter = r.jitter,
-                                                        loss = r.loss, via = r.via, testedAt = now
-                                                    ) else it
-                                                }
-                                            }
+                                            if (r.loss >= 100) VpnGate.bumpFail(app.store, s.key, r.via.ifEmpty { "لا استجابة" })
+                                            else VpnGate.markOk(app.store, s.key, r)
                                             toast("${s.host}: ${r.lat}ms • فقد ${r.loss}%")
                                         } else {
+                                            VpnGate.bumpFail(app.store, s.key, "لا استجابة")
                                             toast("${s.host}: لا استجابة — جرّب سيرفراً آخر")
                                         }
                                         busy = ""

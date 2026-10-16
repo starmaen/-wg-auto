@@ -105,7 +105,7 @@ class Store(ctx: Context) {
             .put("allowFilteredDns", s.allowFilteredDns).put("killSwitch", s.killSwitch)
             .put("excludeSameCountry", s.excludeSameCountry).put("ovpnProto", s.ovpnProto)
             .put("ovpnAutoReconnect", s.ovpnAutoReconnect)
-            .put("autoPurgeExpired", s.autoPurgeExpired)
+            .put("autoPurgeExpired", s.autoPurgeExpired).put("autoPurgeDeadOvpn", s.autoPurgeDeadOvpn).put("warpCountry", s.warpCountry)
         sp.edit().putString("settings", o.toString()).apply()
     }
 
@@ -127,7 +127,9 @@ class Store(ctx: Context) {
                 o.optBoolean("excludeSameCountry", d.excludeSameCountry),
                 o.optString("ovpnProto", "auto").takeIf { it in listOf("auto", "udp", "tcp") } ?: "auto",
                 o.optBoolean("ovpnAutoReconnect", true),
-                o.optBoolean("autoPurgeExpired", true)
+                o.optBoolean("autoPurgeExpired", true),
+                o.optBoolean("autoPurgeDeadOvpn", true),
+                o.optString("warpCountry", "")
             )
         } catch (e: Exception) {
             AppSettings()
@@ -197,7 +199,7 @@ class Store(ctx: Context) {
                     .put("speedMbps", it.speedMbps).put("pingAdvertised", it.pingAdvertised)
                     .put("lat", it.lat).put("jitter", it.jitter).put("loss", it.loss)
                     .put("via", it.via).put("testedAt", it.testedAt).put("lastSeen", it.lastSeen)
-                    .put("stale", it.stale).put("tcp", it.tcp)
+                    .put("stale", it.stale).put("tcp", it.tcp).put("fails", it.fails)
             )
         }
         sp.edit().putString("ovpn", a.toString()).apply()
@@ -219,12 +221,36 @@ class Store(ctx: Context) {
                     // الكاش القديم بلا lastSeen: نعتبره حديثاً ولا نحذفه من أول تحديث
                     o.optLong("lastSeen", System.currentTimeMillis()),
                     o.optBoolean("stale", false),
-                    o.optBoolean("tcp", true)
+                    o.optBoolean("tcp", true),
+                    o.optInt("fails", 0)
                 )
             }
         } catch (e: Exception) {
             emptyList()
         }
+    }
+
+    /**
+     * حذف تلقائي لسيرفرات OpenVPN الميتة: فشل مثبت (3 فشلات متتالية بفحص/اتصال حقيقي)
+     * أو غياب طويل عن قائمة VPNGate (7 أيام). لا يحذف النشط حالياً أبداً.
+     * يعيد عدد المحذوفات، ويحذف ملفات vpnbook المحلية معها.
+     */
+    fun purgeDeadOvpn(): Int {
+        val activeKey = prefGet("ovpnActive")?.takeIf { it.isNotEmpty() }
+        val now = System.currentTimeMillis()
+        val dead = ovpn.value.filter { s ->
+            if (s.key == activeKey) return@filter false
+            val provenDead = s.tested && s.loss >= 100 && s.fails >= VpnGate.FAIL_DELETE_AFTER
+            val longGone = !s.key.startsWith("vbk-") && now - s.lastSeen > VpnGate.STALE_DELETE_MS
+            provenDead || longGone
+        }
+        if (dead.isEmpty()) return 0
+        val keys = dead.map { it.key }.toSet()
+        dead.filter { it.key.startsWith("vbk-") }.forEach { s ->
+            try { java.io.File(ovpnDir(), "${s.key}.ovpn").delete() } catch (e: Exception) { }
+        }
+        updateOvpn { l -> l.filter { it.key !in keys } }
+        return dead.size
     }
 
     /** يحذف الكونفيجات المنتهية الصلاحية نهائياً. يعيد عدد المحذوفات. */

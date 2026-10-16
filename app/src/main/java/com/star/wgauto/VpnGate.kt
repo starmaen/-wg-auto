@@ -52,6 +52,10 @@ object VpnGate {
 
     /** مدة استبعاد السيرفر الذي فشل اتصاله فعلياً (ساعة). الفحص وحده لا يعيده. */
     const val CONNECT_FAIL_BAN_HOURS = 24L
+    /** حذف مثبت الفشل بعد هذا العدد من الفشلات المتتالية (فحص حقيقي أو اتصال فعلي). */
+    const val FAIL_DELETE_AFTER = 3
+    /** حذف الغائب عن قائمة VPNGate بعد هذه المدة (سيرفرات المتطوعين تموت كثيراً). */
+    const val STALE_DELETE_MS = 7L * 24 * 3600 * 1000
 
     /**
      * سيرفر فشل اتصاله الحقيقي مؤخراً (خُفّض من المحرك بـ «فشل الاتصال» أو
@@ -62,6 +66,28 @@ object VpnGate {
         s.loss >= 100 && s.tested &&
             (s.via == "فشل الاتصال" || s.via == "مرفوض الدخول") &&
             now - s.testedAt < CONNECT_FAIL_BAN_HOURS * 3600 * 1000
+
+    /** يرفع عدّاد الفشل بعد فحص/اتصال فاشل حقيقي (يُصفَّر عند أول نجاح). */
+    fun bumpFail(store: Store, key: String, via: String) {
+        val now = System.currentTimeMillis()
+        store.updateOvpn { l ->
+            l.map {
+                if (it.key == key) it.copy(loss = 100, via = via, testedAt = now, fails = it.fails + 1)
+                else it
+            }
+        }
+    }
+
+    /** يوثّق نجاح فحص/اتصال: يصفّر الفشل ويحفظ القياس. */
+    fun markOk(store: Store, key: String, r: ExamResult) {
+        val now = System.currentTimeMillis()
+        store.updateOvpn { l ->
+            l.map {
+                if (it.key == key) it.copy(lat = r.lat, jitter = r.jitter, loss = r.loss, via = r.via, testedAt = now, fails = 0)
+                else it
+            }
+        }
+    }
 
     // ---------- الجلب والتحليل ----------
 

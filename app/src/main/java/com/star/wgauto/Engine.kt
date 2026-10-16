@@ -259,15 +259,19 @@ class Engine(ctx: Context, private val store: Store) {
                 val prevStatus = status.value
                 var bootstrapped: WgConfig? = null
                 try {
-                    // إن كان هناك نفق آخر يعمل بالفعل، سجّل WARP عبره — يجعل Cloudflare يرى IP
-                    // ذلك النفق بدل IP شبكتك المحلية، فيسجَّل WARP على مركز بيانات دولة مختلفة.
-                    var activeVpn = vpnInfo()?.takeIf { tunnelIsUp() }
+                    // أي نفق VPN نشط (WireGuard أو OpenVPN من تبويب VPN) يصلح للتسجيل عبره:
+                    // يجعل Cloudflare يرى IP ذلك النفق بدل IP شبكتك، فيسجَّل WARP على مركز
+                    // بيانات أجنبي. (سابقاً كان يُشترط نفق WireGuard فقط فكان يتجاهل OpenVPN الأجنبي).
+                    var activeVpn = vpnInfo()
 
-                    // لا يوجد نفق يعمل حالياً: جرّب تشغيل كونفيج ناجح آخر مؤقتاً فقط لتسجيل WARP
-                    // عبره، ثم أعِد الحالة كما كانت. هذا الطريق الوحيد المضمون تقنياً لتفادي حصول
-                    // WARP على عنوان من دولتك (قيد من توجيه Cloudflare Anycast نفسه لا حل برمجي بديل).
+                    // لا يوجد نفق يعمل حالياً: جرّب تشغيل كونفيج أجنبي مثبت مؤقتاً فقط لتسجيل WARP
+                    // عبره، ثم أعِد الحالة كما كانت. الأولوية لكونفيج ثبت فعلياً أنه أجنبي ومفيد،
+                    // ثم أي أجنبي معروف، ثم أول مفعّل — لأن التسجيل المباشر من شبكتك يعطي PoP محلياً.
                     if (activeVpn == null) {
-                        val candidate = store.configs.value.firstOrNull { it.enabled && it.name != "WARP" && !it.name.startsWith("WARP-") }
+                        val enabled = store.configs.value.filter { it.enabled && it.name != "WARP" && !it.name.startsWith("WARP-") }
+                        val candidate = enabled.firstOrNull { it.lastCountryUseful == true && it.lastCountry.isNotBlank() && !it.lastCountry.equals("SY", true) }
+                            ?: enabled.firstOrNull { it.lastCountry.isNotBlank() && !it.lastCountry.equals("SY", true) }
+                            ?: enabled.firstOrNull()
                         if (candidate != null) {
                             warpStatus.value = "لا يوجد نفق نشط — تجربة ${candidate.name} مؤقتاً لتوليد WARP عبره…"
                             val under0 = NetUtil.underlying(NetUtil.all(cm))
@@ -308,7 +312,10 @@ class Engine(ctx: Context, private val store: Store) {
                     val under = NetUtil.underlying(NetUtil.all(cm))
                     val direct = under?.let { Probes.exitInfo(it.network, fast = true) }
                     val directCc = direct?.loc ?: ""
-                    warpStatus.value = "جارٍ تجربة ${WarpGenerator.variants(r).size} عناوين WARP لاختيار خروج أجنبي…"
+                    // التثبيت على دولة واحدة (ألمانيا/فرنسا/هولندا) عند الحاجة — فارغ = أي أجنبي غير سوري
+                    val pin = store.settings.value.warpCountry.uppercase().take(2)
+                    val pinLabel = if (pin.isNotBlank()) Country.label(pin) else "أي دولة أجنبية (غير سوريا)"
+                    warpStatus.value = "جارٍ تجربة ${WarpGenerator.variants(r).size} عناوين WARP — المطلوب: خروج $pinLabel…"
                     // كونفيج مؤقت للفحص (لا نحفظ كل البدائل، فقط الأفضل)
                     val tmpCfg = WgConfig(name = "tmp-warp-probe", text = r.configText)
                     val endpoints = WarpGenerator.variants(r, max = 6)
@@ -343,14 +350,23 @@ class Engine(ctx: Context, private val store: Store) {
                                 log("WARP $ep: TCP ✔ ${p.lat}ms بلا خروج مؤكد — احتياط")
                                 continue
                             }
-                            val cc = p.exit.loc
-                            val foreign = directCc.isEmpty() || cc.isEmpty() || !cc.equals(directCc, true)
-                            log("WARP $ep: ${p.lat}ms • ${Country.ipLine(p.exit.ip, cc)}" + if (!foreign) " (محلي)" else " (أجنبي ★)")
+                            val cc = p.exit.loc.uppercase()
+                            // السوري مرفوض دائماً — حتى لو كان مختلفاً عن الشبكة المباشرة
+                            val isSy = cc == "SY"
+                            val pinnedOk = pin.isNotBlank() && cc == pin
+                            val genericForeign = cc.isNotBlank() && !isSy && (directCc.isEmpty() || !cc.equals(directCc, true))
+                            val foreign = pinnedOk || (pin.isBlank() && genericForeign)
+                            log("WARP $ep: ${p.lat}ms • ${Country.ipLine(p.exit.ip, cc)}" + when {
+                                isSy -> " (سوري ✘ مرفوض)"
+                                foreign -> " (أجنبي ★)"
+                                else -> " (محلي)"
+                            })
                             if (foreign) {
                                 bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
                                 foundForeign = true
-                                break // وجدنا أجنبياً — لا نضيع وقتاً وبيانات أكثر
+                                break // وجدنا المطلوب — لا نضيع وقتاً وبيانات أكثر
                             }
+                            if (isSy) continue // لا نحفظ السوري احتياطاً أبداً
                             if (bestProbe?.vpn == null || bestProbe?.exit == null) {
                                 bestText = r.withEndpoint(ep); bestProbe = p; bestNote = ep
                             } else if (p.lat < bestProbe!!.lat &&
@@ -388,11 +404,12 @@ class Engine(ctx: Context, private val store: Store) {
                             setResult(cfg?.id ?: "", "○ TCP يمر عبر $bestNote (${p.lat}ms) بلا خروج مؤكد — محفوظ، فعّله يدوياً بعد دقائق")
                             warpStatus.value = "○ أُضيف $n — النفق يمرّر TCP لكن بلا خروج مؤكد بعد (المفتاح ينتشر) — فعّله يدوياً بعد دقائق"
                         }
-                        p.sameCountry -> {
-                            setResult(cfg?.id ?: "", "⚠ ${Country.label(p.exit?.loc ?: "")} — نفس دولتك، لا يفيد للحجب لكنه محفوظ للسرعة")
+                        p.exit?.loc.equals("SY", true) || p.sameCountry -> {
+                            val syW = p.exit?.loc.equals("SY", true)
+                            setResult(cfg?.id ?: "", "⚠ ${Country.label(p.exit?.loc ?: "")} — " + (if (syW) "خروج سوري مرفوض، لا يفيد إطلاقاً" else "نفس دولتك، لا يفيد للحجب") + " لكنه محفوظ للسرعة")
                             warpStatus.value =
-                                "⚠ أُضيف $n ${Country.label(p.exit?.loc ?: "")} عبر $bestNote — نفس دولتك فلن يفيد للحجب. " +
-                                    "جرّب: فعّل كونفيجاً أجنبياً أولاً ثم ولّد WARP مجدداً وهو يعمل، أو جرّب مولداً آخر."
+                                "⚠ أُضيف $n ${Country.label(p.exit?.loc ?: "")} عبر $bestNote — " + (if (syW) "سوري ✘" else "نفس دولتك") + ". " +
+                                    "الحل: اتصل بسيرفر ألماني/فرنسي/هولندي من تبويب VPN أولاً ثم ولّد WARP مجدداً وهو يعمل."
                         }
                         else -> {
                             setResult(cfg?.id ?: "", "✓ ${Country.ipLine(p.exit?.ip ?: "", p.exit?.loc ?: "")} • ${p.lat}ms عبر $bestNote")

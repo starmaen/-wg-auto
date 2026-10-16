@@ -75,13 +75,7 @@ class OvpnEngine(ctx: Context, private val store: Store) {
             System.currentTimeMillis() - cur.startedAt < 120_000 &&
             !(msg.contains("AUTH_FAILED", true) || msg.contains("auth-failure", true))
         ) {
-            val now = System.currentTimeMillis()
-            store.updateOvpn { l ->
-                l.map {
-                    if (it.key == cur.serverKey) it.copy(loss = 100, via = "فشل الاتصال", testedAt = now)
-                    else it
-                }
-            }
+            VpnGate.bumpFail(store, cur.serverKey, "فشل الاتصال")
             state.value = OvpnState(statusText = "تعذّر هذا السيرفر — جرّب التلقائي مجدداً للذي بعده")
             store.prefPut("ovpnActive", null)
             return
@@ -90,13 +84,7 @@ class OvpnEngine(ctx: Context, private val store: Store) {
         if ((msg.contains("AUTH_FAILED", true) || msg.contains("auth-failure", true)) &&
             cur.serverKey.isNotEmpty()
         ) {
-            val now = System.currentTimeMillis()
-            store.updateOvpn { l ->
-                l.map {
-                    if (it.key == cur.serverKey) it.copy(loss = 100, via = "مرفوض الدخول", testedAt = now)
-                    else it
-                }
-            }
+            VpnGate.bumpFail(store, cur.serverKey, "مرفوض الدخول")
             // كلمة سر VPNBook أسبوعية: رفض الدخول غالباً يعني انتهاءها —
             // نجلب الجديدة في الخلفية ليعيد المستخدم الاتصال فوراً بلا توليد جديد.
             if (cur.serverKey.startsWith("vbk-")) {

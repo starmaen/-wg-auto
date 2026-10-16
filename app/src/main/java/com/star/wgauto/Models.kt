@@ -50,7 +50,11 @@ data class AppSettings(
     /** إعادة وصل OpenVPN تلقائياً إن أسقطه النظام (موت العملية/الذاكرة). */
     val ovpnAutoReconnect: Boolean = true,
     /** حذف كونفيجات VPNBook المنتهية (7 أيام) تلقائياً عند فتح التطبيق. */
-    val autoPurgeExpired: Boolean = true
+    val autoPurgeExpired: Boolean = true,
+    /** حذف سيرفرات VPN الميتة تلقائياً (3 فشلات متتالية أو غياب 7 أيام عن VPNGate). */
+    val autoPurgeDeadOvpn: Boolean = true,
+    /** تثبيت WARP على دولة خروج واحدة (رمز ISO) — فارغ = أي دولة أجنبية. */
+    val warpCountry: String = ""
 )
 
 data class Status(
@@ -183,7 +187,9 @@ data class OvpnServer(
     /** غاب عن آخر تحديث: بلا كونفيج قابل للاتصال — يُعرض رمادياً ولا يُرشَّح للأفضل. */
     val stale: Boolean = false,
     /** يدعم TCP (يعبر الجدران) — يُفضَّل تلقائياً على UDP في الشبكات المقيدة. */
-    val tcp: Boolean = true
+    val tcp: Boolean = true,
+    /** عدد الفشلات المتتالية (فحص/اتصال) — يُصفَّر عند أول نجاح، والحذف بعد 3. */
+    val fails: Int = 0
 ) {
     val score: Double get() = if (lat < 0) Double.MAX_VALUE else Exam.score(lat, jitter, loss)
     val tested: Boolean get() = lat >= 0
