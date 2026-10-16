@@ -793,7 +793,6 @@ fun ConfigsTab(app: WgApp, a: Actions) {
     val st by app.engine.status.collectAsState()
     var showPaste by remember { mutableStateOf(false) }
     var webServer by remember { mutableStateOf<VpnBook.Server?>(null) }
-    var webProton by remember { mutableStateOf(false) }
 
     // شاشة المولد الداخلي تحتل التبويب كاملاً (إنجاز: توليد وتنزيل دون مغادرة التطبيق)
     if (webServer != null) {
@@ -802,17 +801,6 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             app = app,
             hint = "اختر في الصفحة: ${Country.label(ws.country)} ${ws.label} — المنفذ 443",
             onClose = { webServer = null }
-        )
-        return
-    }
-    if (webProton) {
-        VpnBookWebView(
-            app = app,
-            title = "تحميل Proton داخل التطبيق",
-            url = "https://account.protonvpn.com/downloads",
-            namePrefix = "proton",
-            hint = "سجّل الدخول بحسابك المجاني ← Downloads ← اختر WireGuard لأخف سيرفر — الملف يُستورد تلقائياً لقائمتك",
-            onClose = { webProton = false }
         )
         return
     }
@@ -842,8 +830,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
         ) { Text("🇨🇭 خوادم Proton المجانية (خروج أجنبي)") }
         if (showProton) ProtonDialog(
             app,
-            onClose = { showProton = false },
-            onOpenInApp = { showProton = false; webProton = true }
+            onClose = { showProton = false }
         )
         var showBook by remember { mutableStateOf(false) }
         OutlinedButton(
@@ -1000,7 +987,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
 }
 
 @Composable
-fun ProtonDialog(app: WgApp, onClose: () -> Unit, onOpenInApp: () -> Unit = {}) {
+fun ProtonDialog(app: WgApp, onClose: () -> Unit) {
     val ctx = LocalContext.current
     var list by remember { mutableStateOf(ProtonServers.cache) }
     var loading by remember { mutableStateOf(false) }
@@ -1044,12 +1031,8 @@ fun ProtonDialog(app: WgApp, onClose: () -> Unit, onOpenInApp: () -> Unit = {}) 
                             } catch (e: Exception) { }
                         },
                         modifier = Modifier.weight(1f)
-                    ) { Text("فتح خارجي", maxLines = 1) }
+                    ) { Text("فتح صفحة التحميل (متصفح خارجي)", maxLines = 1) }
                 }
-                Button(
-                    onClick = { onOpenInApp() },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("فتح تحميل Proton داخل التطبيق") }
                 if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                 if (list.isEmpty() && !loading) Text("لا توجد بيانات بعد — اضغط تحديث القائمة", fontSize = 12.sp)
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -2574,20 +2557,25 @@ fun OvpnTab(app: WgApp, a: Actions) {
                     Text("📖 سيرفرات VPNBook المولّدة (${vbkServers.size})", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     vbkServers.forEach { v ->
                         val bannedV = VpnGate.connectFailedRecently(v)
+                        val failedV = v.tested && v.loss >= 100
                         val okV = v.tested && v.loss < 100 && !bannedV
+                        // تباين قوي يعمل في الوضعين الفاتح والداكن: أخضر مشبع = يعمل، أحمر مشبع = فاشل
+                        val bgColor = when {
+                            bannedV || failedV -> Color(0xFFC62828)
+                            okV -> Color(0xFF2E7D32)
+                            else -> null
+                        }
+                        val fgColor = Color.White
                         Card(
                             Modifier.fillMaxWidth(),
-                            colors = when {
-                                bannedV || (v.tested && v.loss >= 100) ->
-                                    CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE))
-                                okV -> CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
-                                else -> CardDefaults.cardColors()
-                            }
+                            colors = if (bgColor != null)
+                                CardDefaults.cardColors(containerColor = bgColor)
+                            else CardDefaults.cardColors()
                         ) {
                         Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 when {
-                                    bannedV || (v.tested && v.loss >= 100) -> "🔴"
+                                    bannedV || failedV -> "🔴"
                                     okV -> "🟢"
                                     else -> "⚪"
                                 },
@@ -2597,17 +2585,52 @@ fun OvpnTab(app: WgApp, a: Actions) {
                             Column(Modifier.weight(1f)) {
                                 Text(
                                     "${Country.flag(v.country)} ${v.host}",
-                                    fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1
+                                    fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1,
+                                    color = if (bgColor != null) fgColor else Color.Unspecified
                                 )
                                 Text(
                                     when {
                                         bannedV -> "🚫 مستبعد: فشل اتصاله مؤخراً — يعود بعد 24 ساعة"
-                                        v.tested -> VpnGate.examText(VpnGate.ExamResult(v.lat, v.jitter, v.loss, v.via))
+                                        failedV -> "🔴 فشل آخر فحص/اتصال — جرّب غيره"
+                                        v.tested -> "🟢 " + VpnGate.examText(VpnGate.ExamResult(v.lat, v.jitter, v.loss, v.via))
                                         else -> "جديد — اضغط فحص ثم اتصال"
                                     },
-                                    fontSize = 11.sp
+                                    fontSize = 11.sp,
+                                    color = if (bgColor != null) Color(0xFFF1F8E9) else Color.Unspecified
                                 )
                             }
+                            if (bgColor != null) {
+                                TextButton(
+                                    onClick = {
+                                        scope.launch {
+                                            busy = "فحص ${v.host}…"
+                                            val r = VpnGate.examStored(app.store, v.key, prefer)
+                                            if (r != null) {
+                                                val now = System.currentTimeMillis()
+                                                app.store.updateOvpn { l ->
+                                                    l.map {
+                                                        if (it.key == v.key) it.copy(
+                                                            lat = r.lat, jitter = r.jitter,
+                                                            loss = r.loss, via = r.via, testedAt = now
+                                                        ) else it
+                                                    }
+                                                }
+                                                toast("${v.host}: ${r.lat}ms • فقد ${r.loss}%")
+                                            } else {
+                                                toast("${v.host}: لا استجابة — جرّب سيرفراً آخر")
+                                            }
+                                            busy = ""
+                                        }
+                                    }
+                                ) { Text("فحص", maxLines = 1, color = fgColor) }
+                                Button(
+                                    onClick = { a.startOvpn(v) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Color.White,
+                                        contentColor = if (failedV || bannedV) Color(0xFFC62828) else Color(0xFF2E7D32)
+                                    )
+                                ) { Text("اتصال", maxLines = 1, fontWeight = FontWeight.Bold) }
+                            } else {
                             TextButton(onClick = {
                                 scope.launch {
                                     busy = "فحص ${v.host}…"
@@ -2630,6 +2653,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                 }
                             }) { Text("فحص", maxLines = 1) }
                             Button(onClick = { a.startOvpn(v) }) { Text("اتصال", maxLines = 1) }
+                            }
                         }
                         }
                     }
