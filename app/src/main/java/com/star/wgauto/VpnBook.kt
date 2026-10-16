@@ -51,17 +51,43 @@ object VpnBook {
             else -> ""
         }
         if (host.endsWith("vpnbook.com", true)) return cc
-        // مضيف IP مباشر لسيرفر VPNBook مستورد: نستدل من الاسم المحفوظ إن أمكن
+        // مضيف IP مباشر: كونفيجات OpenVPN تستخدم IP لا اسم المضيف — نطابق الخريطة الثابتة
+        ipCountry[host.trim()]?.let { return it }
         return cc
+    }
+
+    /** خريطة IP الحالية لسيرفرات VPNBook (تُحل أسماؤها لهذه العناوين — تُحدَّث عند تغيّرها). */
+    private val ipCountry: Map<String, String> = mapOf(
+        "147.135.15.16" to "US", "147.135.37.178" to "US",
+        "144.217.253.149" to "CA", "142.4.216.196" to "CA", "142.4.216.225" to "CA",
+        "145.239.252.205" to "GB", "145.239.255.68" to "GB",
+        "51.75.145.20" to "DE", "51.75.145.220" to "DE",
+        "5.196.64.200" to "FR", "5.196.64.231" to "FR",
+        "54.36.174.134" to "PL", "54.36.174.140" to "PL"
+    )
+
+    /** يستدل الدولة من اسم ملف الكونفيج (vpnbook-de20-tcp443 / us1 / uk2 / fr200 ...). */
+    fun countryOfName(name: String): String {
+        val n = name.lowercase()
+        // euro/eu أولاً قبل المطابقة الجزئية
+        if (n.contains("euro") || Regex("""(^|[^a-z])eu([^a-z]|$)""").containsMatchIn(n)) return "EU"
+        val m = Regex("""(^|[^a-z])(us|ca|uk|de|fr|pl)([0-9]{1,3})?([^a-z]|$)""").find(n)
+        return when (m?.groupValues?.getOrNull(2)) {
+            "us" -> "US"; "ca" -> "CA"; "uk" -> "GB"
+            "de" -> "DE"; "fr" -> "FR"; "pl" -> "PL"
+            else -> ""
+        }
     }
 
     /** هل هذا سيرفر VPNBook-OpenVPN مستورد (مفتاح vbk-...)؟ */
     fun isBookKey(key: String): Boolean = key.startsWith("vbk-")
 
     /** دولة العرض لسيرفر قائمة VPN: المخزنة أولاً ثم الاستدلال من المضيف. */
-    fun displayCountry(host: String, stored: String): String {
+    fun displayCountry(host: String, stored: String, fallbackName: String = ""): String {
         if (stored.isNotBlank()) return stored.uppercase().take(2)
-        return countryOf(host)
+        countryOf(host).takeIf { it.isNotBlank() }?.let { return it }
+        if (fallbackName.isNotBlank()) countryOfName(fallbackName).takeIf { it.isNotBlank() }?.let { return it }
+        return countryOfName(host)
     }
 
     /** بادئة عرض موحدة: 📖 + علم + اسم الدولة — لسيرفرات VPNBook فقط. */

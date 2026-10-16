@@ -193,11 +193,11 @@ class MainActivity : ComponentActivity() {
             startOvpn = { s ->
                 withVpnPermission {
                     val st = app.store
-                    // كلمة سر VPNBook أسبوعية: إن غابت ن/batchنجلبها أولاً بدل الفشل الفوري
-                    if (s.key.startsWith("vbk-") && (st.prefGet("vpnbookPass") ?: "").isEmpty()) {
-                        toast("جارٍ جلب كلمة سر VPNBook…")
+                    // كلمة سر VPNBook تتغير أسبوعياً: جلب طازج قبل كل اتصال يمنع AUTH_FAILED من أول ضغطة
+                    if (s.key.startsWith("vbk-")) {
+                        toast("جارٍ جلب كلمة سر VPNBook ثم الاتصال…")
                         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                            val pwd = VpnBook.fetchPassword()
+                            val pwd = VpnBook.fetchPassword() ?: st.prefGet("vpnbookPass")
                             withContext(kotlinx.coroutines.Dispatchers.Main) {
                                 if (!pwd.isNullOrEmpty()) {
                                     st.prefPut("vpnbookPass", pwd)
@@ -2233,7 +2233,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                             msg = "الكونفيج بلا سيرفر remote — اختر ملفاً آخر"
                         } else {
                             val host = rems.first().host
-                            val cc = VpnBook.countryOf(host)
+                            val cc = VpnBook.displayCountry(host, "", name).ifBlank { VpnBook.countryOfName(text.take(2000)) }
                             val key = "vbk-" + host.lowercase().replace(Regex("[^a-z0-9.-]"), "_")
                             app.store.saveVpnBookOvpn(key, text)
                             val tcpCap = rems.any { it.proto == "tcp" }
@@ -2247,9 +2247,10 @@ fun OvpnTab(app: WgApp, a: Actions) {
                             addedKey = key
                             val pwd = VpnBook.fetchPassword() ?: app.store.prefGet("vpnbookPass")
                             if (!pwd.isNullOrEmpty()) app.store.prefPut("vpnbookPass", pwd)
+                            val ccLabel = if (cc.isBlank()) "VPNBook" else "${Country.flag(cc)} $cc • ${Country.name(cc)}"
                             msg = if (pwd.isNullOrEmpty())
-                                "✔ أُضيف $host (${Country.name(cc)}) — تعذّر جلب كلمة السر، سيُطلب التحديث عند الاتصال"
-                            else "✔ أُضيف $host (${Country.name(cc)}) كسيرفر — افحصه واتصل"
+                                "✔ أُضيف $host ($ccLabel) — تعذّر جلب كلمة السر، سيُطلب التحديث عند الاتصال"
+                            else "✔ أُضيف $host ($ccLabel) كسيرفر — افحصه واتصل"
                         }
                     } catch (e: Exception) {
                         msg = "فشل تجهيز السيرفر: ${e.message?.take(100)}"
@@ -2269,8 +2270,19 @@ fun OvpnTab(app: WgApp, a: Actions) {
         return
     }
 
-    // تحميل أولي من الكاش + تحديث تلقائي إن قَدُم (أكثر من 6 ساعات)
+    // إصلاح فوري لسيرفرات VPNBook القديمة بلا دولة: نستدل من IP/الاسم مرة واحدة
     LaunchedEffect(Unit) {
+        val needFix = app.store.ovpn.value.filter { it.key.startsWith("vbk-") && it.country.isBlank() }
+        if (needFix.isNotEmpty()) {
+            app.store.updateOvpn { l ->
+                l.map { s ->
+                    if (s.key.startsWith("vbk-") && s.country.isBlank()) {
+                        val cc = VpnBook.displayCountry(s.host, "")
+                        if (cc.isNotBlank()) s.copy(country = cc) else s
+                    } else s
+                }
+            }
+        }
         if (servers.isEmpty()) {
             app.store.loadVpnGateCsv()?.let { csv ->
                 val list = VpnGate.parse(csv)
@@ -2537,11 +2549,11 @@ fun OvpnTab(app: WgApp, a: Actions) {
                         val bPrefix = if (VpnBook.isBookKey(best.key)) "📖 " else ""
                         Text("الأفضل تلقائياً — جاهز للاتصال" + if (bPrefix.isNotEmpty()) " • VPNBook" else "", fontSize = 11.sp, color = Color(0xFFC8E6C9))
                         Text(
-                            "$bPrefix${Country.flag(bcc)} ${best.host}",
+                            "$bPrefix${Country.flag(bcc)} $bcc • ${best.host}",
                             fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White
                         )
                         Text(
-                            "${Country.name(bcc)} • ${best.ip} • ${best.lat}ms • فقد ${best.loss}% • ${VpnGate.speedText(best.speedMbps)}",
+                            "${Country.name(bcc)} ($bcc) • ${best.ip} • ${best.lat}ms • فقد ${best.loss}% • ${VpnGate.speedText(best.speedMbps)}",
                             fontSize = 12.sp, color = Color(0xFFE8F5E9)
 
                         )
@@ -2597,7 +2609,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                             Column(Modifier.weight(1f)) {
                                 val vcc = VpnBook.displayCountry(v.host, v.country)
                                 Text(
-                                    "${Country.flag(vcc)} ${Country.name(vcc)} • ${v.host}",
+                                    "${Country.flag(vcc)} $vcc • ${Country.name(vcc)} • ${v.host}",
                                     fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1,
                                     color = if (bgColor != null) fgColor else Color.Unspecified
                                 )
@@ -2760,7 +2772,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                     fontWeight = FontWeight.Bold, fontSize = 14.sp
                                 )
                                 Text(
-                                    (if (VpnBook.isBookKey(s.key)) "VPNBook • " else "") +
+                                    (if (VpnBook.isBookKey(s.key)) "VPNBook $dcc • " else "") +
                                         "${Country.name(dcc)} • ${s.ip} • ${s.sessions} جلسة" +
                                         (if (s.sessions >= 200) " (ممتلئ — مستبعد)" else "") +
                                         (if (s.tcp) " • TCP" else " • UDP فقط") +
