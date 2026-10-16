@@ -72,7 +72,7 @@ class OvpnEngine(ctx: Context, private val store: Store) {
         // رفض الدخول من السيرفر: نخفضه فوراً (فقد 100%) فلا يعود للأول تلقائياً
         if ((msg.contains("AUTH_FAILED", true) || msg.contains("auth-failure", true)) &&
             cur.serverKey.isNotEmpty()
-        {
+        ) {
             val now = System.currentTimeMillis()
             store.updateOvpn { l ->
                 l.map {
