@@ -50,6 +50,19 @@ object VpnGate {
         val score: Double get() = Exam.score(lat, jitter, loss)
     }
 
+    /** مدة استبعاد السيرفر الذي فشل اتصاله فعلياً (ساعة). الفحص وحده لا يعيده. */
+    const val CONNECT_FAIL_BAN_HOURS = 24L
+
+    /**
+     * سيرفر فشل اتصاله الحقيقي مؤخراً (خُفّض من المحرك بـ «فشل الاتصال» أو
+     * «مرفوض الدخول») — يُستبعد من الترشيح التلقائي والفحص حتى تنتهي المهلة،
+     * لأن إعادة فحصه نجاحاً كاذباً (Ping يرد والمنفذ مغلق) كانت تعيده للواجهة.
+     */
+    fun connectFailedRecently(s: OvpnServer, now: Long = System.currentTimeMillis()): Boolean =
+        s.loss >= 100 && s.tested &&
+            (s.via == "فشل الاتصال" || s.via == "مرفوض الدخول") &&
+            now - s.testedAt < CONNECT_FAIL_BAN_HOURS * 3600 * 1000
+
     // ---------- الجلب والتحليل ----------
 
     suspend fun fetchCsv(network: Network? = null): String? = withContext(Dispatchers.IO) {
@@ -223,7 +236,23 @@ object VpnGate {
      */
     suspend fun exam(server: Server, prefer: String): ExamResult? = withContext(Dispatchers.IO) {
         val cfg = decodeConfig(server.configB64) ?: return@withContext null
-        val rems = remotes(cfg)
+        examRemotes(remotes(cfg), server.ip, prefer)
+    }
+
+    /** يفحص سيرفراً محفوظاً في الخزنة (VPNGate أو VPNBook) بكونفيجه الكامل. */
+    suspend fun examStored(store: Store, key: String, prefer: String): ExamResult? =
+        withContext(Dispatchers.IO) {
+            val b64 = store.ovpnConfigB64(key) ?: vpnBookOvpnConfig(store, key)
+            val cfg = b64?.let { decodeConfig(it) } ?: return@withContext null
+            val ip = store.ovpn.value.firstOrNull { it.key == key }?.ip?.takeIf { it.isNotEmpty() }
+                ?: remotes(cfg).firstOrNull()?.host ?: ""
+            examRemotes(remotes(cfg), ip, prefer)
+        }
+
+    /** نواة الفحص المشتركة: تعمل على أي قائمة remotes + عنوان IP للـ ICMP الاحتياطي. */
+    suspend fun examRemotes(
+        rems: List<Remote>, ip: String, prefer: String
+    ): ExamResult? = withContext(Dispatchers.IO) {
         val ordered = when (prefer) {
             "tcp" -> rems.sortedBy { if (it.proto == "tcp") 0 else 1 }
             "udp" -> rems.sortedBy { if (it.proto == "udp") 0 else 1 }
@@ -238,10 +267,12 @@ object VpnGate {
             val st = Probes.stat(samples, 4)
             if (st != null) return@withContext ExamResult(st.median, st.jitter, st.loss, "TCP ${r.port}")
         }
-        // بديل ICMP على IP السيرفر
-        val samples = icmpPing(server.ip)
-        val st = Probes.stat(samples, 3)
-        if (st != null) return@withContext ExamResult(st.median, st.jitter, st.loss, "Ping")
+        // بديل ICMP على IP السيرفر (غير مؤكد لـ UDP — يُوسم Ping فقط)
+        if (ip.isNotEmpty()) {
+            val samples = icmpPing(ip)
+            val st = Probes.stat(samples, 3)
+            if (st != null) return@withContext ExamResult(st.median, st.jitter, st.loss, "Ping")
+        }
         null
     }
 
@@ -347,6 +378,7 @@ object VpnGate {
     fun examText(r: ExamResult?): String = when {
         r == null -> "لم يُفحص"
         r.loss >= 100 -> "✘ لا استجابة"
+        r.via == "Ping" -> "${r.lat}ms • فقد ${r.loss}% • Ping فقط (غير مؤكد للـ UDP)"
         else -> "${r.lat}ms • فقد ${r.loss}% • تذبذب ${r.jitter} • ${r.via}"
     }
 }

@@ -18,6 +18,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebViewClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.widget.Toast
 import androidx.compose.ui.viewinterop.AndroidView
 import java.net.HttpURLConnection
@@ -64,6 +65,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -1174,6 +1176,7 @@ fun VpnBookWebView(
     var webRef by remember { mutableStateOf<WebView?>(null) }
     var pageUrl by remember { mutableStateOf(url) }
     var pageState by remember { mutableStateOf("يفتح…") }
+    var progress by remember { mutableIntStateOf(0) }
     val ctx = LocalContext.current
 
     // يستقبل نص الكونفيج من JS (blob أو التقاط ظاهر) ويدخله للقائمة — يعمل على أي خيط
@@ -1247,6 +1250,12 @@ fun VpnBookWebView(
             }
         }
         // زر التقاط احتياطي — لا يعطّل التنزيل التلقائي، فقط بديل عند فشل blob
+        if (progress in 1..99) {
+            LinearProgressIndicator(
+                progress = progress / 100f,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp)
+            )
+        }
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1321,9 +1330,16 @@ fun VpnBookWebView(
                 WebView(c).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
+                    settings.databaseEnabled = true
                     settings.loadsImagesAutomatically = true
                     settings.builtInZoomControls = true
                     settings.displayZoomControls = false
+                    // صفحات Proton (https) تحمّل موارد مختلطة — الوضع الافتراضي
+                    // يمنعها فينقطع التحميل وتبقى الصفحة بيضاء.
+                    if (Build.VERSION.SDK_INT >= 21) {
+                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+                    settings.cacheMode = WebSettings.LOAD_DEFAULT
                     // بعض المواقع (ومنها بروتون) تعطي صفحة بيضاء عند كشف WebView
                     // عبر علامة "; wv" — نحذفها ليظهر المتصفح ككروم عادي.
                     try {
@@ -1361,6 +1377,13 @@ fun VpnBookWebView(
                                 } catch (_: Exception) { }
                                 return true
                             }
+                            // روابط التطبيقات (intent:// وغير http) — خارج التطبيق بدل التعليق
+                            if (!u.startsWith("http://") && !u.startsWith("https://") && !u.startsWith("about:")) {
+                                try {
+                                    ctx.startActivity(Intent(Intent.ACTION_VIEW, request!!.url))
+                                } catch (_: Exception) { }
+                                return true
+                            }
                             return false
                         }
 
@@ -1369,6 +1392,7 @@ fun VpnBookWebView(
                             wv.post {
                                 if (!url.isNullOrEmpty()) pageUrl = url
                                 pageState = "يحمّل…"
+                                progress = 0
                             }
                         }
 
@@ -1395,10 +1419,40 @@ fun VpnBookWebView(
                         }
                     }
                     webChromeClient = object : WebChromeClient() {
+                        override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                            progress = newProgress
+                        }
                         override fun onCreateWindow(
                             view: WebView?, isDialog: Boolean, isUserGesture: Boolean,
                             resultMsg: Message?
                         ): Boolean {
+                            // النوافذ المبرمجة (window.open في صفحات الدخول) بلا hitTestResult —
+                            // النقل الرسمي عبر WebViewTransport يمنع موت النافذة والبياض.
+                            try {
+                                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                                if (transport != null) {
+                                    val popup = WebView(c)
+                                    popup.settings.javaScriptEnabled = true
+                                    popup.settings.domStorageEnabled = true
+                                    transport.webView = popup
+                                    resultMsg.sendToTarget()
+                                    // اعرض النتيجة في نفس المتصفح بدل نافذة منفصلة
+                                    popup.webViewClient = object : WebViewClient() {
+                                        override fun shouldOverrideUrlLoading(
+                                            v: WebView?, req: WebResourceRequest?
+                                        ): Boolean {
+                                            val u = req?.url?.toString() ?: return true
+                                            if (u.startsWith("http://") || u.startsWith("https://")) {
+                                                wv.post { wv.loadUrl(u) }
+                                                popup.destroy()
+                                                return true
+                                            }
+                                            return true
+                                        }
+                                    }
+                                    return true
+                                }
+                            } catch (_: Exception) { }
                             val href = view?.hitTestResult?.extra
                             if (!href.isNullOrBlank()) {
                                 wv.post { wv.loadUrl(href) }
@@ -1940,6 +1994,7 @@ suspend fun refreshOvpnServers(app: WgApp): String = withContext(kotlinx.corouti
     val old = app.store.ovpn.value.associateBy { it.key }
     val freshKeys = parsed.map { it.key }.toSet()
     // القدامى الغائبون منذ أقل من 48 ساعة يبقون (موسومون ضمنياً بقدم lastSeen)
+    // سيرفرات VPNBook (vbk-*) ليست من VPNGate أصلاً — تبقى صالحة دائماً ولا تُوسم قديمة.
     val kept = old.values.filter { it.key !in freshKeys && now - it.lastSeen < 48L * 3600 * 1000 }
     app.store.updateOvpn {
         parsed.map { s ->
@@ -1955,7 +2010,11 @@ suspend fun refreshOvpnServers(app: WgApp): String = withContext(kotlinx.corouti
                 via = o?.via ?: "", testedAt = o?.testedAt ?: 0L, lastSeen = now, stale = false,
                 tcp = tcpCapable
             )
-        } + kept.map { it.copy(stale = true) }
+        } + kept.map {
+            // VPNBook صالح بملفه المحلي — لا يُعطَّل بتحديث قائمة VPNGate
+            if (it.key.startsWith("vbk-")) it.copy(lastSeen = now, stale = false)
+            else it.copy(stale = true)
+        }
     }
     app.store.setOvpnUpdatedAt(now)
     val nCountries = (parsed.map { it.country } + kept.map { it.country }).distinct().size
@@ -1969,7 +2028,11 @@ suspend fun examOvpnBest(
     onProgress: (String) -> Unit
 ): List<OvpnServer> {
     val csv = app.store.loadVpnGateCsv() ?: return emptyList()
+    val banned = app.store.ovpn.value
+        .filter { VpnGate.connectFailedRecently(it) }
+        .map { it.key }.toSet()
     val cands = VpnGate.candidates(VpnGate.parse(csv), prefer)
+        .filterNot { it.key in banned }
     if (cands.isEmpty()) return emptyList()
     onProgress("فحص ${cands.size} مرشحاً…")
     val now = System.currentTimeMillis()
@@ -1983,13 +2046,95 @@ suspend fun examOvpnBest(
             }
         }
     }
+    // سيرفرات VPNBook المحلية (vbk-*) تُفحص أيضاً لتترشح للأفضل مثل VPNGate
+    val vbk = app.store.ovpn.value.filter { it.key.startsWith("vbk-") && !it.stale }
+    if (vbk.isNotEmpty()) {
+        onProgress("فحص سيرفرات VPNBook…")
+        vbk.forEach { v ->
+            val r = try { VpnGate.examStored(app.store, v.key, prefer) } catch (e: Exception) { null }
+            if (r != null) {
+                app.store.updateOvpn { l ->
+                    l.map {
+                        if (it.key == v.key) it.copy(
+                            lat = r.lat, jitter = r.jitter, loss = r.loss,
+                            via = r.via, testedAt = System.currentTimeMillis()
+                        ) else it
+                    }
+                }
+            }
+        }
+    }
     onProgress("")
     return app.store.ovpn.value
         .filter { it.tested && it.loss < 100 && !it.stale && it.sessions < 200 }
         .sortedWith(
-            if (prefer == "auto") compareBy({ if (it.tcp) 0 else 1 }, { it.score }, { it.sessions })
+            if (prefer == "auto") compareBy(
+                { if (it.via.startsWith("TCP")) 0 else 1 },
+                { if (it.tcp) 0 else 1 }, { it.score }, { it.sessions }
+            )
             else compareBy({ it.score }, { it.sessions })
         )
+}
+
+/**
+ * اتصال تلقائي ذكي: يفحص المرشحين ثم يجرّب أفضل 3 بالتتابع حتى ينجح واحد.
+ * (سيرفرات المتطوعين تموت فجأة — المحاولة الواحدة كانت سبب «الضعف» الظاهر.)
+ * يعيد رسالة النتيجة النهائية للعرض.
+ */
+suspend fun autoConnectOvpnBest(
+    app: WgApp, prefer: String, onProgress: (String) -> Unit
+): String = withContext(kotlinx.coroutines.Dispatchers.Main) {
+    onProgress("فحص المرشحين…")
+    val ranked = withContext(kotlinx.coroutines.Dispatchers.IO) {
+        examOvpnBest(app, prefer) {}
+    }
+    if (ranked.isEmpty()) {
+        onProgress("")
+        return@withContext "لا سيرفر يستجيب الآن — حدّث القائمة أو جرّب TCP ثم أعد"
+    }
+    val tried = ArrayList<String>()
+    for (s in ranked.take(3)) {
+        onProgress("محاولة ${tried.size + 1}/3: ${s.host}…")
+        val immediate = startOvpnInternal(app, s, prefer)
+        // فشل فوري (قديم/كلمة سر/تجهيز) — جرّب التالي بلا انتظار
+        if (!app.ovpn.state.value.connecting && !app.ovpn.state.value.active) {
+            tried += "${s.host} ($immediate)"
+            continue
+        }
+        // انتظار النتيجة حتى 30 ثانية: متصل = نجاح، سقوط = التالي
+        var waited = 0
+        var done: Boolean? = null
+        while (waited < 30) {
+            kotlinx.coroutines.delay(1000)
+            waited++
+            val st = app.ovpn.state.value
+            if (st.active) {
+                done = true
+                break
+            }
+            if (!st.connecting && !st.active && st.serverKey.isEmpty()) {
+                done = false
+                break
+            }
+        }
+        when (done) {
+            true -> {
+                onProgress("")
+                return@withContext "✔ متصل عبر ${s.host}" +
+                    if (tried.isNotEmpty()) " (بعد فشل: ${tried.joinToString("؛ ")} )" else ""
+            }
+            false -> {
+                tried += "${s.host} (سقط الاتصال — استُبعد تلقائياً)"
+                continue
+            }
+            else -> {
+                app.ovpn.stop()
+                tried += "${s.host} (انتهت المهلة 30ث)"
+            }
+        }
+    }
+    onProgress("")
+    "تعذّر الثلاثة الأفضل — ${tried.joinToString("؛ ")} — جرّب سيرفراً يدوياً أو غيّر البروتوكول"
 }
 
 /**
@@ -2214,18 +2359,13 @@ fun OvpnTab(app: WgApp, a: Actions) {
             onClick = {
                 scope.launch {
                     busy = "فحص المرشحين…"
-                    val res = examOvpnBest(app, prefer) { pr -> busy = pr }
+                    val msg = autoConnectOvpnBest(app, prefer) { pr -> busy = pr }
                     busy = ""
-                    val top = res.firstOrNull()
-                    if (top == null) {
-                        toast("لا سيرفر يستجيب الآن — حدّث القائمة أو جرّب TCP ثم أعد")
-                    } else {
-                        a.startOvpn(top)
-                    }
+                    toast(msg)
                 }
             },
             modifier = Modifier.fillMaxWidth()
-        ) { Text("⚡ فحص واتصال تلقائي بالأسرع") }
+        ) { Text("⚡ فحص واتصال تلقائي بالأسرع (يجرب 3)") }
         }
 
         // ---- مولد VPNBook-OpenVPN (سيرفرات قريبة وسريعة) ----
@@ -2463,14 +2603,24 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                 fontSize = 12.sp
                             )
                         }
+                        if (VpnGate.connectFailedRecently(s)) {
+                            Text(
+                                "🚫 مستبعد تلقائياً: فشل اتصاله الفعلي مؤخراً (${s.via}) — يُعاد فحصه بعد 24 ساعة",
+                                fontSize = 12.sp, color = MaterialTheme.colorScheme.error
+                            )
+                        }
                         if (!s.stale) Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             OutlinedButton(
                                 onClick = {
                                     scope.launch {
                                         busy = "فحص ${s.host}…"
-                                        val csv = app.store.loadVpnGateCsv()
-                                        val full = csv?.let { VpnGate.parse(it).firstOrNull { p -> p.key == s.key } }
-                                        val r = full?.let { VpnGate.exam(it, prefer) }
+                                        val cur = app.store.ovpn.value.firstOrNull { it.key == s.key }
+                                        if (cur != null && VpnGate.connectFailedRecently(cur)) {
+                                            toast("${s.host}: مستبعد مؤقتاً (فشل اتصاله مؤخراً) — يعود للفحص تلقائياً بعد 24 ساعة")
+                                            busy = ""
+                                            return@launch
+                                        }
+                                        val r = VpnGate.examStored(app.store, s.key, prefer)
                                         if (r != null) {
                                             val now = System.currentTimeMillis()
                                             app.store.updateOvpn { l ->
