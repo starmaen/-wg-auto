@@ -97,6 +97,23 @@ class OvpnEngine(ctx: Context, private val store: Store) {
                     else it
                 }
             }
+            // كلمة سر VPNBook أسبوعية: رفض الدخول غالباً يعني انتهاءها —
+            // نجلب الجديدة في الخلفية ليعيد المستخدم الاتصال فوراً بلا توليد جديد.
+            if (cur.serverKey.startsWith("vbk-")) {
+                state.value = OvpnState(statusText = "انتهت كلمة سر VPNBook — جارٍ جلب الجديدة تلقائياً…")
+                store.prefPut("ovpnActive", null)
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    val pwd = VpnBook.fetchPassword()
+                    if (!pwd.isNullOrEmpty()) store.prefPut("vpnbookPass", pwd)
+                    scope.launch {
+                        state.value = OvpnState(
+                            statusText = if (!pwd.isNullOrEmpty()) "حُدّثت كلمة السر — اضغط اتصال مجدداً"
+                            else "تعذّر تحديث كلمة السر — أعد توليد السيرفر من زر VPNBook"
+                        )
+                    }
+                }
+                return
+            }
             state.value = OvpnState(statusText = "السيرفر رفض الدخول — اختر سيرفراً آخر (الأول الجديد مقترح بالأعلى)")
             store.prefPut("ovpnActive", null)
             return
@@ -134,6 +151,18 @@ class OvpnEngine(ctx: Context, private val store: Store) {
                 statusText = "جارٍ الاتصال…", startedAt = System.currentTimeMillis()
             )
             store.prefPut("ovpnActive", server.key)
+            // حارس المهلة: التعليق على «جارٍ الاتصال» أكثر من 60 ثانية يعني
+            // سيرفراً ميتاً — نفصل ونوجّه للبديل بدل الانتظار الأبدي.
+            scope.launch {
+                kotlinx.coroutines.delay(60_000)
+                val st = state.value
+                if (st.serverKey == server.key && st.connecting && !st.active) {
+                    stop()
+                    state.value = OvpnState(
+                        statusText = "انتهت المهلة (60 ثانية) — ${server.host} لا يرد، جرّب سيرفراً آخر"
+                    )
+                }
+            }
             "جارٍ الاتصال عبر ${server.host} داخل التطبيق…"
         } catch (e: Exception) {
             "تعذّر تشغيل OpenVPN: ${(e.message ?: "خطأ غير معروف").take(90)}"

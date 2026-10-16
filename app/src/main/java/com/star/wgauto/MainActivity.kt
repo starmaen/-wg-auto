@@ -29,6 +29,7 @@ import java.util.Locale
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.lifecycle.lifecycleScope
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -191,7 +192,24 @@ class MainActivity : ComponentActivity() {
             // إذن VPN من النظام (مرة واحدة) ثم تشغيل OpenVPN الداخلي — بدونه يفشل establish بصمت
             startOvpn = { s ->
                 withVpnPermission {
-                    toast(startOvpnInternal(app, s, app.store.settings.value.ovpnProto))
+                    val st = app.store
+                    // كلمة سر VPNBook أسبوعية: إن غابت ن/batchنجلبها أولاً بدل الفشل الفوري
+                    if (s.key.startsWith("vbk-") && (st.prefGet("vpnbookPass") ?: "").isEmpty()) {
+                        toast("جارٍ جلب كلمة سر VPNBook…")
+                        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                            val pwd = VpnBook.fetchPassword()
+                            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                if (!pwd.isNullOrEmpty()) {
+                                    st.prefPut("vpnbookPass", pwd)
+                                    toast(startOvpnInternal(app, s, st.settings.value.ovpnProto))
+                                } else {
+                                    toast("تعذّر جلب كلمة السر — تحقق من الإنترنت وأعد المحاولة")
+                                }
+                            }
+                        }
+                    } else {
+                        toast(startOvpnInternal(app, s, st.settings.value.ovpnProto))
+                    }
                 }
             }
         )
@@ -1177,6 +1195,7 @@ fun VpnBookWebView(
     var pageUrl by remember { mutableStateOf(url) }
     var pageState by remember { mutableStateOf("يفتح…") }
     var progress by remember { mutableIntStateOf(0) }
+    var showWvUpdate by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
 
     // يستقبل نص الكونفيج من JS (blob أو التقاط ظاهر) ويدخله للقائمة — يعمل على أي خيط
@@ -1325,6 +1344,21 @@ fun VpnBookWebView(
                 color = MaterialTheme.colorScheme.primary
             )
         }
+        if (showWvUpdate) {
+            OutlinedButton(
+                onClick = {
+                    try {
+                        ctx.startActivity(
+                            Intent(
+                                Intent.ACTION_VIEW,
+                                Uri.parse("https://play.google.com/store/apps/details?id=com.google.android.webview")
+                            )
+                        )
+                    } catch (_: Exception) { }
+                },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)
+            ) { Text("تحديث Android System WebView من المتجر") }
+        }
         AndroidView(
             factory = { c ->
                 WebView(c).apply {
@@ -1408,6 +1442,22 @@ fun VpnBookWebView(
                                 if (!url.isNullOrEmpty()) pageUrl = url
                                 pageState = "اكتمل التحميل"
                             }
+                            // تشخيص الفراغ: بعد 8 ثوانٍ إن بقي body فارغاً فالصفحة محجوبة
+                            // (Cloudflare ضد المتصفح الداخلي) أو WebView النظام قديم — نرشد بدل البياض الصامت.
+                            wv.postDelayed({
+                                try {
+                                    wv.evaluateJavascript(
+                                        "(function(){return (document.body?document.body.innerText:'').length;})();"
+                                    ) { res ->
+                                        val len = res?.trim()?.trim('"')?.toIntOrNull() ?: -1
+                                        if (len == 0 && !pageState.startsWith("خطأ")) {
+                                            statusMsg = "الصفحة فارغة بعد التحميل — حجب Cloudflare للمتصفح الداخلي أو WebView قديم: " +
+                                                "حدّث Android System WebView من المتجر (زر بالأسفل)، أو استخدم «فتح خارجي» ثم استيراد الملف"
+                                            showWvUpdate = true
+                                        }
+                                    }
+                                } catch (_: Exception) { }
+                            }, 8000)
                         }
 
                         override fun onReceivedError(
@@ -2480,27 +2530,33 @@ fun OvpnTab(app: WgApp, a: Actions) {
         }
         }
 
-        // ---- الاختيار التلقائي: الأفضل بضغطة ----
+        // ---- الاختيار التلقائي: الأفضل بضغطة (بطاقة خضراء مميزة) ----
         if (best != null) {
             item {
             Card(
                 Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1))
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF2E7D32))
             ) {
                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("🥇", fontSize = 22.sp)
                     Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
+                        Text("الأفضل تلقائياً — جاهز للاتصال", fontSize = 11.sp, color = Color(0xFFC8E6C9))
                         Text(
                             "${Country.flag(best.country)} ${best.host}",
-                            fontWeight = FontWeight.Bold, fontSize = 14.sp
+                            fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White
                         )
                         Text(
                             "${Country.name(best.country)} • ${best.ip} • ${best.lat}ms • فقد ${best.loss}% • ${VpnGate.speedText(best.speedMbps)}",
-                            fontSize = 12.sp
+                            fontSize = 12.sp, color = Color(0xFFE8F5E9)
                         )
                     }
-                    Button(onClick = { a.startOvpn(best) }) { Text("اتصال") }
+                    Button(
+                        onClick = { a.startOvpn(best) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color.White, contentColor = Color(0xFF2E7D32)
+                        )
+                    ) { Text("اتصال", fontWeight = FontWeight.Bold) }
                 }
             }
             }
@@ -2517,15 +2573,38 @@ fun OvpnTab(app: WgApp, a: Actions) {
                 Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("📖 سيرفرات VPNBook المولّدة (${vbkServers.size})", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     vbkServers.forEach { v ->
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        val bannedV = VpnGate.connectFailedRecently(v)
+                        val okV = v.tested && v.loss < 100 && !bannedV
+                        Card(
+                            Modifier.fillMaxWidth(),
+                            colors = when {
+                                bannedV || (v.tested && v.loss >= 100) ->
+                                    CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE))
+                                okV -> CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+                                else -> CardDefaults.cardColors()
+                            }
+                        ) {
+                        Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                when {
+                                    bannedV || (v.tested && v.loss >= 100) -> "🔴"
+                                    okV -> "🟢"
+                                    else -> "⚪"
+                                },
+                                fontSize = 18.sp
+                            )
+                            Spacer(Modifier.width(6.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(
                                     "${Country.flag(v.country)} ${v.host}",
                                     fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1
                                 )
                                 Text(
-                                    if (v.tested) VpnGate.examText(VpnGate.ExamResult(v.lat, v.jitter, v.loss, v.via))
-                                    else "جديد — اضغط فحص ثم اتصال",
+                                    when {
+                                        bannedV -> "🚫 مستبعد: فشل اتصاله مؤخراً — يعود بعد 24 ساعة"
+                                        v.tested -> VpnGate.examText(VpnGate.ExamResult(v.lat, v.jitter, v.loss, v.via))
+                                        else -> "جديد — اضغط فحص ثم اتصال"
+                                    },
                                     fontSize = 11.sp
                                 )
                             }
@@ -2551,6 +2630,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                 }
                             }) { Text("فحص", maxLines = 1) }
                             Button(onClick = { a.startOvpn(v) }) { Text("اتصال", maxLines = 1) }
+                        }
                         }
                     }
                 }
