@@ -2316,14 +2316,15 @@ fun OvpnTab(app: WgApp, a: Actions) {
             (query.isBlank() || it.host.contains(query.trim(), true) || it.ip.contains(query.trim()))
     }.sortedWith(compareBy({ val r = rankOf(it.key); if (r >= 0) r else 99 }, { it.score }))
 
+    // ألوان ثابتة في الفاتح والداكن — قبل LazyColumn لأن isSystemInDarkTheme استدعاء @Composable
+    val dark = isSystemInDarkTheme()
+    val okBg = if (dark) Color(0xFF12351F) else Color(0xFFE8F5E9)
+    val warnBg = if (dark) Color(0xFF3A2E00) else Color(0xFFFFF8E1)
+    val infoBg = if (dark) Color(0xFF0F2B4A) else Color(0xFFE3F2FD)
+    val statusFg = if (dark) Color.White else Color(0xFF111111)
+
     LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         val wgUp = wgSt.running && wgSt.connected
-        // ألوان ثابتة في الفاتح والداكن: خلفية فاتحة + نص داكن دائماً لبطاقات الحالة
-        val dark = isSystemInDarkTheme()
-        val okBg = if (dark) Color(0xFF12351F) else Color(0xFFE8F5E9)
-        val warnBg = if (dark) Color(0xFF3A2E00) else Color(0xFFFFF8E1)
-        val infoBg = if (dark) Color(0xFF0F2B4A) else Color(0xFFE3F2FD)
-        val statusFg = if (dark) Color.White else Color(0xFF111111)
         // ---- ترويسة مميزة للتبويب ----
         item {
         Card(
