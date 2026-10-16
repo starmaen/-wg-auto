@@ -46,9 +46,29 @@ object VpnBook {
             h.startsWith("uk") -> "GB"
             h.startsWith("de") -> "DE"
             h.startsWith("fr") -> "FR"
+            h.startsWith("eu") -> "EU"
+            h.startsWith("euro") -> "EU"
             else -> ""
         }
-        return if (host.endsWith("vpnbook.com", true)) cc else ""
+        if (host.endsWith("vpnbook.com", true)) return cc
+        // مضيف IP مباشر لسيرفر VPNBook مستورد: نستدل من الاسم المحفوظ إن أمكن
+        return cc
+    }
+
+    /** هل هذا سيرفر VPNBook-OpenVPN مستورد (مفتاح vbk-...)؟ */
+    fun isBookKey(key: String): Boolean = key.startsWith("vbk-")
+
+    /** دولة العرض لسيرفر قائمة VPN: المخزنة أولاً ثم الاستدلال من المضيف. */
+    fun displayCountry(host: String, stored: String): String {
+        if (stored.isNotBlank()) return stored.uppercase().take(2)
+        return countryOf(host)
+    }
+
+    /** بادئة عرض موحدة: 📖 + علم + اسم الدولة — لسيرفرات VPNBook فقط. */
+    fun bookBadge(host: String, stored: String): String {
+        val cc = displayCountry(host, stored)
+        return if (cc.isBlank()) "📖 VPNBook"
+        else "📖 ${Country.flag(cc)} ${Country.name(cc)}"
     }
 
     val servers: List<Server> = listOf(

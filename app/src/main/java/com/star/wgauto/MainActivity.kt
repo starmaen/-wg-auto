@@ -2309,19 +2309,26 @@ fun OvpnTab(app: WgApp, a: Actions) {
     val topList = tested.take(3)
     val topKeys = topList.map { it.key }.toSet()
     fun rankOf(key: String) = topList.indexOfFirst { it.key == key }
-    val countries = servers.map { it.country }.distinct().sorted()
+    val countries = servers.map { VpnBook.displayCountry(it.host, it.country).ifBlank { it.country } }.filter { it.isNotBlank() }.distinct().sorted()
     val shown = servers.filter {
-        (countryFilter == "ALL" || it.country == countryFilter) &&
+        val dc = VpnBook.displayCountry(it.host, it.country)
+        (countryFilter == "ALL" || dc == countryFilter || it.country == countryFilter) &&
             (query.isBlank() || it.host.contains(query.trim(), true) || it.ip.contains(query.trim()))
     }.sortedWith(compareBy({ val r = rankOf(it.key); if (r >= 0) r else 99 }, { it.score }))
 
     LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         val wgUp = wgSt.running && wgSt.connected
+        // ألوان ثابتة في الفاتح والداكن: خلفية فاتحة + نص داكن دائماً لبطاقات الحالة
+        val dark = isSystemInDarkTheme()
+        val okBg = if (dark) Color(0xFF12351F) else Color(0xFFE8F5E9)
+        val warnBg = if (dark) Color(0xFF3A2E00) else Color(0xFFFFF8E1)
+        val infoBg = if (dark) Color(0xFF0F2B4A) else Color(0xFFE3F2FD)
+        val statusFg = if (dark) Color.White else Color(0xFF111111)
         // ---- ترويسة مميزة للتبويب ----
         item {
         Card(
             Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3F73))
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3F73), contentColor = Color.White)
         ) {
             Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("🌍", fontSize = 30.sp)
@@ -2345,7 +2352,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
         when {
             ovSt.active -> Card(
                 Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+                colors = CardDefaults.cardColors(containerColor = okBg, contentColor = statusFg)
             ) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("🟢 متصل عبر OpenVPN داخل التطبيق", fontWeight = FontWeight.Bold)
@@ -2365,7 +2372,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
             }
             ovSt.connecting -> Card(
                 Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8E1))
+                colors = CardDefaults.cardColors(containerColor = warnBg, contentColor = statusFg)
             ) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("🟡 ${ovSt.statusText.ifEmpty { "جارٍ الاتصال…" }}", fontWeight = FontWeight.Bold)
@@ -2373,12 +2380,12 @@ fun OvpnTab(app: WgApp, a: Actions) {
                     OutlinedButton(
                         onClick = { toast(app.ovpn.stop()) },
                         modifier = Modifier.fillMaxWidth()
-                    ) { Text("إلغاء") }
+                    ) { Text("إلغاء — إغلاق VPN") }
                 }
             }
             wgUp -> Card(
                 Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
+                colors = CardDefaults.cardColors(containerColor = infoBg, contentColor = statusFg)
             ) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("🔵 متصل عبر WireGuard (${wgSt.activeConfig ?: ""})", fontWeight = FontWeight.Bold)
@@ -2519,20 +2526,23 @@ fun OvpnTab(app: WgApp, a: Actions) {
             item {
             Card(
                 Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF2E7D32))
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF2E7D32), contentColor = Color.White)
             ) {
                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("🥇", fontSize = 22.sp)
                     Spacer(Modifier.width(8.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("الأفضل تلقائياً — جاهز للاتصال", fontSize = 11.sp, color = Color(0xFFC8E6C9))
+                        val bcc = VpnBook.displayCountry(best.host, best.country)
+                        val bPrefix = if (VpnBook.isBookKey(best.key)) "📖 " else ""
+                        Text("الأفضل تلقائياً — جاهز للاتصال" + if (bPrefix.isNotEmpty()) " • VPNBook" else "", fontSize = 11.sp, color = Color(0xFFC8E6C9))
                         Text(
-                            "${Country.flag(best.country)} ${best.host}",
+                            "$bPrefix${Country.flag(bcc)} ${best.host}",
                             fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White
                         )
                         Text(
-                            "${Country.name(best.country)} • ${best.ip} • ${best.lat}ms • فقد ${best.loss}% • ${VpnGate.speedText(best.speedMbps)}",
+                            "${Country.name(bcc)} • ${best.ip} • ${best.lat}ms • فقد ${best.loss}% • ${VpnGate.speedText(best.speedMbps)}",
                             fontSize = 12.sp, color = Color(0xFFE8F5E9)
+
                         )
                     }
                     Button(
@@ -2584,8 +2594,9 @@ fun OvpnTab(app: WgApp, a: Actions) {
                             )
                             Spacer(Modifier.width(6.dp))
                             Column(Modifier.weight(1f)) {
+                                val vcc = VpnBook.displayCountry(v.host, v.country)
                                 Text(
-                                    "${Country.flag(v.country)} ${v.host}",
+                                    "${Country.flag(vcc)} ${Country.name(vcc)} • ${v.host}",
                                     fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1,
                                     color = if (bgColor != null) fgColor else Color.Unspecified
                                 )
@@ -2676,7 +2687,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                 label = { Text("🌐 الكل (${servers.size})", maxLines = 1) }
             )
             countries.forEach { cc ->
-                val n = servers.count { it.country == cc }
+                val n = servers.count { VpnBook.displayCountry(it.host, it.country) == cc }
                 FilterChip(
                     selected = countryFilter == cc,
                     onClick = { countryFilter = cc },
@@ -2736,16 +2747,20 @@ fun OvpnTab(app: WgApp, a: Actions) {
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("${Country.flag(s.country)}", fontSize = 20.sp)
+                            // سيرفرات VPNBook فقط: علم + رمز الدولة دائماً (حتى لو الكاش قديم)
+                            val dcc = VpnBook.displayCountry(s.host, s.country)
+                            Text("${Country.flag(dcc)}", fontSize = 20.sp)
                             Spacer(Modifier.width(8.dp))
                             Column(Modifier.weight(1f)) {
                                 val rank = rankOf(s.key)
+                                val bookMark = if (VpnBook.isBookKey(s.key)) "📖 " else ""
                                 Text(
-                                    (if (rank >= 0) "${Exam.rankMedal(rank)} " else "") + s.host,
+                                    bookMark + (if (rank >= 0) "${Exam.rankMedal(rank)} " else "") + s.host,
                                     fontWeight = FontWeight.Bold, fontSize = 14.sp
                                 )
                                 Text(
-                                    "${Country.name(s.country)} • ${s.ip} • ${s.sessions} جلسة" +
+                                    (if (VpnBook.isBookKey(s.key)) "VPNBook • " else "") +
+                                        "${Country.name(dcc)} • ${s.ip} • ${s.sessions} جلسة" +
                                         (if (s.sessions >= 200) " (ممتلئ — مستبعد)" else "") +
                                         (if (s.tcp) " • TCP" else " • UDP فقط") +
                                         " • ${VpnGate.speedText(s.speedMbps)}",
