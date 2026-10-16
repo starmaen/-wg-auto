@@ -138,12 +138,15 @@ class OvpnEngine(ctx: Context, private val store: Store) {
         }
     }
 
-    /** يشغّل سيرفراً بكونفيجه المفلتر. يعيد رسالة عرض. */
-    fun start(server: OvpnServer, configText: String): String {
+    /** يشغّل سيرفراً بكونفيجه المفلتر. الاعتماد يُمرَّر لواجهة النواة مباشرة (ملف auth-user-pass الخارجي تتجاهله النواة في وضع API). */
+    fun start(
+        server: OvpnServer, configText: String,
+        authUser: String? = null, authPass: String? = null
+    ): String {
         return try {
             OpenVpnApi.startVpn(
                 appCtx, configText, "WG Auto • ${server.host}",
-                null, null, emptyList()
+                authUser, authPass, emptyList()
             )
             val label = "${Country.flag(server.country)} ${server.host}"
             state.value = OvpnState(
@@ -218,8 +221,8 @@ class OvpnEngine(ctx: Context, private val store: Store) {
         val ready = VpnGate.buildConnectConfig(store, key, prefer, authPath, user, pass) ?: return null
         return try {
             OpenVpnApi.startVpn(
-                appCtx, ready, "WG Auto • ${server.host}",
-                null, null, emptyList()
+                appCtx, VpnGate.stripAuthPath(ready), "WG Auto • ${server.host}",
+                user, pass, emptyList()
             )
             val label = "${Country.flag(server.country)} ${server.host}"
             state.value = OvpnState(

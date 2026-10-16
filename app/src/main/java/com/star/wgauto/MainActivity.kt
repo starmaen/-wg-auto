@@ -2192,7 +2192,8 @@ fun startOvpnInternal(app: WgApp, server: OvpnServer, prefer: String): String {
         return "انتهت كلمة سر VPNBook — أعد توليد سيرفر من زر VPNBook لتحديثها"
     val ready = VpnGate.buildConnectConfig(app.store, server.key, prefer, authPath, user, pass)
         ?: return "تعذّر تجهيز هذا السيرفر — حدّث القائمة أو اختر سيرفراً آخر"
-    return app.ovpn.start(server, ready)
+    // الاعتماد عبر وسيطي النواة + سطر عارٍ (ملف auth-user-pass الخارجي تتجاهله النواة)
+    return app.ovpn.start(server, VpnGate.stripAuthPath(ready), user, pass)
 }
 
 @Composable

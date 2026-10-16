@@ -336,6 +336,25 @@ object VpnGate {
         return false
     }
 
+    /**
+     * النواة المدمجة (ics-openvpn عبر API) تتجاهل مراجع الملفات الخارجية
+     * (auth-user-pass /path) — الاعتماد الصحيح: سطر عارٍ + تمرير
+     * المستخدم/كلمة السر لوسيطي startVpn. هذه الدالة تعيد السطر عارياً.
+     */
+    fun stripAuthPath(configText: String): String {
+        val sb = StringBuilder()
+        for (raw in configText.lines()) {
+            val low = raw.substringBefore('#').trim().lowercase()
+            if (Regex("^auth-user-pass\\s+\\S").containsMatchIn(low)) {
+                val comment = raw.substring(raw.indexOf('#').takeIf { it >= 0 } ?: raw.length)
+                sb.appendLine(if (comment.startsWith("#")) "auth-user-pass $comment" else "auth-user-pass")
+            } else {
+                sb.appendLine(raw)
+            }
+        }
+        return sb.toString()
+    }
+
     /** كونفيج الاتصال الجاهز: فك + فلترة بروتوكول + حقن مصادقة. null إن تعذّر. */
     fun buildConnectConfig(
         store: Store, serverKey: String, prefer: String, authFilePath: String,
