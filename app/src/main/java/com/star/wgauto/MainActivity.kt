@@ -1340,11 +1340,16 @@ fun VpnBookWebView(
                         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
                     settings.cacheMode = WebSettings.LOAD_DEFAULT
-                    // بعض المواقع (ومنها بروتون) تعطي صفحة بيضاء عند كشف WebView
-                    // عبر علامة "; wv" — نحذفها ليظهر المتصفح ككروم عادي.
+                    // بعض المواقع (ومنها بروتون وCloudflare) تعطي صفحة بيضاء عند كشف WebView
+                    // عبر علامة "; wv" أو وكيل قديم — وكيل كروم حديث كامل يمنع الكشف.
                     try {
-                        settings.userAgentString =
-                            settings.userAgentString.replace("; wv", "")
+                        var ua = settings.userAgentString ?: ""
+                        ua = ua.replace("; wv", "")
+                        if (!Regex("Chrome/1[2-9]\\d").containsMatchIn(ua)) {
+                            ua = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 " +
+                                "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+                        }
+                        settings.userAgentString = ua
                     } catch (_: Exception) { }
                     // صفحات الدخول تفتح نوافذ منبثقة — بدون هذا تبقى الشاشة بيضاء.
                     // نحمّلها في نفس المتصفح ونعرض أخطاء وحدة التحكم للتشخيص.
@@ -2187,6 +2192,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
             onOvpn = { text, name ->
                 scope.launch(kotlinx.coroutines.Dispatchers.IO) {
                     var msg: String
+                    var addedKey: String? = null
                     try {
                         val rems = VpnGate.remotes(text)
                         if (rems.isEmpty()) {
@@ -2204,6 +2210,7 @@ fun OvpnTab(app: WgApp, a: Actions) {
                                     lastSeen = System.currentTimeMillis(), stale = false, tcp = tcpCap
                                 )
                             }
+                            addedKey = key
                             val pwd = VpnBook.fetchPassword() ?: app.store.prefGet("vpnbookPass")
                             if (!pwd.isNullOrEmpty()) app.store.prefPut("vpnbookPass", pwd)
                             msg = if (pwd.isNullOrEmpty())
@@ -2213,7 +2220,15 @@ fun OvpnTab(app: WgApp, a: Actions) {
                     } catch (e: Exception) {
                         msg = "فشل تجهيز السيرفر: ${e.message?.take(100)}"
                     }
-                    withContext(kotlinx.coroutines.Dispatchers.Main) { toast(msg) }
+                    withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        toast(msg)
+                        // إظهار مضمون: رجوع تلقائي للقائمة مع تصفير الفلاتر حتى لا يختفي السيرفر
+                        if (addedKey != null) {
+                            countryFilter = "ALL"
+                            query = ""
+                            webVBook = false
+                        }
+                    }
                 }
             }
         )
@@ -2486,6 +2501,58 @@ fun OvpnTab(app: WgApp, a: Actions) {
                         )
                     }
                     Button(onClick = { a.startOvpn(best) }) { Text("اتصال") }
+                }
+            }
+            }
+        }
+
+        // ---- سيرفرات VPNBook المولّدة: قسم ثابت أعلى القائمة فلا تضيع بين المئات ----
+        val vbkServers = servers.filter { it.key.startsWith("vbk-") && !it.stale }
+        if (vbkServers.isNotEmpty()) {
+            item {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+            ) {
+                Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("📖 سيرفرات VPNBook المولّدة (${vbkServers.size})", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    vbkServers.forEach { v ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "${Country.flag(v.country)} ${v.host}",
+                                    fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1
+                                )
+                                Text(
+                                    if (v.tested) VpnGate.examText(VpnGate.ExamResult(v.lat, v.jitter, v.loss, v.via))
+                                    else "جديد — اضغط فحص ثم اتصال",
+                                    fontSize = 11.sp
+                                )
+                            }
+                            TextButton(onClick = {
+                                scope.launch {
+                                    busy = "فحص ${v.host}…"
+                                    val r = VpnGate.examStored(app.store, v.key, prefer)
+                                    if (r != null) {
+                                        val now = System.currentTimeMillis()
+                                        app.store.updateOvpn { l ->
+                                            l.map {
+                                                if (it.key == v.key) it.copy(
+                                                    lat = r.lat, jitter = r.jitter,
+                                                    loss = r.loss, via = r.via, testedAt = now
+                                                ) else it
+                                            }
+                                        }
+                                        toast("${v.host}: ${r.lat}ms • فقد ${r.loss}%")
+                                    } else {
+                                        toast("${v.host}: لا استجابة — جرّب سيرفراً آخر")
+                                    }
+                                    busy = ""
+                                }
+                            }) { Text("فحص", maxLines = 1) }
+                            Button(onClick = { a.startOvpn(v) }) { Text("اتصال", maxLines = 1) }
+                        }
+                    }
                 }
             }
             }
