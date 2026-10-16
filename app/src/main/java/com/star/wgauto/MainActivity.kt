@@ -2103,6 +2103,26 @@ fun OvpnTab(app: WgApp, a: Actions) {
         }
         }
 
+        // ---- زر واحد: افحص واتصل بالأفضل تلقائياً ----
+        item {
+        Button(
+            onClick = {
+                scope.launch {
+                    busy = "فحص المرشحين…"
+                    val res = examOvpnBest(app, prefer) { pr -> busy = pr }
+                    busy = ""
+                    val top = res.firstOrNull()
+                    if (top == null) {
+                        toast("لا سيرفر يستجيب الآن — حدّث القائمة أو جرّب TCP ثم أعد")
+                    } else {
+                        a.startOvpn(top)
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("⚡ فحص واتصال تلقائي بالأسرع") }
+        }
+
         // ---- القائمة والتحديث ----
         item {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
