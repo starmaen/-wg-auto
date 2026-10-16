@@ -1162,10 +1162,18 @@ fun VpnBookWebView(app: WgApp, hint: String, onClose: () -> Unit) {
 }
 
 @Composable
-fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, hint: String, onClose: () -> Unit) {
+fun VpnBookWebView(
+    app: WgApp, title: String, url: String, namePrefix: String, hint: String, onClose: () -> Unit,
+    expectOvpn: Boolean = false, onOvpn: ((String, String) -> Unit)? = null
+) {
+    fun isValidConfig(text: String): Boolean = if (expectOvpn)
+        text.contains("remote ") && (text.contains("client", true) || text.contains("dev tun", true))
+    else text.contains("[Interface]") && text.contains("[Peer]")
     var statusMsg by remember { mutableStateOf("") }
     var downloading by remember { mutableStateOf(false) }
     var webRef by remember { mutableStateOf<WebView?>(null) }
+    var pageUrl by remember { mutableStateOf(url) }
+    var pageState by remember { mutableStateOf("يفتح…") }
     val ctx = LocalContext.current
 
     // يستقبل نص الكونفيج من JS (blob أو التقاط ظاهر) ويدخله للقائمة — يعمل على أي خيط
@@ -1201,8 +1209,13 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                         text = sb.toString()
                     } catch (_e: Exception) { }
                 }
-                if (!text.contains("[Interface]") || !text.contains("[Peer]")) {
+                if (!isValidConfig(text)) {
                     msg = "لم أجد كونفيج في الصفحة بعد — انتظر ظهوره ثم اضغط التقاط مجدداً"
+                } else if (expectOvpn && onOvpn != null) {
+                    val cleanName = fnameHint.substringAfterLast('/').substringAfterLast('\\')
+                        .substringBeforeLast('.').ifBlank { "$namePrefix-${System.currentTimeMillis()}" }
+                    onOvpn(text, cleanName)
+                    msg = "✔ استُلم كونفيج OpenVPN — جارٍ تجهيزه كسيرفر…"
                 } else {
                     val cleanName = fnameHint.substringAfterLast('/').substringAfterLast('\\')
                         .substringBeforeLast('.').ifBlank { "$namePrefix-${System.currentTimeMillis()}" }
@@ -1230,6 +1243,7 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
             Column(Modifier.weight(1f)) {
                 Text(title, fontWeight = FontWeight.Bold, maxLines = 1)
                 Text(hint, fontSize = 12.sp, maxLines = 2)
+                Text("الحالة: $pageState • ${pageUrl.take(70)}", fontSize = 10.sp, maxLines = 2)
             }
         }
         // زر التقاط احتياطي — لا يعطّل التنزيل التلقائي، فقط بديل عند فشل blob
@@ -1249,7 +1263,7 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                     wv.evaluateJavascript(
                         "(function(){try{" +
                             "var t=(document.body?document.body.innerText:'');" +
-                            "var i=t.indexOf('[Interface]');" +
+                            "var i=t.indexOf('" + (if (expectOvpn) "remote " else "[Interface]") + "');" +
                             "if(i<0){AndroidBlob.onError('NO_CONFIG');return;}" +
                             "AndroidBlob.onBlob(t.substring(i,i+9000));" +
                             "}catch(e){AndroidBlob.onError(''+e)}})();",
@@ -1350,10 +1364,20 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                             return false
                         }
 
+                        override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                            super.onPageStarted(view, url, favicon)
+                            wv.post {
+                                if (!url.isNullOrEmpty()) pageUrl = url
+                                pageState = "يحمّل…"
+                            }
+                        }
+
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             wv.post {
                                 if (downloading) downloading = false
+                                if (!url.isNullOrEmpty()) pageUrl = url
+                                pageState = "اكتمل التحميل"
                             }
                         }
 
@@ -1364,6 +1388,7 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                             if (request?.isForMainFrame == true) {
                                 wv.post {
                                     downloading = false
+                                    pageState = "خطأ: ${error?.description ?: "شبكة"}"
                                     statusMsg = "تعذّر تحميل الصفحة (${error?.description ?: "خطأ شبكة"}) — تحقق من الإنترنت ثم ↻ تحميل، أو افتح خارجياً"
                                 }
                             }
@@ -1442,14 +1467,20 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                                     } else {
                                         java.net.URLDecoder.decode(data, "UTF-8")
                                     }
-                                    if (text.contains("[Interface]") && text.contains("[Peer]")) {
-                                        val err = app.engine.addConfig(
-                                            "$namePrefix-${System.currentTimeMillis()}", text
-                                        )
-                                        msg = if (err == null) "✔ تم إدخال الكونفيج في القائمة (ارجع وافحصه)"
-                                        else "✗ $err"
+                                    if (isValidConfig(text)) {
+                                        if (expectOvpn && onOvpn != null) {
+                                            onOvpn(text, "$namePrefix-${System.currentTimeMillis()}")
+                                            msg = "✔ استُلم كونفيج OpenVPN — جارٍ تجهيزه كسيرفر…"
+                                        } else {
+                                            val err = app.engine.addConfig(
+                                                "$namePrefix-${System.currentTimeMillis()}", text
+                                            )
+                                            msg = if (err == null) "✔ تم إدخال الكونفيج في القائمة (ارجع وافحصه)"
+                                            else "✗ $err"
+                                        }
                                     } else {
-                                        msg = "الملف المحمّل ليس كونفيج WireGuard صالحاً"
+                                        msg = if (expectOvpn) "الملف المحمّل ليس كونفيج OpenVPN صالحاً"
+                                        else "الملف المحمّل ليس كونفيج WireGuard صالحاً"
                                     }
                                 } catch (e: Exception) {
                                     msg = "فشل التنزيل: ${e.message?.take(100)}"
@@ -1473,15 +1504,21 @@ fun VpnBookWebView(app: WgApp, title: String, url: String, namePrefix: String, h
                                 val code = conn.responseCode
                                 val text = conn.inputStream.bufferedReader().use { it.readText() }
                                 conn.disconnect()
-                                if (code in 200..299 && text.contains("[Interface]") && text.contains("[Peer]")) {
+                                if (code in 200..299 && isValidConfig(text)) {
                                     var fname = Regex("filename=\"?([^\";]+)\"?").find(contentDisposition ?: "")
                                         ?.groupValues?.getOrNull(1) ?: "$namePrefix-${System.currentTimeMillis()}.conf"
                                     fname = fname.substringAfterLast('/').substringAfterLast('\\')
-                                    val err = app.engine.addConfig(fname.substringBeforeLast('.'), text)
-                                    msg = if (err == null) "✔ تم إدخال $fname في قائمة الكونفيجات (ارجع وافحصه)"
-                                    else "✗ $err"
+                                    if (expectOvpn && onOvpn != null) {
+                                        onOvpn(text, fname.substringBeforeLast('.'))
+                                        msg = "✔ استُلم $fname — جارٍ تجهيزه كسيرفر OpenVPN…"
+                                    } else {
+                                        val err = app.engine.addConfig(fname.substringBeforeLast('.'), text)
+                                        msg = if (err == null) "✔ تم إدخال $fname في قائمة الكونفيجات (ارجع وافحصه)"
+                                        else "✗ $err"
+                                    }
                                 } else {
-                                    msg = "الملف المحمّل ليس كونفيج WireGuard صالحاً (HTTP $code)"
+                                    msg = if (expectOvpn) "الملف المحمّل ليس كونفيج OpenVPN صالحاً (HTTP $code)"
+                                    else "الملف المحمّل ليس كونفيج WireGuard صالحاً (HTTP $code)"
                                 }
                             } catch (e: Exception) {
                                 msg = "فشل التنزيل: ${e.message?.take(100)}"
@@ -1965,7 +2002,12 @@ fun startOvpnInternal(app: WgApp, server: OvpnServer, prefer: String): String {
     if (app.engine.status.value.running) app.engine.stop()
     if (app.ovpn.isUp()) app.ovpn.stop()
     val authPath = java.io.File(app.cacheDir, "ovpn/auth.txt").absolutePath
-    val ready = VpnGate.buildConnectConfig(app.store, server.key, prefer, authPath)
+    val isVbk = server.key.startsWith("vbk-")
+    val user = if (isVbk) VpnBook.OVPN_USER else "vpn"
+    val pass = if (isVbk) (app.store.prefGet("vpnbookPass") ?: "") else "vpn"
+    if (isVbk && pass.isEmpty())
+        return "انتهت كلمة سر VPNBook — أعد توليد سيرفر من زر VPNBook لتحديثها"
+    val ready = VpnGate.buildConnectConfig(app.store, server.key, prefer, authPath, user, pass)
         ?: return "تعذّر تجهيز هذا السيرفر — حدّث القائمة أو اختر سيرفراً آخر"
     return app.ovpn.start(server, ready)
 }
@@ -1986,6 +2028,52 @@ fun OvpnTab(app: WgApp, a: Actions) {
 
     fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_LONG).show()
     val prefer = settings.ovpnProto
+
+    var webVBook by remember { mutableStateOf(false) }
+    if (webVBook) {
+        VpnBookWebView(
+            app = app,
+            title = "مولد VPNBook-OpenVPN داخل التطبيق",
+            url = VpnBook.OVPN_URL,
+            namePrefix = "vbk",
+            hint = "اختر سيرفراً قريباً (ألمانيا/فرنسا/بريطانيا) وبروتوكول TCP 443 — الملف يُستورد كسيرفر تلقائياً",
+            onClose = { webVBook = false },
+            expectOvpn = true,
+            onOvpn = { text, name ->
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    var msg: String
+                    try {
+                        val rems = VpnGate.remotes(text)
+                        if (rems.isEmpty()) {
+                            msg = "الكونفيج بلا سيرفر remote — اختر ملفاً آخر"
+                        } else {
+                            val host = rems.first().host
+                            val cc = VpnBook.countryOf(host)
+                            val key = "vbk-" + host.lowercase().replace(Regex("[^a-z0-9.-]"), "_")
+                            app.store.saveVpnBookOvpn(key, text)
+                            val tcpCap = rems.any { it.proto == "tcp" }
+                            app.store.updateOvpn { l ->
+                                val rest = l.filter { it.key != key }
+                                rest + OvpnServer(
+                                    key, host, host, cc, 0, 0.0, -1,
+                                    lastSeen = System.currentTimeMillis(), stale = false, tcp = tcpCap
+                                )
+                            }
+                            val pwd = VpnBook.fetchPassword() ?: app.store.prefGet("vpnbookPass")
+                            if (!pwd.isNullOrEmpty()) app.store.prefPut("vpnbookPass", pwd)
+                            msg = if (pwd.isNullOrEmpty())
+                                "✔ أُضيف $host (${Country.name(cc)}) — تعذّر جلب كلمة السر، سيُطلب التحديث عند الاتصال"
+                            else "✔ أُضيف $host (${Country.name(cc)}) كسيرفر — افحصه واتصل"
+                        }
+                    } catch (e: Exception) {
+                        msg = "فشل تجهيز السيرفر: ${e.message?.take(100)}"
+                    }
+                    withContext(kotlinx.coroutines.Dispatchers.Main) { toast(msg) }
+                }
+            }
+        )
+        return
+    }
 
     // تحميل أولي من الكاش + تحديث تلقائي إن قَدُم (أكثر من 6 ساعات)
     LaunchedEffect(Unit) {
@@ -2138,6 +2226,14 @@ fun OvpnTab(app: WgApp, a: Actions) {
             },
             modifier = Modifier.fillMaxWidth()
         ) { Text("⚡ فحص واتصال تلقائي بالأسرع") }
+        }
+
+        // ---- مولد VPNBook-OpenVPN (سيرفرات قريبة وسريعة) ----
+        item {
+        OutlinedButton(
+            onClick = { webVBook = true },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("📖 توليد VPNBook-OpenVPN داخل التطبيق (أمريكا/أوروبا)") }
         }
 
         // ---- القائمة والتحديث ----

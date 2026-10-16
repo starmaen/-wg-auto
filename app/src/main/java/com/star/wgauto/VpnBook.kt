@@ -15,6 +15,41 @@ object VpnBook {
     data class Port(val port: Int, val label: String)
 
     const val GEN_URL = "https://www.vpnbook.com/freevpn/wireguard-vpn"
+    const val OVPN_URL = "https://www.vpnbook.com/freevpn"
+    const val OVPN_USER = "vpnbook"
+
+    /** كلمة سر OpenVPN الأسبوعية منشورة في الصفحة نفسها (JSON-LD). */
+    suspend fun fetchPassword(network: android.net.Network? = null): String? =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val url = java.net.URL("https://www.vpnbook.com/freevpn")
+                val c = (network?.openConnection(url) ?: url.openConnection()) as java.net.HttpURLConnection
+                c.connectTimeout = 15000
+                c.readTimeout = 15000
+                c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36")
+                val raw = c.inputStream.bufferedReader().use { it.readText() }
+                c.disconnect()
+                // "Username: vpnbook. Password: e5c65ph"
+                Regex("Password:\\s*([A-Za-z0-9]{4,20})").find(raw)?.groupValues?.getOrNull(1)
+            } catch (e: Exception) { null }
+        }
+
+    /** دولة مضيف VPNBook (تشمل بولندا وكندا الإضافية لنسخة OpenVPN). */
+    fun countryOf(host: String): String {
+        servers.firstOrNull { it.host.equals(host, true) }?.let { return it.country }
+        // احتياط للمضيفات الجديدة (pl134.vpnbook.com ...): أول حرفين بعد البادئة
+        val h = host.lowercase().substringBefore(".")
+        val cc = when {
+            h.startsWith("pl") -> "PL"
+            h.startsWith("us") -> "US"
+            h.startsWith("ca") -> "CA"
+            h.startsWith("uk") -> "GB"
+            h.startsWith("de") -> "DE"
+            h.startsWith("fr") -> "FR"
+            else -> ""
+        }
+        return if (host.endsWith("vpnbook.com", true)) cc else ""
+    }
 
     val servers: List<Server> = listOf(
         Server("us16.vpnbook.com", "US", "أمريكا 1"),

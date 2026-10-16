@@ -306,21 +306,35 @@ object VpnGate {
     }
 
     /** كونفيج الاتصال الجاهز: فك + فلترة بروتوكول + حقن مصادقة. null إن تعذّر. */
-    fun buildConnectConfig(store: Store, serverKey: String, prefer: String, authFilePath: String): String? {
-        val b64 = store.ovpnConfigB64(serverKey) ?: return null
-        val cfg = decodeConfig(b64) ?: return null
+    fun buildConnectConfig(
+        store: Store, serverKey: String, prefer: String, authFilePath: String,
+        authUser: String = "vpn", authPass: String = "vpn"
+    ): String? {
+        val b64 = store.ovpnConfigB64(serverKey) ?: vpnBookOvpnConfig(store, serverKey)
+        val cfg = b64?.let { decodeConfig(it) } ?: return null
         var out = filterConfig(cfg, prefer)
         if (needsAuth(out)) {
             try {
                 val f = java.io.File(authFilePath)
                 f.parentFile?.mkdirs()
-                f.writeText("vpn\nvpn\n")
+                f.writeText("$authUser\n$authPass\n")
             } catch (e: Exception) {
                 return null
             }
             out = injectAuth(out, authFilePath)
         }
         return out
+    }
+
+    /** كونفيج VPNBook المحفوظ ملفاً (مفتاح vbk-...). */
+    fun vpnBookOvpnConfig(store: Store, key: String): String? {
+        if (!key.startsWith("vbk-")) return null
+        return try {
+            val f = java.io.File(store.ovpnDir(), "$key.ovpn")
+            if (f.exists()) android.util.Base64.encodeToString(
+                f.readText().toByteArray(Charsets.UTF_8), android.util.Base64.DEFAULT
+            ) else null
+        } catch (e: Exception) { null }
     }
 
     fun speedText(mbps: Double): String = when {

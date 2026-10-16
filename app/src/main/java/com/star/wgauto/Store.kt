@@ -237,6 +237,14 @@ class Store(ctx: Context) {
         return expired.size
     }
 
+    fun ovpnDir(): java.io.File = java.io.File(appCtx.filesDir, "vbk").apply { mkdirs() }
+
+    fun saveVpnBookOvpn(key: String, configText: String) {
+        try {
+            java.io.File(ovpnDir(), "$key.ovpn").writeText(configText)
+        } catch (e: Exception) { }
+    }
+
     fun setOvpnUpdatedAt(t: Long) {
         ovpnUpdatedAt.value = t
         sp.edit().putLong("ovpnUpdatedAt", t).apply()

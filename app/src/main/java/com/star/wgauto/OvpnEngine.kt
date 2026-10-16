@@ -179,7 +179,14 @@ class OvpnEngine(ctx: Context, private val store: Store) {
         }
         val prefer = store.settings.value.ovpnProto
         val authPath = java.io.File(appCtx.cacheDir, "ovpn/auth.txt").absolutePath
-        val ready = VpnGate.buildConnectConfig(store, key, prefer, authPath) ?: return null
+        val isVbk = key.startsWith("vbk-")
+        val user = if (isVbk) VpnBook.OVPN_USER else "vpn"
+        val pass = if (isVbk) (store.prefGet("vpnbookPass") ?: "") else "vpn"
+        if (isVbk && pass.isEmpty()) {
+            store.prefPut("ovpnActive", null)
+            return null
+        }
+        val ready = VpnGate.buildConnectConfig(store, key, prefer, authPath, user, pass) ?: return null
         return try {
             OpenVpnApi.startVpn(
                 appCtx, ready, "WG Auto • ${server.host}",
