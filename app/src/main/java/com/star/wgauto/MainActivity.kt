@@ -805,7 +805,12 @@ fun ConfigsTab(app: WgApp, a: Actions) {
         return
     }
 
-    Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    // قائمة ديناميكية واحدة مثل تبويب VPN: الأدوات تُمرَّر والكونفيجات ظاهرة دائماً
+    LazyColumn(
+        Modifier.fillMaxSize().padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        item {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Button(onClick = a.importFiles, modifier = Modifier.weight(1f)) { Text("استيراد", maxLines = 1) }
             OutlinedButton(onClick = { showPaste = true }, modifier = Modifier.weight(1f)) { Text("لصق", maxLines = 1) }
@@ -873,8 +878,8 @@ fun ConfigsTab(app: WgApp, a: Actions) {
             fontSize = 12.sp
         )
         if (list.isEmpty()) Text("لا توجد كونفيجات بعد.")
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(list, key = { it.id }) { c ->
+        }
+        items(list, key = { it.id }) { c ->
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         // السطر 1: الاسم + العلم (جدول منظم)
@@ -956,7 +961,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                     }
                 }
             }
-        }
+        item {
         if (!s.autoConfig) {
             OutlinedButton(
                 onClick = {
@@ -965,6 +970,7 @@ fun ConfigsTab(app: WgApp, a: Actions) {
                 },
                 modifier = Modifier.fillMaxWidth()
             ) { Text("العودة للاختيار التلقائي") }
+        }
         }
     }
 
