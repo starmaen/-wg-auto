@@ -634,11 +634,11 @@ class Engine(ctx: Context, private val store: Store) {
         val startMtu = if (s.autoMtu) null else s.selMtu
 
         downSafe()
-        var ver = connectAndVerify(cfg, startMtu, dns?.ips() ?: emptyList(), direct)
+        val raw = connectAndVerify(cfg, startMtu, dns?.ips() ?: emptyList(), direct)
         // WARP: خروج سورياً/مخالف للتثبيت → بحث تلقائي عبر بدائل Endpoint قبل إعلان الاتصال
-        if (ver != null && isWarp(cfg)) {
-            warpForeignAssist(cfg, dns?.ips() ?: emptyList(), direct, ver)?.let { ver = it }
-        }
+        val ver = if (raw != null && isWarp(cfg))
+            warpForeignAssist(cfg, dns?.ips() ?: emptyList(), direct, raw) ?: raw
+        else raw
         if (ver != null) {
             markConnected(cfg, dns, emptyList(), ver, null, networkLabel(), direct, emptyList())
             // تحذير شفاف في كل مرة: شبكات Anycast مثل Cloudflare WARP قد تُعيد توجيهك لمركز
@@ -1711,7 +1711,7 @@ class Engine(ctx: Context, private val store: Store) {
             // توقف مبكر (توفير وقت وبيانات): مرشح أجنبي ممتاز كفاية لا يضاهيه ما بعده
             // (زمن/فقد/تذبذب منخفضة جداً) — نقطع الفحص ونثبته فوراً بلا فحص البقية.
             val exScore = Exam.score(p.lat, p.jitter, p.loss)
-            if (exScore < 45.0) {
+            if (s.autoConfig && exScore < 45.0) {
                 earlyExit = true
                 log("🏅 ${c.name}: ممتاز كفاية (درج ${"%.0f".format(exScore)}) — تخطي فحص بقية المرشحين لتوفير الوقت والبيانات")
                 setProgress("ممتاز كفاية: ${c.name} — تخطي بقية الفحص")
@@ -1724,8 +1724,8 @@ class Engine(ctx: Context, private val store: Store) {
             if (earlyExit) break
         }
         downSafe()
-        // حفظ ذاكرة الامتحان (الناجح زمنه والفاشل -1) لتسريع الفحوص القادمة على نفس الشبكة
-        writeExamMap(label, examMap + newExam)
+        // حفظ ذاكرة الامتحان (الناجح زمنه والفاشل -1) — للأتمتة فقط؛ الاختيار اليدوي منفصل عنها لا تتأثر به
+        if (s.autoConfig) writeExamMap(label, examMap + newExam)
 
         if (alive.isEmpty() && sameCountryFallback.isNotEmpty()) {
             log(
@@ -1781,10 +1781,9 @@ class Engine(ctx: Context, private val store: Store) {
                     continue
                 }
                 // WARP: خروج سورياً/مخالف للتثبيت → بحث تلقائي عبر بدائل Endpoint
-                var ver = ver0
-                if (isWarp(r.cfg)) {
-                    warpForeignAssist(r.cfg, r.dns?.ips() ?: emptyList(), direct, ver0)?.let { ver = it }
-                }
+                val ver = if (isWarp(r.cfg))
+                    warpForeignAssist(r.cfg, r.dns?.ips() ?: emptyList(), direct, ver0) ?: ver0
+                else ver0
                 markConnected(r.cfg, r.dns, r.dnsRows, ver, null, label, direct, r.mtuRows)
                 log(
                     (if (pass) "★ الأفضل (مكتمل مضمون): " else "★ الأفضل (أساسي احتياط): ") +
