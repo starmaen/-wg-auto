@@ -319,6 +319,8 @@ class Engine(ctx: Context, private val store: Store) {
                     // كونفيج مؤقت للفحص (لا نحفظ كل البدائل، فقط الأفضل)
                     val tmpCfg = WgConfig(name = "tmp-warp-probe", text = r.configText)
                     val endpoints = WarpGenerator.variants(r, max = 6)
+                    // نتيجة كل بديل: زمن>0 = نفق حي، -1 = فاشل — تُحفظ كذاكرة إصلاح ذاتي لاحقاً
+                    val probeRes = LinkedHashMap<String, Int>()
                     var tried = 0
                     var foundForeign = false
                     // جولتان: مفاتيح WARP الجديدة تحتاج 10-60 ثانية لتنتشر على كل نقاط
@@ -338,6 +340,7 @@ class Engine(ctx: Context, private val store: Store) {
                                 if (round == 1) " (إعادة بعد انتشار المفتاح)" else ""
                             val t = tmpCfg.copy(text = r.withEndpoint(ep))
                             val p = probeTunnel(t, listOf(null, 1280), emptyList(), direct)
+                            probeRes[ep] = if (p.vpn == null) -1 else p.lat
                             if (p.vpn == null) {
                                 log("WARP $ep: ✗ ${p.note}")
                                 continue
@@ -387,6 +390,14 @@ class Engine(ctx: Context, private val store: Store) {
                     val cfg = store.configs.value.firstOrNull { it.name == n }
                     // حفظ الدولة فوراً لعرض العلم بجانب IP
                     val p = bestProbe
+                    if (cfg != null) {
+                        // ذاكرة بدائل Endpoint للإصلاح الذاتي: الأجنبي المُثبت أولاً ثم الآخرون بالأسرع، ثم ولم يجدوا أجنبياً تُخزَّن الناجحة TCP فقط
+                        val alts = buildList {
+                            if (foundForeign && bestNote.isNotEmpty()) add(bestNote)
+                            probeRes.filter { it.value >= 0 }.entries.sortedBy { it.value }.forEach { add(it.key) }
+                        }.distinct()
+                        if (alts.isNotEmpty()) saveWarpAlts(cfg.id, alts)
+                    }
                     if (cfg != null && p?.exit != null) {
                         store.updateConfigs { l -> l.map {
                             if (it.id == cfg.id) it.copy(lastCountry = p.exit.loc,
@@ -409,7 +420,8 @@ class Engine(ctx: Context, private val store: Store) {
                             setResult(cfg?.id ?: "", "⚠ ${Country.label(p.exit?.loc ?: "")} — " + (if (syW) "خروج سوري مرفوض، لا يفيد إطلاقاً" else "نفس دولتك، لا يفيد للحجب") + " لكنه محفوظ للسرعة")
                             warpStatus.value =
                                 "⚠ أُضيف $n ${Country.label(p.exit?.loc ?: "")} عبر $bestNote — " + (if (syW) "سوري ✘" else "نفس دولتك") + ". " +
-                                    "الحل: اتصل بسيرفر ألماني/فرنسي/هولندي من تبويب VPN أولاً ثم ولّد WARP مجدداً وهو يعمل."
+                                    "عند الاتصال بـ $n سيُجرى البحث تلقائياً عن بديل Endpoint يعطي خروج مطابق (ذاكرة البدائل). " +
+                                    "والحل الأكيد: اتصل بسيرفر ألماني/فرنسي/هولندي من تبويب VPN أولاً ثم ولّد WARP مجدداً وهو يعمل."
                         }
                         else -> {
                             setResult(cfg?.id ?: "", "✓ ${Country.ipLine(p.exit?.ip ?: "", p.exit?.loc ?: "")} • ${p.lat}ms عبر $bestNote")
@@ -622,7 +634,11 @@ class Engine(ctx: Context, private val store: Store) {
         val startMtu = if (s.autoMtu) null else s.selMtu
 
         downSafe()
-        val ver = connectAndVerify(cfg, startMtu, dns?.ips() ?: emptyList(), direct)
+        var ver = connectAndVerify(cfg, startMtu, dns?.ips() ?: emptyList(), direct)
+        // WARP: خروج سورياً/مخالف للتثبيت → بحث تلقائي عبر بدائل Endpoint قبل إعلان الاتصال
+        if (ver != null && isWarp(cfg)) {
+            warpForeignAssist(cfg, dns?.ips() ?: emptyList(), direct, ver)?.let { ver = it }
+        }
         if (ver != null) {
             markConnected(cfg, dns, emptyList(), ver, null, networkLabel(), direct, emptyList())
             // تحذير شفاف في كل مرة: شبكات Anycast مثل Cloudflare WARP قد تُعيد توجيهك لمركز
@@ -1446,6 +1462,89 @@ class Engine(ctx: Context, private val store: Store) {
         store.prefPut("lastBest_$label", "$cfgId|$mtu|$pathMtu|$dnsId|${now()}")
     }
 
+    // ---------- ذاكرة الامتحان لكل شكلة شبكة (ترتيب مسبق = وقت وبيانات أقل) ----------
+    /** آخر زمن معروف لكل كونفيج على هذه الشكلة: "id:lat|id:lat" — زمن>0 ناجح، -1 فاشل، غياب=لم يُفحص. */
+    private fun readExamMap(label: String): Map<String, Int> {
+        val raw = store.prefGet("examLbl_${label.hashCode()}") ?: return emptyMap()
+        return raw.split("|").mapNotNull { p ->
+            val kv = p.split(":", limit = 2)
+            if (kv.size == 2) kv[0] to (kv[1].toIntOrNull() ?: return@mapNotNull null) else null
+        }.toMap()
+    }
+
+    private fun writeExamMap(label: String, m: Map<String, Int>) {
+        val s = if (m.size <= 120) m.entries.joinToString("|") { "${it.key}:${it.value}" }
+        else m.entries.sortedByDescending { it.value >= 0 }.take(120)
+            .joinToString("|") { "${it.key}:${it.value}" }
+        store.prefPut("examLbl_${label.hashCode()}", s)
+    }
+
+    // ---------- ذاكرة بدائل WARP + إصلاح الخروج عند كل اتصال ----------
+    private fun isWarp(c: WgConfig): Boolean =
+        c.name == "WARP" || c.name.startsWith("WARP-")
+
+    private fun warpAltsKey(id: String) = "warpAlts_$id"
+
+    private fun readWarpAlts(id: String): List<String> =
+        store.prefGet(warpAltsKey(id))?.split("|")?.filter { it.contains(":") } ?: emptyList()
+
+    private fun saveWarpAlts(id: String, eps: List<String>) {
+        store.prefPut(warpAltsKey(id), eps.filter { it.contains(":") }.distinct().joinToString("|"))
+    }
+
+    private fun swapEndpointLine(text: String, ep: String): String =
+        text.replace(Regex("(?i)^Endpoint\\s*=.*$", RegexOption.MULTILINE), "Endpoint = $ep")
+
+    /** هل خروج مطابق؟ السوري مرفوض دائماً؛ وعند تثبيت دولة يُقبل المطابق فقط. */
+    private fun warpExitOk(loc: String?, direct: ExitInfo?): Boolean {
+        val pin = store.settings.value.warpCountry.uppercase().take(2)
+        if (loc.isNullOrBlank() || loc.equals("SY", true)) return false
+        if (pin.isNotBlank()) return loc.uppercase() == pin
+        return direct == null || !loc.equals(direct.loc, true)
+    }
+
+    /**
+     * إصلاح ذاتي لكونفيج WARP عند كل اتصال: إن كان الخروج سورياً أو مخالفاً للتثبيت،
+     * تبدّل الـ Endpoint على بدائله المحفوظة (أو القائمة العامة) ويعيد الاختبار حتى يتحقق
+     * خروج مطابق — بلا إعادة توليد ولا بيانات تسجيل جديدة. يُثبت البديل الناجح فعلياً في
+     * الكونفيج، وإن لم يوجد يُعيد الـ Endpoint الأصلي ويوضّح ذلك للمستخدم.
+     */
+    private suspend fun warpForeignAssist(
+        cfg: WgConfig, dns: List<String>, direct: ExitInfo?, firstVer: Verified
+    ): Verified? {
+        if (!isWarp(cfg)) return null
+        if (warpExitOk(firstVer.exit?.loc, direct)) return null
+        if (readWarpAlts(cfg.id).isEmpty()) saveWarpAlts(cfg.id, WarpGenerator.ENDPOINT_CANDIDATES)
+        val alts = readWarpAlts(cfg.id)
+        if (alts.isEmpty()) return null
+        val pin = store.settings.value.warpCountry.uppercase().take(2)
+        val wanted = if (pin.isNotBlank()) Country.label(pin) else "أجنبي غير سوري"
+        val current = Probes.parseEndpoint(cfg.text)?.first ?: ""
+        val origText = cfg.text
+        log("WARP: خروج غير مطابق (${firstVer.exit?.loc ?: "؟"}) — تجربة بدائل Endpoint للوصول لـ $wanted")
+        var i = 0
+        for (ep in alts) {
+            if (i >= 6) break
+            if (ep.substringBefore(":") == current.substringBefore(":")) continue
+            i++
+            val swapped = swapEndpointLine(origText, ep)
+            store.updateConfigs { l -> l.map { if (it.id == cfg.id) it.copy(text = swapped) else it } }
+            status.update { it.copy(message = "WARP: بديل $i من ${alts.size} — $ep…") }
+            val tried = withTimeoutOrNull(45_000) {
+                connectAndVerify(cfg.copy(text = swapped), firstVer.mtu, dns, direct, strict = false)
+            }
+            if (tried != null && warpExitOk(tried.exit?.loc, direct)) {
+                log("✔ WARP: بديل يعطي خروج المطلوب: $ep → ${tried.exit?.loc} • ${tried.lat}ms")
+                saveWarpAlts(cfg.id, listOf(ep) + alts.filter { it != ep })
+                return tried
+            }
+        }
+        store.updateConfigs { l -> l.map { if (it.id == cfg.id) it.copy(text = origText) else it } }
+        status.update { it.copy(message = "WARP: لا بديل يعطي خروج $wanted على هذه الشبكة — أُبقي الـ Endpoint الأصلي") }
+        log("✗ WARP: لا بديل يعطي خروج $wanted ($i محاولة) — أُعيد الـ Endpoint الأصلي")
+        return null
+    }
+
     private fun markConnected(
         cfg: WgConfig, dns: DnsServer?, dnsRows: List<DnsRow>,
         ver: Verified, mbps: Double?, label: String, direct: ExitInfo?, mtuRows: List<MtuRow>
@@ -1544,6 +1643,18 @@ class Engine(ctx: Context, private val store: Store) {
             rows = candidates.map { ConfigRow(it.id, it.name) },
             progress = "الفحص في الخلفية — اتصال بقية التطبيقات لا يتأثر"
         )
+        // ترتيب مسبق من ذاكرة الامتحان نفس الشكلة: الأسرع المعروف أولاً ثم غير المفحوص ثم
+        // الفاشل سابقاً — يوفر وقتاً وبيانات: غالباً أول مرشح أو ثانيه هو الفائز.
+        val examMap = if (s.autoConfig) readExamMap(label) else emptyMap()
+        val orderedCandidates = if (s.autoConfig && examMap.isNotEmpty()) {
+            // الناجح بالأسرع أولاً، ثم غير المفحوص، ثم الفاشل سابقاً
+            fun key(id: String): Int =
+                examMap[id]?.let { lat -> if (lat > 0) lat else 1_000_000_000 } ?: 500_000_000
+            candidates.sortedBy { key(it.id) }
+        } else candidates
+        if (orderedCandidates != candidates) {
+            log("ترتيب مسبق من ذاكرة الامتحان: " + orderedCandidates.take(3).joinToString { it.name })
+        }
         log("بدء الفحص: $reason (${candidates.size} كونفيج)")
         downSafe()
 
@@ -1556,7 +1667,9 @@ class Engine(ctx: Context, private val store: Store) {
         val alive = ArrayList<ExamResult>()
         val sameCountryFallback = ArrayList<ExamResult>()
         var sameCountryLoc = ""
-        for ((i, c) in candidates.withIndex()) {
+        var earlyExit = false
+        val newExam = LinkedHashMap<String, Int>()
+        for ((i, c) in orderedCandidates.withIndex()) {
             currentCoroutineContext().ensureActive()
             // فاصل بين المرشحين: يمنع رشق السيرفر بمصافحات متتالية فيُحجب مؤقتاً
             if (i > 0) delay(600)
@@ -1575,8 +1688,10 @@ class Engine(ctx: Context, private val store: Store) {
                 }
                 updateRow(c.id) { it.copy(state = "fail", note = note) }
                 log("✗ ${c.name}: $note")
+                newExam[c.id] = -1
                 continue
             }
+            newExam[c.id] = p.lat
             updateRow(c.id) {
                 val exam = Exam.score(p.lat, p.jitter, p.loss)
                 it.copy(
@@ -1593,13 +1708,24 @@ class Engine(ctx: Context, private val store: Store) {
             }
             log("✓ ${c.name}: ${p.lat}ms ±${p.jitter} • فقد ${p.loss}% • MTU ${p.mtu} • ${p.exit?.ip ?: "؟"} ${p.exit?.loc ?: ""}")
             alive += ExamResult(c, p.mtu, p.lat, p.jitter, p.loss, p.exit, p.sameCountry)
+            // توقف مبكر (توفير وقت وبيانات): مرشح أجنبي ممتاز كفاية لا يضاهيه ما بعده
+            // (زمن/فقد/تذبذب منخفضة جداً) — نقطع الفحص ونثبته فوراً بلا فحص البقية.
+            val exScore = Exam.score(p.lat, p.jitter, p.loss)
+            if (exScore < 45.0) {
+                earlyExit = true
+                log("🏅 ${c.name}: ممتاز كفاية (درج ${"%.0f".format(exScore)}) — تخطي فحص بقية المرشحين لتوفير الوقت والبيانات")
+                setProgress("ممتاز كفاية: ${c.name} — تخطي بقية الفحص")
+            }
             } catch (e: Exception) {
                 // مرشح واحد لا يُسقط الامتحان كله — يُسجَّل ويُتابَع البقية
                 updateRow(c.id) { it.copy(state = "fail", note = "خطأ فحص: ${e.message?.take(60)}") }
                 log("✗ ${c.name}: خطأ فحص (${e.message?.take(60)}) — متابعة البقية")
             }
+            if (earlyExit) break
         }
         downSafe()
+        // حفظ ذاكرة الامتحان (الناجح زمنه والفاشل -1) لتسريع الفحوص القادمة على نفس الشبكة
+        writeExamMap(label, examMap + newExam)
 
         if (alive.isEmpty() && sameCountryFallback.isNotEmpty()) {
             log(
@@ -1647,12 +1773,17 @@ class Engine(ctx: Context, private val store: Store) {
                 currentCoroutineContext().ensureActive()
                 try {
                 setProgress("تثبيت الاتصال: ${r.cfg.name}" + if (pass) "" else " (احتياط)")
-                val ver = withTimeoutOrNull(75_000) {
+                val ver0 = withTimeoutOrNull(75_000) {
                     connectAndVerify(r.cfg, r.mtu, r.dns?.ips() ?: emptyList(), direct, strict = pass)
                 }
-                if (ver == null) {
+                if (ver0 == null) {
                     log("✗ فشل التحقق بعد التثبيت: ${r.cfg.name} — التالي في الترتيب")
                     continue
+                }
+                // WARP: خروج سورياً/مخالف للتثبيت → بحث تلقائي عبر بدائل Endpoint
+                var ver = ver0
+                if (isWarp(r.cfg)) {
+                    warpForeignAssist(r.cfg, r.dns?.ips() ?: emptyList(), direct, ver0)?.let { ver = it }
                 }
                 markConnected(r.cfg, r.dns, r.dnsRows, ver, null, label, direct, r.mtuRows)
                 log(
