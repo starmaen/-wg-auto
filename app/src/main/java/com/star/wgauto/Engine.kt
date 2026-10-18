@@ -1709,9 +1709,10 @@ class Engine(ctx: Context, private val store: Store) {
             log("✓ ${c.name}: ${p.lat}ms ±${p.jitter} • فقد ${p.loss}% • MTU ${p.mtu} • ${p.exit?.ip ?: "؟"} ${p.exit?.loc ?: ""}")
             alive += ExamResult(c, p.mtu, p.lat, p.jitter, p.loss, p.exit, p.sameCountry)
             // توقف مبكر (توفير وقت وبيانات): مرشح أجنبي ممتاز كفاية لا يضاهيه ما بعده
-            // (زمن/فقد/تذبذب منخفضة جداً) — نقطع الفحص ونثبته فوراً بلا فحص البقية.
+            // (زمن/فقد/تذبذب منخفضة جداً) — فقط في إعادة الوصل التلقائية السريعة.
+            // الامتحان الشامل اليدوي (التشغيل/بحث كامل شامل) يفحص الجميع دائماً بلا اختصار.
             val exScore = Exam.score(p.lat, p.jitter, p.loss)
-            if (s.autoConfig && exScore < 45.0) {
+            if (s.autoConfig && allowFast && exScore < 45.0) {
                 earlyExit = true
                 log("🏅 ${c.name}: ممتاز كفاية (درج ${"%.0f".format(exScore)}) — تخطي فحص بقية المرشحين لتوفير الوقت والبيانات")
                 setProgress("ممتاز كفاية: ${c.name} — تخطي بقية الفحص")
