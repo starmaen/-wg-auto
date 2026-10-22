@@ -635,47 +635,6 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
         app.store.setExtraUpdatedAt(System.currentTimeMillis())
     }
 
-    fun refreshAll(urls: List<String>? = null) {
-        val sources0 = urls ?: sources
-        if (sources0.isEmpty()) {
-            toast("أضف رابط اشتراك أولاً")
-            return
-        }
-        if (busy.isNotEmpty()) return
-        busy = "جارٍ جلب ${sources0.size} مصادر…"
-        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            var got = 0
-            var failed = 0
-            var firstErr = ""
-            val found = ArrayList<ExtraServer>()
-            for (u in sources0) {
-                try {
-                    val text = ExtraServers.fetch(u)
-                    val parsed = ExtraServers.parseSubscription(text, u)
-                    if (parsed.isEmpty()) {
-                        failed++
-                        if (firstErr.isEmpty()) firstErr = "لا سيرفرات مفهومة في الرابط"
-                    } else {
-                        found.addAll(parsed)
-                        got += parsed.size
-                    }
-                } catch (e: Exception) {
-                    failed++
-                    if (firstErr.isEmpty()) firstErr = (e.message ?: "خطأ شبكة").take(70)
-                }
-            }
-            withContext(kotlinx.coroutines.Dispatchers.Main) {
-                addAll(found)
-                busy = ""
-                toast(
-                    if (got == 0) "تعذّر الجلب — $firstErr"
-                    else "تم جلب $got سيرفر" + (if (failed > 0) " • تعذّر $failed رابط" else "")
-                )
-                if (got > 0) probeAll()
-            }
-        }
-    }
-
     fun importText(text: String, src: String) {
         if (text.isBlank()) {
             toast("النص فارغ")
@@ -711,48 +670,6 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                 }
             }
         }
-    }
-
-    /** فحص جماعي سريع: يبقي المتاح فقط في الأعلى ويعرف المستخدم ما يعمل فعلاً. */
-    fun probeAll() {
-        if (probing || busy.isNotEmpty()) return
-        val targets = app.store.extra.value.filter { it.connectable }.take(120)
-        if (targets.isEmpty()) return
-        probing = true
-        busy = "فحص ${targets.size} سيرفر…"
-        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            val res = targets.map { s -> async { s.id to ExtraServers.tcpTest(s.host, s.port, 3500) } }
-                .map { it.await() }
-            withContext(kotlinx.coroutines.Dispatchers.Main) {
-                val now = System.currentTimeMillis()
-                app.store.updateExtra { l ->
-                    l.map { cur ->
-                        res.firstOrNull { it.first == cur.id }?.let {
-                            cur.copy(lat = it.second, testedAt = now)
-                        } ?: cur
-                    }
-                }
-                probing = false
-                busy = ""
-                toast("فحص ${res.size} سيرفر — ${res.count { it.second >= 0 }} يعمل")
-                autoPick()
-            }
-        }
-    }
-
-    /** بعد الفحص: اتصال تلقائي بأفضل سيرفر عامل إن لم يكن هناك نفق قائم. */
-    fun autoPick() {
-        if (!auto) return
-        if (app.store.prefGet("extraAutoConnect") == "0") return
-        if (app.engine.status.value.running || app.ovpn.isUp() || XrayEngine.isUp()) return
-        val last = app.store.prefGet("extraAutoPickAt")?.toLongOrNull() ?: 0L
-        if (System.currentTimeMillis() - last < 10L * 60 * 1000) return
-        val best = app.store.extra.value
-            .filter { it.protocol in setOf("vmess", "vless", "trojan", "ss") && it.lat >= 0 }
-            .minByOrNull { it.lat } ?: return
-        app.store.prefPut("extraAutoPickAt", System.currentTimeMillis().toString())
-        toast("اتصال تلقائي بأفضل سيرفر: ${best.title} (${best.lat}ms)")
-        connect(best)
     }
 
     // العلم مطلوب لكل سيرفر: من الاسم أولاً، وإن غاب نجلبه من عنوان الاتصال بالخلفية (مرة واحدة).
@@ -816,6 +733,89 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                     toast("الأسرع: ${best.first.title} (${best.second}ms) — جارٍ الاتصال")
                     connect(best.first)
                 }
+            }
+        }
+    }
+
+    /** بعد الفحص: اتصال تلقائي بأفضل سيرفر عامل إن لم يكن هناك نفق قائم. */
+    fun autoPick() {
+        if (!auto) return
+        if (app.store.prefGet("extraAutoConnect") == "0") return
+        if (app.engine.status.value.running || app.ovpn.isUp() || XrayEngine.isUp()) return
+        val last = app.store.prefGet("extraAutoPickAt")?.toLongOrNull() ?: 0L
+        if (System.currentTimeMillis() - last < 10L * 60 * 1000) return
+        val best = app.store.extra.value
+            .filter { it.protocol in setOf("vmess", "vless", "trojan", "ss") && it.lat >= 0 }
+            .minByOrNull { it.lat } ?: return
+        app.store.prefPut("extraAutoPickAt", System.currentTimeMillis().toString())
+        toast("اتصال تلقائي بأفضل سيرفر: ${best.title} (${best.lat}ms)")
+        connect(best)
+    }
+
+    /** فحص جماعي سريع: يبقي المتاح فقط في الأعلى ويعرف المستخدم ما يعمل فعلاً. */
+    fun probeAll() {
+        if (probing || busy.isNotEmpty()) return
+        val targets = app.store.extra.value.filter { it.connectable }.take(120)
+        if (targets.isEmpty()) return
+        probing = true
+        busy = "فحص ${targets.size} سيرفر…"
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val res = targets.map { s -> async { s.id to ExtraServers.tcpTest(s.host, s.port, 3500) } }
+                .map { it.await() }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                val now = System.currentTimeMillis()
+                app.store.updateExtra { l ->
+                    l.map { cur ->
+                        res.firstOrNull { it.first == cur.id }?.let {
+                            cur.copy(lat = it.second, testedAt = now)
+                        } ?: cur
+                    }
+                }
+                probing = false
+                busy = ""
+                toast("فحص ${res.size} سيرفر — ${res.count { it.second >= 0 }} يعمل")
+                autoPick()
+            }
+        }
+    }
+
+    fun refreshAll(urls: List<String>? = null) {
+        val sources0 = urls ?: sources
+        if (sources0.isEmpty()) {
+            toast("أضف رابط اشتراك أولاً")
+            return
+        }
+        if (busy.isNotEmpty()) return
+        busy = "جارٍ جلب ${sources0.size} مصادر…"
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            var got = 0
+            var failed = 0
+            var firstErr = ""
+            val found = ArrayList<ExtraServer>()
+            for (u in sources0) {
+                try {
+                    val text = ExtraServers.fetch(u)
+                    val parsed = ExtraServers.parseSubscription(text, u)
+                    if (parsed.isEmpty()) {
+                        failed++
+                        if (firstErr.isEmpty()) firstErr = "لا سيرفرات مفهومة في الرابط"
+                    } else {
+                        found.addAll(parsed)
+                        got += parsed.size
+                    }
+                } catch (e: Exception) {
+                    failed++
+                    if (firstErr.isEmpty()) firstErr = (e.message ?: "خطأ شبكة").take(70)
+                }
+            }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                addAll(found)
+                busy = ""
+                toast(
+                    if (got == 0) "تعذّر الجلب — $firstErr"
+                    else "تم جلب $got سيرفر" + (if (failed > 0) " • تعذّر $failed رابط" else "")
+                )
+                if (got > 0) probeAll()
             }
         }
     }
