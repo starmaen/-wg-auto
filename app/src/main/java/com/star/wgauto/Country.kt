@@ -29,6 +29,15 @@ object Country {
         return arabic[c] ?: c
     }
 
+    /** يستخرج رمز الدولة من اسم عربي مكتوب في اسم السيرفر (مثل «سيرفر ألمانيا»). */
+    fun codeFromText(s: String): String {
+        val t = s.lowercase()
+        for ((cc, ar) in arabic) {
+            if (t.contains(ar)) return cc
+        }
+        return ""
+    }
+
     /** سطر جاهز للعرض: "🇩🇪 ألمانيا" أو "—" */
     fun label(cc: String): String {
         if (cc.isBlank()) return "—"

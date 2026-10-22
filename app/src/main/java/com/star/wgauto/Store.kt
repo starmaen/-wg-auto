@@ -14,6 +14,9 @@ class Store(ctx: Context) {
     val settings = MutableStateFlow(loadSettings())
     val ovpn = MutableStateFlow(loadOvpn())
     val ovpnUpdatedAt = MutableStateFlow(sp.getLong("ovpnUpdatedAt", 0L))
+    val extra = MutableStateFlow(loadExtra())
+    val extraUpdatedAt = MutableStateFlow(sp.getLong("extraUpdatedAt", 0L))
+    val extraSourcesFlow = MutableStateFlow(loadExtraSources())
 
     // ---------- configs ----------
     fun updateConfigs(f: (List<WgConfig>) -> List<WgConfig>) {
@@ -296,5 +299,44 @@ class Store(ctx: Context) {
             if (s.key == key) return s.configB64
         }
         return null
+    }
+
+    // ---------- سيرفرات إضافية (اشتراكات عامة) ----------
+    fun updateExtra(f: (List<ExtraServer>) -> List<ExtraServer>) {
+        extra.value = f(extra.value)
+        sp.edit().putString("extra", ExtraServers.toJsonList(extra.value)).apply()
+    }
+
+    private fun loadExtra(): List<ExtraServer> {
+        val s = sp.getString("extra", null) ?: return emptyList()
+        return try {
+            val a = JSONArray(s)
+            (0 until a.length()).mapNotNull { ExtraServers.fromJson(a.getJSONObject(it)) }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun setExtraUpdatedAt(t: Long) {
+        extraUpdatedAt.value = t
+        sp.edit().putLong("extraUpdatedAt", t).apply()
+    }
+
+    fun extraSources(): List<String> = extraSourcesFlow.value
+
+    fun setExtraSources(list: List<String>) {
+        val clean = list.map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        extraSourcesFlow.value = clean
+        sp.edit().putString("extraSources", JSONArray(clean).toString()).apply()
+    }
+
+    private fun loadExtraSources(): List<String> {
+        return try {
+            val s = sp.getString("extraSources", null) ?: return emptyList()
+            val a = JSONArray(s)
+            (0 until a.length()).map { a.optString(it, "") }.filter { it.isNotBlank() }
+        } catch (e: Exception) {
+            emptyList()
+        }
     }
 }

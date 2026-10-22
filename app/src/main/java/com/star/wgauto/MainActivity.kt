@@ -117,7 +117,8 @@ class Actions(
     val shutdownAll: () -> Unit,
     val openVpnSettings: () -> Unit,
     val activateConfig: (String) -> Unit,
-    val startOvpn: (OvpnServer) -> Unit
+    val startOvpn: (OvpnServer) -> Unit,
+    val startExtraOvpn: (ExtraServer) -> Unit
 )
 
 class MainActivity : ComponentActivity() {
@@ -210,6 +211,18 @@ class MainActivity : ComponentActivity() {
                     } else {
                         toast(startOvpnInternal(app, s, st.settings.value.ovpnProto))
                     }
+                }
+            },
+            // سيرفر مستورد من اشتراك عام: نفق واحد فقط — نوقف WireGuard ثم نشغّل الكونفيج كما هو
+            startExtraOvpn = { s ->
+                withVpnPermission {
+                    if (app.engine.status.value.running) app.engine.stop()
+                    if (app.ovpn.isUp()) app.ovpn.stop()
+                    val server = OvpnServer(
+                        key = "extra-" + s.id, host = s.host, ip = s.host,
+                        country = s.country, lastSeen = System.currentTimeMillis()
+                    )
+                    toast(app.ovpn.start(server, s.raw, null, null))
                 }
             }
         )
@@ -452,12 +465,367 @@ fun Root(app: WgApp, a: Actions) {
             when (tab) {
                 0 -> HomeTab(app, a)
                 1 -> ConfigsTab(app, a)
-                2 -> OvpnTab(app, a)
+                2 -> VpnHub(app, a)
                 3 -> DnsTab(app)
                 else -> SettingsTab(app, a)
             }
         }
     }
+}
+
+/**
+ * تبويب VPN = مركز واحد بخدمتين مستقلتين:
+ * 1) OpenVPN المدمج (القائم كما هو).
+ * 2) سيرفرات إضافية من اشتراكات عامة — قسم مستقل لا يمس أي خدمة أخرى.
+ */
+@Composable
+fun VpnHub(app: WgApp, a: Actions) {
+    var sub by remember { mutableIntStateOf(0) }
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(
+                selected = sub == 0, onClick = { sub = 0 },
+                label = { Text("OpenVPN المدمج", maxLines = 1) }
+            )
+            FilterChip(
+                selected = sub == 1, onClick = { sub = 1 },
+                label = { Text("سيرفرات إضافية", maxLines = 1) }
+            )
+        }
+        if (sub == 0) OvpnTab(app, a) else ExtraServersTab(app, a)
+    }
+}
+
+/** قسم السيرفرات الإضافية: استيراد اشتراكات عامة وتشغيل wg/ovpn منها. */
+@Composable
+fun ExtraServersTab(app: WgApp, a: Actions) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val list by app.store.extra.collectAsState()
+    val sources by app.store.extraSourcesFlow.collectAsState()
+    val updatedAt by app.store.extraUpdatedAt.collectAsState()
+    var showAdd by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf("") }
+    var auto by remember { mutableStateOf(app.store.prefGet("extraAuto") == "1") }
+
+    fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_LONG).show()
+
+    fun setAuto(v: Boolean) {
+        auto = v
+        app.store.prefPut("extraAuto", if (v) "1" else "0")
+    }
+
+    fun addAll(found: List<ExtraServer>) {
+        if (found.isEmpty()) return
+        app.store.updateExtra { cur ->
+            val keys = found.map { it.key }.toSet()
+            cur.filter { it.key !in keys } + found
+        }
+        app.store.setExtraUpdatedAt(System.currentTimeMillis())
+    }
+
+    fun refreshAll() {
+        if (sources.isEmpty()) {
+            toast("أضف رابط اشتراك أولاً")
+            return
+        }
+        if (busy.isNotEmpty()) return
+        busy = "جارٍ جلب الاشتراكات…"
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            var got = 0
+            var failed = 0
+            var firstErr = ""
+            val found = ArrayList<ExtraServer>()
+            for (u in sources) {
+                try {
+                    val text = ExtraServers.fetch(u)
+                    val parsed = ExtraServers.parseSubscription(text, u)
+                    if (parsed.isEmpty()) {
+                        failed++
+                        if (firstErr.isEmpty()) firstErr = "لا سيرفرات مفهومة في الرابط"
+                    } else {
+                        found.addAll(parsed)
+                        got += parsed.size
+                    }
+                } catch (e: Exception) {
+                    failed++
+                    if (firstErr.isEmpty()) firstErr = (e.message ?: "خطأ شبكة").take(70)
+                }
+            }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                addAll(found)
+                busy = ""
+                toast(
+                    if (got == 0) "تعذّر الجلب — $firstErr"
+                    else "تم جلب $got سيرفر" + (if (failed > 0) " • تعذّر $failed رابط" else "")
+                )
+            }
+        }
+    }
+
+    fun importText(text: String, src: String) {
+        if (text.isBlank()) {
+            toast("النص فارغ")
+            return
+        }
+        busy = "جارٍ تحليل المحتوى…"
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val parsed = ExtraServers.parseSubscription(text, src)
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                busy = ""
+                if (parsed.isEmpty()) {
+                    toast("لا سيرفرات مفهومة — تأكد أنه رابط اشتراك أو كونفيج wg/ovpn")
+                } else {
+                    addAll(parsed)
+                    toast("أُضيف ${parsed.size} سيرفر — اضغط فحص أو اتصال")
+                }
+            }
+        }
+    }
+
+    fun testOne(s: ExtraServer) {
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val ms = ExtraServers.tcpTest(s.host, s.port)
+            val cc = if (s.country.isBlank()) ExtraServers.resolveCountry(s.host) else s.country
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                app.store.updateExtra { l ->
+                    l.map { if (it.id == s.id) it.copy(lat = ms, country = it.country.ifBlank { cc }) else it }
+                }
+            }
+        }
+    }
+
+    // العلم مطلوب لكل سيرفر: من الاسم أولاً، وإن غاب نجلبه من عنوان الاتصال بالخلفية (مرة واحدة).
+    fun resolveMissingCountries() {
+        val pending = list.filter { it.country.isBlank() }.take(20)
+        if (pending.isEmpty()) return
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            for (s in pending) {
+                val cc = ExtraServers.resolveCountry(s.host)
+                if (cc.isNotBlank()) {
+                    withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        app.store.updateExtra { l -> l.map { if (it.id == s.id) it.copy(country = cc) else it } }
+                    }
+                }
+            }
+        }
+    }
+
+    fun connect(s: ExtraServer) {
+        if (s.protocol == "wg") {
+            val cfg = WgConfig(name = "Extra • " + s.title, text = s.raw)
+            app.store.updateConfigs { it + cfg }
+            a.activateConfig(cfg.id)
+            toast("يُتصل عبر WireGuard: ${s.title}")
+        } else if (s.protocol == "ovpn") {
+            a.startExtraOvpn(s)
+        }
+    }
+
+    /** الاختيار التلقائي: يفحص كل السيرفرات القابلة للتشغيل ويتصل بالأسرع استجابة. */
+    fun connectFastest() {
+        val candidates = list.filter { it.connectable }
+        if (candidates.isEmpty()) {
+            toast("لا سيرفرات قابلة للتشغيل — أضف WireGuard أو OpenVPN")
+            return
+        }
+        if (busy.isNotEmpty()) return
+        busy = "جارٍ فحص ${candidates.size} سيرفر لاختيار الأسرع…"
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val results = candidates.map { s ->
+                async { s to ExtraServers.tcpTest(s.host, s.port) }
+            }.map { it.await() }
+            val alive = results.filter { it.second >= 0 }.sortedBy { it.second }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                app.store.updateExtra { l ->
+                    l.map { cur ->
+                        results.firstOrNull { it.first.id == cur.id }?.let { cur.copy(lat = it.second) } ?: cur
+                    }
+                }
+                busy = ""
+                val best = alive.firstOrNull()
+                if (best == null) {
+                    toast("كل السيرفرات غير متاحة الآن — حدّث الاشتراك أو أضف غيره")
+                } else {
+                    toast("الأسرع: ${best.first.title} (${best.second}ms) — جارٍ الاتصال")
+                    connect(best.first)
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(list.count { it.country.isBlank() }) { resolveMissingCountries() }
+
+    if (showAdd) {
+        AddExtraDialog(
+            onClose = { showAdd = false },
+            onSubmit = { text ->
+                val t = text.trim()
+                if (t.startsWith("http://") || t.startsWith("https://")) {
+                    app.store.setExtraSources(sources + t)
+                    showAdd = false
+                    toast("أُضيف الرابط — سأجلبه الآن")
+                    busy = ""
+                    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        try {
+                            val body = ExtraServers.fetch(t)
+                            val parsed = ExtraServers.parseSubscription(body, t)
+                            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                addAll(parsed)
+                                toast(if (parsed.isEmpty()) "الرابط أُضيف لكن لا سيرفرات مفهومة فيه" else "أُضيف ${parsed.size} سيرفر من الرابط")
+                            }
+                        } catch (e: Exception) {
+                            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                toast("الرابط أُضيف — تعذّر الجلب الآن: ${(e.message ?: "خطأ شبكة").take(60)}")
+                            }
+                        }
+                    }
+                } else {
+                    importText(t, "لصق يدوي")
+                    showAdd = false
+                }
+            }
+        )
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        Card(Modifier.fillMaxWidth().padding(12.dp)) {
+            Column(Modifier.padding(12.dp)) {
+                Text("سيرفرات إضافية", fontWeight = FontWeight.Bold)
+                Text(
+                    "استورد روابط اشتراك عامة. يعمل الآن: WireGuard و OpenVPN. " +
+                        "بقية البروتوكولات (vmess/vless/trojan/ss) تُحفظ وتُعرض ويأتي تشغيلها مع محرّك Xray.",
+                    fontSize = 12.sp
+                )
+                if (updatedAt > 0L) {
+                    Text(
+                        "آخر تحديث: " + SimpleDateFormat("HH:mm", Locale.US).format(Date(updatedAt)),
+                        fontSize = 11.sp
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { refreshAll() }, enabled = busy.isEmpty()) {
+                        Text(if (busy.isEmpty()) "تحديث الاشتراكات" else busy, maxLines = 1)
+                    }
+                    OutlinedButton(onClick = { showAdd = true }, enabled = busy.isEmpty()) {
+                        Text("إضافة اشتراك")
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = !auto, onClick = { setAuto(false) },
+                        label = { Text("اختيار يدوي", maxLines = 1) }
+                    )
+                    FilterChip(
+                        selected = auto, onClick = { setAuto(true) },
+                        label = { Text("تلقائي: الأسرع", maxLines = 1) }
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                if (auto) {
+                    Button(
+                        onClick = { connectFastest() },
+                        enabled = busy.isEmpty() && list.any { it.connectable }
+                    ) { Text("اتصل بالأسرع الآن") }
+                }
+                if (sources.isNotEmpty()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text("الروابط: ${sources.size}", fontSize = 11.sp)
+                }
+            }
+        }
+
+        if (list.isEmpty()) {
+            Box(Modifier.fillMaxWidth().weight(1f).padding(24.dp), contentAlignment = Alignment.Center) {
+                Text("لا سيرفرات بعد — أضف رابط اشتراك أو الصق كونفيجاً", fontSize = 13.sp)
+            }
+        } else {
+            LazyColumn(Modifier.fillMaxWidth().weight(1f), contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp)) {
+                items(list, key = { it.id }) { s ->
+                    Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                        Column(Modifier.padding(12.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    s.protocol.uppercase(Locale.US),
+                                    fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(end = 8.dp)
+                                )
+                                Text(s.title, fontWeight = FontWeight.Bold, maxLines = 1)
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    if (s.country.isNotBlank()) Country.label(s.country) else "🏳️ جارٍ تحديد الدولة",
+                                    fontSize = 12.sp
+                                )
+                            }
+                            Text(
+                                s.host + ":" + s.port +
+                                    if (s.lat >= 0) " • ${s.lat}ms" else " • لم يُفحص",
+                                fontSize = 12.sp
+                            )
+                            if (!s.connectable) {
+                                Text("يتطلب محرّك Xray (مرحلة لاحقة) — محفوظ للعرض فقط", fontSize = 11.sp)
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                if (s.connectable) {
+                                    Button(onClick = { connect(s) }) { Text("اتصال") }
+                                }
+                                OutlinedButton(onClick = { testOne(s) }) { Text("فحص") }
+                                OutlinedButton(onClick = {
+                                    app.store.updateExtra { l -> l.filter { it.id != s.id } }
+                                }) { Text("حذف") }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AddExtraDialog(onClose: () -> Unit, onSubmit: (String) -> Unit) {
+    val ctx = LocalContext.current
+    var text by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("إضافة اشتراك / كونفيج") },
+        text = {
+            Column {
+                Text("الصق رابط اشتراك (base64) أو رابط كونفيج أو نص كونفيج wg/ovpn مباشرة.", fontSize = 12.sp)
+                OutlinedTextField(
+                    value = text, onValueChange = { text = it },
+                    minLines = 4, maxLines = 8,
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                )
+                TextButton(onClick = {
+                    try {
+                        val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        val clip = cm.primaryClip
+                        if (clip != null && clip.itemCount > 0) {
+                            text = clip.getItemAt(0).text?.toString() ?: ""
+                        }
+                    } catch (e: Exception) {
+                    }
+                }) { Text("لصق من الحافظة") }
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onSubmit(text) }) { Text("إضافة") }
+        },
+        dismissButton = {
+            TextButton(onClick = onClose) { Text("إلغاء") }
+        }
+    )
 }
 
 /** ضوء أحمر ناعم نابض يدل على العنصر الذي اختاره التطبيق. */
