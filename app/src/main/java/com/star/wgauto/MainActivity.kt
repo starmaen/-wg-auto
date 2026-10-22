@@ -67,6 +67,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
@@ -75,10 +76,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -494,15 +495,27 @@ fun LicenseGate(app: WgApp, content: @Composable () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun Root(app: WgApp, a: Actions) {
     var tab by remember { mutableIntStateOf(0) }
-    val titles = listOf("الرئيسية", "الكونفيجات", "VPN 🌍", "سيرفرات", "DNS", "الإعدادات")
+    val titles = listOf(
+        "🏠 الرئيسية", "📄 الكونفيجات", "🌍 VPN", "🚀 سيرفرات", "🛡️ DNS", "⚙️ الإعدادات"
+    )
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().systemBarsPadding()) {
-            TabRow(selectedTabIndex = tab) {
+            // شريط قابل للتمرير: النصوص لا تُقصّ ولا تتكدّس
+            ScrollableTabRow(
+                selectedTabIndex = tab,
+                edgePadding = 6.dp,
+                containerColor = MaterialTheme.colorScheme.surface
+            ) {
                 titles.forEachIndexed { i, t ->
-                    Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t, maxLines = 1) })
+                    Tab(
+                        selected = tab == i,
+                        onClick = { tab = i },
+                        text = { Text(t, maxLines = 1, softWrap = false) }
+                    )
                 }
             }
             when (tab) {
@@ -542,24 +555,25 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
         if (found.isEmpty()) return
         app.store.updateExtra { cur ->
             val keys = found.map { it.key }.toSet()
-            cur.filter { it.key !in keys } + found
+            (found + cur.filter { it.key !in keys }).distinctBy { it.key }.take(800)
         }
         app.store.setExtraUpdatedAt(System.currentTimeMillis())
     }
 
-    fun refreshAll() {
-        if (sources.isEmpty()) {
+    fun refreshAll(urls: List<String>? = null) {
+        val sources0 = urls ?: sources
+        if (sources0.isEmpty()) {
             toast("أضف رابط اشتراك أولاً")
             return
         }
         if (busy.isNotEmpty()) return
-        busy = "جارٍ جلب الاشتراكات…"
+        busy = "جارٍ جلب ${sources0.size} مصادر…"
         scope.launch(kotlinx.coroutines.Dispatchers.IO) {
             var got = 0
             var failed = 0
             var firstErr = ""
             val found = ArrayList<ExtraServer>()
-            for (u in sources) {
+            for (u in sources0) {
                 try {
                     val text = ExtraServers.fetch(u)
                     val parsed = ExtraServers.parseSubscription(text, u)
@@ -684,6 +698,18 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     }
 
     LaunchedEffect(list.count { it.country.isBlank() }) { resolveMissingCountries() }
+
+    // جلب تلقائي عند أول فتح (أو إذا مرّت 6 ساعات) بدل تبويب فارغ
+    LaunchedEffect(Unit) {
+        val stale = updatedAt == 0L || System.currentTimeMillis() - updatedAt > 6L * 3600 * 1000
+        val lastTry = app.store.prefGet("extraAutoAt")?.toLongOrNull() ?: 0L
+        if (stale && busy.isEmpty() && sources.isNotEmpty() &&
+            System.currentTimeMillis() - lastTry > 5L * 60 * 1000
+        ) {
+            app.store.prefPut("extraAutoAt", System.currentTimeMillis().toString())
+            refreshAll()
+        }
+    }
 
     if (showAdd) {
         AddExtraDialog(

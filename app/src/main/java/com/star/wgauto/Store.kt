@@ -18,6 +18,13 @@ class Store(ctx: Context) {
     val extraUpdatedAt = MutableStateFlow(sp.getLong("extraUpdatedAt", 0L))
     val extraSourcesFlow = MutableStateFlow(loadExtraSources())
 
+    init {
+        // أول تشغيل: مصادر مجانية جاهزة بدل تبويب فارغ
+        if (sp.getString("extraSources", null) == null) {
+            setExtraSources(ExtraServers.DEFAULT_SOURCES)
+        }
+    }
+
     // ---------- configs ----------
     fun updateConfigs(f: (List<WgConfig>) -> List<WgConfig>) {
         configs.value = f(configs.value)

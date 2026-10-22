@@ -37,7 +37,19 @@ data class ExtraServer(
 
 /** تحميل/تحليل/فحص الاشتراكات العامة. بلا أي مكتبة خارجية. */
 object ExtraServers {
-    private const val UA = "WG Auto/1.54"
+    private const val UA = "WG Auto/1.55"
+
+    /**
+     * مصادر عامة مجانية تُجلب تلقائياً عند أول فتح.
+     * كلها مستودعات GitHub عامة تُحدَّث دورياً (ss/vmess/vless/trojan).
+     */
+    val DEFAULT_SOURCES: List<String> = listOf(
+        "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/Eternity.txt",
+        "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
+        "https://raw.githubusercontent.com/freefq/free/master/v2",
+        "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/mix",
+        "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/server.txt"
+    )
 
     // ---------- الشبكة ----------
     fun fetch(url: String): String {
@@ -154,6 +166,7 @@ object ExtraServers {
         val seen = HashSet<String>()
         fun add(s: ExtraServer?) {
             if (s == null || s.host.isBlank()) return
+            if (out.size >= 300) return
             val fixed = s.copy(source = if (s.source.isBlank()) source else s.source)
             if (seen.add(fixed.key + "|" + fixed.name)) out.add(fixed)
         }
