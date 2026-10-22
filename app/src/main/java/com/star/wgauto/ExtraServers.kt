@@ -26,6 +26,7 @@ data class ExtraServer(
     val source: String = "",
     val lat: Int = -1,
     val note: String = "",
+    val testedAt: Long = 0,
     val addedAt: Long = System.currentTimeMillis()
 ) {
     val connectable: Boolean
@@ -360,7 +361,7 @@ object ExtraServers {
         .put("id", s.id).put("name", s.name).put("protocol", s.protocol)
         .put("host", s.host).put("port", s.port).put("country", s.country)
         .put("raw", s.raw).put("source", s.source).put("lat", s.lat)
-        .put("note", s.note).put("addedAt", s.addedAt)
+        .put("note", s.note).put("testedAt", s.testedAt).put("addedAt", s.addedAt)
 
     fun fromJson(o: JSONObject): ExtraServer? = try {
         ExtraServer(
@@ -369,7 +370,8 @@ object ExtraServers {
             host = o.optString("host", ""), port = o.optInt("port", 0),
             country = o.optString("country", ""), raw = o.optString("raw", ""),
             source = o.optString("source", ""), lat = o.optInt("lat", -1),
-            note = o.optString("note", ""), addedAt = o.optLong("addedAt", System.currentTimeMillis())
+            note = o.optString("note", ""), testedAt = o.optLong("testedAt", 0L),
+            addedAt = o.optLong("addedAt", System.currentTimeMillis())
         )
     } catch (e: Exception) {
         null

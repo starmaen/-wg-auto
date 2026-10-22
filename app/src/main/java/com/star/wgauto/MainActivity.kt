@@ -8,6 +8,8 @@ import android.content.IntentFilter
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.Bundle
 import android.os.Message
 import android.os.PowerManager
@@ -130,6 +132,71 @@ class MainActivity : ComponentActivity() {
     private val app get() = application as WgApp
     private var pendingAfterPerm: (() -> Unit)? = null
 
+    // ---- تبديل تلقائي بين سيرفرات Xray حتى ينجح أحدها ----
+    private var xrayWanted = false
+    private var xrayTries = 0
+    private var xrayTried = ""
+    private var xrayOrder: List<String> = emptyList()
+    private val xrayHandler = Handler(Looper.getMainLooper())
+    private val xrayWatchdog = object : Runnable {
+        override fun run() {
+            if (xrayWanted && !XrayEngine.state.value.running) {
+                toast("تعذّر الاتصال بالسيرفر — تبديل تلقائي")
+                nextXray()
+            }
+        }
+    }
+
+    private fun beginXray(s: ExtraServer) {
+        val same = setOf("vmess", "vless", "trojan", "ss")
+        xrayOrder = listOf(s.id) + app.store.extra.value
+            .filter { it.connectable && it.protocol in same && it.id != s.id }
+            .sortedWith(compareBy({ if (it.lat < 0) 1 else 0 }, { it.lat }))
+            .map { it.id }
+        xrayTries = 0
+        xrayWanted = true
+        startXrayId(s.id)
+    }
+
+    private fun startXrayId(id: String) {
+        val s = app.store.extra.value.firstOrNull { it.id == id }
+        if (s == null) {
+            nextXray(); return
+        }
+        xrayTried = id
+        if (app.engine.status.value.running) app.engine.stop()
+        if (app.ovpn.isUp()) app.ovpn.stop()
+        val err = XrayEngine.start(this, s)
+        if (err.isNotBlank()) {
+            toast("تعذّر تجهيز Xray: $err")
+            nextXray(); return
+        }
+        toast("جارٍ الاتصال: ${s.title}")
+        xrayHandler.removeCallbacks(xrayWatchdog)
+        xrayHandler.postDelayed(xrayWatchdog, 15_000)
+    }
+
+    private fun nextXray() {
+        xrayHandler.removeCallbacks(xrayWatchdog)
+        if (!xrayWanted) return
+        xrayTries++
+        val idx = xrayOrder.indexOf(xrayTried)
+        val nxt = if (idx < 0) xrayOrder.firstOrNull() else xrayOrder.drop(idx + 1).firstOrNull()
+        if (xrayTries > 5 || nxt == null) {
+            xrayWanted = false
+            XrayEngine.stop(this)
+            toast("لا سيرفر يعمل الآن — حدّث القائمة ثم أعد المحاولة")
+            return
+        }
+        toast("تجربة سيرفر آخر (${xrayTries}/5)…")
+        startXrayId(nxt)
+    }
+
+    private fun cancelXrayAuto() {
+        xrayWanted = false
+        xrayHandler.removeCallbacks(xrayWatchdog)
+    }
+
     private val xrayReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
             if (i == null) return
@@ -139,6 +206,14 @@ class MainActivity : ComponentActivity() {
                 title = i.getStringExtra(XrayEngine.EXTRA_TITLE).orEmpty(),
                 error = i.getStringExtra(XrayEngine.EXTRA_ERROR).orEmpty()
             )
+            val st = XrayEngine.state.value
+            if (st.running) {
+                xrayWanted = false
+                xrayHandler.removeCallbacks(xrayWatchdog)
+            } else if (st.error.isNotBlank() && xrayWanted) {
+                xrayHandler.removeCallbacks(xrayWatchdog)
+                nextXray()
+            }
         }
     }
 
@@ -210,6 +285,7 @@ class MainActivity : ComponentActivity() {
             activateConfig = { id ->
                 app.store.updateSettings { it.copy(autoConfig = false, selConfigId = id) }
                 app.ovpn.stop()
+                cancelXrayAuto()
                 XrayEngine.stop(this)
                 withVpnPermission {
                     ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
@@ -219,6 +295,7 @@ class MainActivity : ComponentActivity() {
             // إذن VPN من النظام (مرة واحدة) ثم تشغيل OpenVPN الداخلي — بدونه يفشل establish بصمت
             startOvpn = { s ->
                 withVpnPermission {
+                    cancelXrayAuto()
                     XrayEngine.stop(this)
                     val st = app.store
                     // كلمة سر VPNBook تتغير أسبوعياً: جلب طازج قبل كل اتصال يمنع AUTH_FAILED من أول ضغطة
@@ -243,6 +320,7 @@ class MainActivity : ComponentActivity() {
             // سيرفر مستورد من اشتراك عام: نفق واحد فقط — نوقف WireGuard ثم نشغّل الكونفيج كما هو
             startExtraOvpn = { s ->
                 withVpnPermission {
+                    cancelXrayAuto()
                     XrayEngine.stop(this)
                     if (app.engine.status.value.running) app.engine.stop()
                     if (app.ovpn.isUp()) app.ovpn.stop()
@@ -254,15 +332,7 @@ class MainActivity : ComponentActivity() {
                 }
             },
             // نفق Xray: يوقف أي نفق آخر أولاً (نفق واحد فقط)
-            startExtraXray = { s ->
-                withVpnPermission {
-                    if (app.engine.status.value.running) app.engine.stop()
-                    if (app.ovpn.isUp()) app.ovpn.stop()
-                    val err = XrayEngine.start(this, s)
-                    if (err.isNotBlank()) toast("تعذّر تجهيز Xray: $err")
-                    else toast("جارٍ الاتصال عبر Xray: ${s.title}")
-                }
-            }
+            startExtraXray = { s -> withVpnPermission { beginXray(s) } }
         )
         syncService()
         if (app.store.settings.value.autoPurgeExpired) {
@@ -325,6 +395,7 @@ class MainActivity : ComponentActivity() {
 
     private fun startVpn() {
         app.ovpn.stop() // نفق واحد فقط: فصل OpenVPN الداخلي قبل تشغيل WireGuard
+        cancelXrayAuto()
         XrayEngine.stop(this)
         ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
         app.engine.start()
@@ -542,7 +613,9 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     val updatedAt by app.store.extraUpdatedAt.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf("") }
-    var auto by remember { mutableStateOf(app.store.prefGet("extraAuto") == "1") }
+    var probing by remember { mutableStateOf(false) }
+    var auto by remember { mutableStateOf(app.store.prefGet("extraAuto") != "0") }
+    var autoPickOn by remember { mutableStateOf(app.store.prefGet("extraAutoConnect") != "0") }
 
     fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_LONG).show()
 
@@ -596,6 +669,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                     if (got == 0) "تعذّر الجلب — $firstErr"
                     else "تم جلب $got سيرفر" + (if (failed > 0) " • تعذّر $failed رابط" else "")
                 )
+                if (got > 0) probeAll()
             }
         }
     }
@@ -626,10 +700,57 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
             val cc = if (s.country.isBlank()) ExtraServers.resolveCountry(s.host) else s.country
             withContext(kotlinx.coroutines.Dispatchers.Main) {
                 app.store.updateExtra { l ->
-                    l.map { if (it.id == s.id) it.copy(lat = ms, country = it.country.ifBlank { cc }) else it }
+                    l.map {
+                        if (it.id == s.id) it.copy(
+                            lat = ms, testedAt = System.currentTimeMillis(),
+                            country = it.country.ifBlank { cc }
+                        ) else it
+                    }
                 }
             }
         }
+    }
+
+    /** فحص جماعي سريع: يبقي المتاح فقط في الأعلى ويعرف المستخدم ما يعمل فعلاً. */
+    fun probeAll() {
+        if (probing || busy.isNotEmpty()) return
+        val targets = app.store.extra.value.filter { it.connectable }.take(120)
+        if (targets.isEmpty()) return
+        probing = true
+        busy = "فحص ${targets.size} سيرفر…"
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val res = targets.map { s -> async { s.id to ExtraServers.tcpTest(s.host, s.port, 3500) } }
+                .map { it.await() }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                val now = System.currentTimeMillis()
+                app.store.updateExtra { l ->
+                    l.map { cur ->
+                        res.firstOrNull { it.first == cur.id }?.let {
+                            cur.copy(lat = it.second, testedAt = now)
+                        } ?: cur
+                    }
+                }
+                probing = false
+                busy = ""
+                toast("فحص ${res.size} سيرفر — ${res.count { it.second >= 0 }} يعمل")
+                autoPick()
+            }
+        }
+    }
+
+    /** بعد الفحص: اتصال تلقائي بأفضل سيرفر عامل إن لم يكن هناك نفق قائم. */
+    fun autoPick() {
+        if (!auto) return
+        if (app.store.prefGet("extraAutoConnect") == "0") return
+        if (app.engine.status.value.running || app.ovpn.isUp() || XrayEngine.isUp()) return
+        val last = app.store.prefGet("extraAutoPickAt")?.toLongOrNull() ?: 0L
+        if (System.currentTimeMillis() - last < 10L * 60 * 1000) return
+        val best = app.store.extra.value
+            .filter { it.protocol in setOf("vmess", "vless", "trojan", "ss") && it.lat >= 0 }
+            .minByOrNull { it.lat } ?: return
+        app.store.prefPut("extraAutoPickAt", System.currentTimeMillis().toString())
+        toast("اتصال تلقائي بأفضل سيرفر: ${best.title} (${best.lat}ms)")
+        connect(best)
     }
 
     // العلم مطلوب لكل سيرفر: من الاسم أولاً، وإن غاب نجلبه من عنوان الاتصال بالخلفية (مرة واحدة).
@@ -708,6 +829,8 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
         ) {
             app.store.prefPut("extraAutoAt", System.currentTimeMillis().toString())
             refreshAll()
+        } else if (list.isNotEmpty() && list.none { it.testedAt > 0 } && !probing) {
+            probeAll()
         }
     }
 
@@ -754,18 +877,33 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                 )
                 if (updatedAt > 0L) {
                     Text(
-                        "آخر تحديث: " + SimpleDateFormat("HH:mm", Locale.US).format(Date(updatedAt)),
+                        "آخر تحديث: " + SimpleDateFormat("HH:mm", Locale.US).format(Date(updatedAt)) +
+                            " • " + list.count { it.lat >= 0 } + " يعمل من " + list.size,
                         fontSize = 11.sp
                     )
                 }
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { refreshAll() }, enabled = busy.isEmpty()) {
-                        Text(if (busy.isEmpty()) "تحديث الاشتراكات" else busy, maxLines = 1)
+                        Text(if (busy.isEmpty()) "تحديث تلقائي" else busy, maxLines = 1)
                     }
+                    OutlinedButton(
+                        onClick = { probeAll() },
+                        enabled = busy.isEmpty() && list.any { it.connectable }
+                    ) { Text("فحص الكل") }
                     OutlinedButton(onClick = { showAdd = true }, enabled = busy.isEmpty()) {
-                        Text("إضافة اشتراك")
+                        Text("إضافة")
                     }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(
+                        checked = autoPickOn,
+                        onCheckedChange = {
+                            autoPickOn = it
+                            app.store.prefPut("extraAutoConnect", if (it) "1" else "0")
+                        }
+                    )
+                    Text("اتصال تلقائي بأفضل سيرفر يعمل", fontSize = 12.sp)
                 }
                 Spacer(Modifier.height(8.dp))
                 Row(
@@ -816,11 +954,18 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
 
         if (list.isEmpty()) {
             Box(Modifier.fillMaxWidth().weight(1f).padding(24.dp), contentAlignment = Alignment.Center) {
-                Text("لا سيرفرات بعد — أضف رابط اشتراك أو الصق كونفيجاً", fontSize = 13.sp)
+                Text(
+                    if (busy.isNotEmpty()) busy
+                    else "لا سيرفرات بعد — يُجلب تلقائياً عند أول فتح مع إنترنت",
+                    fontSize = 13.sp
+                )
             }
         } else {
             LazyColumn(Modifier.fillMaxWidth().weight(1f), contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp)) {
-                items(list, key = { it.id }) { s ->
+                items(
+                    list.sortedWith(compareBy({ if (it.lat < 0) 1 else 0 }, { it.lat })),
+                    key = { it.id }
+                ) { s ->
                     Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
                         Column(Modifier.padding(12.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -837,8 +982,11 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                                 )
                             }
                             Text(
-                                s.host + ":" + s.port +
-                                    if (s.lat >= 0) " • ${s.lat}ms" else " • لم يُفحص",
+                                s.host + ":" + s.port + when {
+                                    s.lat >= 0 -> " • ${s.lat}ms"
+                                    s.testedAt > 0 -> " • ❌ غير متاح الآن"
+                                    else -> " • لم يُفحص"
+                                },
                                 fontSize = 12.sp
                             )
                             if (!s.connectable) {
