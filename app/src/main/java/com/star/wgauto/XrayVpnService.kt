@@ -72,7 +72,14 @@ class XrayVpnService : VpnService() {
     }
 
     private fun startCore(cfg: String): Boolean {
-        if (running) return true
+        // تبديل سيرفر: أوقف النواة السابقة وأعد استخدام الخدمة نفسها
+        if (running) {
+            try { core?.stopLoop() } catch (e: Exception) { }
+            try { tun?.close() } catch (e: Exception) { }
+            core = null
+            tun = null
+            running = false
+        }
         return try {
             val pfd = buildTun() ?: run {
                 fail("تعذّر إنشاء واجهة VPN (تحقق من الإذن)")
