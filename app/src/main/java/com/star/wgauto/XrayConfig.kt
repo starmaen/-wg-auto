@@ -14,6 +14,9 @@ import java.util.Base64
  */
 object XrayConfig {
 
+    /** منفذ SOCKS محلي داخل النواة: نستخدمه للتحقق الحقيقي من مرور البيانات. */
+    const val SOCKS_PORT = 30678
+
     fun build(s: ExtraServer): String {
         val raw = s.raw.trim()
         val outbound = when (s.protocol.lowercase()) {
@@ -24,16 +27,28 @@ object XrayConfig {
             else -> throw IllegalArgumentException("بروتوكول غير مدعوم: ${s.protocol}")
         }
 
-        val inbounds = JSONArray().put(
-            JSONObject()
-                .put("tag", "tun")
-                .put("protocol", "tun")
-                .put("settings", JSONObject().put("name", "xray0").put("mtu", 1500).put("userLevel", 8))
-                .put(
-                    "sniffing", JSONObject().put("enabled", true)
-                        .put("destOverride", JSONArray().put("http").put("tls").put("quic"))
-                )
-        )
+        val inbounds = JSONArray()
+            .put(
+                JSONObject()
+                    .put("tag", "tun")
+                    .put("protocol", "tun")
+                    .put("settings", JSONObject().put("name", "xray0").put("mtu", 1500).put("userLevel", 8))
+                    .put(
+                        "sniffing", JSONObject().put("enabled", true)
+                            .put("destOverride", JSONArray().put("http").put("tls").put("quic"))
+                    )
+            )
+            .put(
+                JSONObject()
+                    .put("tag", "local-socks")
+                    .put("listen", "127.0.0.1")
+                    .put("port", SOCKS_PORT)
+                    .put("protocol", "socks")
+                    .put(
+                        "settings", JSONObject()
+                            .put("auth", "noauth").put("udp", false)
+                    )
+            )
 
         val outbounds = JSONArray()
             .put(outbound)

@@ -12,8 +12,8 @@ android {
         applicationId = "com.star.wgauto"
         minSdk = 26
         targetSdk = 34
-        versionCode = 61
-        versionName = "1.60"
+        versionCode = 62
+        versionName = "1.61"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }

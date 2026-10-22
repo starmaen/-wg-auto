@@ -154,6 +154,84 @@ object ExtraServers {
         return Triple(med, jit, loss)
     }
 
+    /**
+     * تحقق حقيقي من مرور البيانات: يتصل بـ SOCKS المحلي داخل نواة Xray
+     * ثم يطلب صفحة صغيرة عبر البروكسي. يعيد الزمن أو -1.
+     * يكشف سيرفرات CDN التي تستجيب TCP بسرعة لكنها لا تمرر أي بيانات.
+     */
+    fun socksProbe(
+        socksPort: Int = XrayConfig.SOCKS_PORT,
+        host: String = "cp.cloudflare.com",
+        port: Int = 80,
+        timeoutMs: Int = 9000
+    ): Int {
+        return try {
+        val t0 = System.currentTimeMillis()
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", socksPort), 3000)
+            s.soTimeout = timeoutMs
+            val out = s.getOutputStream()
+            val inp = s.getInputStream()
+            out.write(byteArrayOf(5, 1, 0)); out.flush()
+            val hello = ByteArray(2)
+            readExactly(inp, hello)
+            if (hello[0].toInt() != 5 || hello[1].toInt() != 0) return -1
+            val hb = host.toByteArray()
+            val req = ByteArray(7 + hb.size)
+            req[0] = 5; req[1] = 1; req[2] = 0; req[3] = 3
+            req[4] = hb.size.toByte()
+            hb.copyInto(req, 5)
+            req[5 + hb.size] = (port shr 8).toByte()
+            req[6 + hb.size] = port.toByte()
+            out.write(req); out.flush()
+            val head = ByteArray(4)
+            readExactly(inp, head)
+            if (head[0].toInt() != 5 || head[1].toInt() != 0) return -1
+            when (head[3].toInt()) {
+                1 -> readExactly(inp, ByteArray(6))
+                3 -> {
+                    val l = inp.read()
+                    if (l < 0) return -1
+                    readExactly(inp, ByteArray(l + 2))
+                }
+                4 -> readExactly(inp, ByteArray(18))
+                else -> return -1
+            }
+            out.write(
+                ("GET /generate_204 HTTP/1.1\r\nHost: $host\r\n" +
+                    "User-Agent: WG-Auto\r\nConnection: close\r\n\r\n").toByteArray()
+            )
+            out.flush()
+            val line = readLine(inp)
+            if (line.startsWith("HTTP/1.") || line.startsWith("HTTP/2")) {
+                (System.currentTimeMillis() - t0).toInt()
+            } else -1
+        }
+    } catch (e: Exception) {
+        -1
+    }
+    }
+
+    private fun readExactly(input: java.io.InputStream, buf: ByteArray) {
+        var off = 0
+        while (off < buf.size) {
+            val n = input.read(buf, off, buf.size - off)
+            if (n < 0) throw java.io.EOFException("قفل مبكر")
+            off += n
+        }
+    }
+
+    private fun readLine(input: java.io.InputStream): String {
+        val sb = StringBuilder()
+        while (sb.length < 200) {
+            val c = input.read()
+            if (c < 0) break
+            if (c == '\n'.code) break
+            if (c != '\r'.code) sb.append(c.toChar())
+        }
+        return sb.toString()
+    }
+
     // ---------- Base64 ----------
     private fun pad(s: String): String {
         var t = s.trim().replace("\n", "").replace("\r", "").replace(" ", "")

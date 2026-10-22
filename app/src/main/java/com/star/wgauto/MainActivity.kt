@@ -138,6 +138,8 @@ class MainActivity : ComponentActivity() {
     private var xrayTries = 0
     private var xrayTried = ""
     private var xrayOrder: List<String> = emptyList()
+    private var verifyJob: kotlinx.coroutines.Job? = null
+    private var xrayTestPhase = false
     private val xrayHandler = Handler(Looper.getMainLooper())
     private val xrayWatchdog = object : Runnable {
         override fun run() {
@@ -152,7 +154,12 @@ class MainActivity : ComponentActivity() {
         val same = setOf("vmess", "vless", "trojan", "ss")
         xrayOrder = listOf(s.id) + app.store.extra.value
             .filter { it.connectable && it.protocol in same && it.id != s.id }
-            .sortedWith(compareBy({ if (it.lat < 0) 1 else 0 }, { it.lat }))
+            .sortedWith(
+                compareBy(
+                    { it.note.startsWith("✗") }, { if (it.lat < 0) 1 else 0 },
+                    { it.loss }, { it.jitter }, { if (it.lat < 0) Int.MAX_VALUE else it.lat }
+                )
+            )
             .map { it.id }
         xrayTries = 0
         xrayWanted = true
@@ -167,17 +174,55 @@ class MainActivity : ComponentActivity() {
         xrayTried = id
         if (app.engine.status.value.running) app.engine.stop()
         if (app.ovpn.isUp()) app.ovpn.stop()
-        val err = XrayEngine.start(this, s)
+
+        // مرحلة 1: نفق فحص مصغّر (لا يقطع إنترنت الجهاز) للتأكد أن السيرفر يمرر بيانات فعلًا
+        xrayTestPhase = true
+        val err = XrayEngine.start(this, s, test = true)
         if (err.isNotBlank()) {
             toast("تعذّر تجهيز Xray: $err")
             nextXray(); return
         }
-        toast("جارٍ الاتصال: ${s.title}")
+        toast("فحص السيرفر: ${s.title}")
         xrayHandler.removeCallbacks(xrayWatchdog)
-        xrayHandler.postDelayed(xrayWatchdog, 15_000)
+        xrayHandler.postDelayed(xrayWatchdog, 25_000)
+
+        verifyJob?.cancel()
+        verifyJob = lifecycleScope.launch {
+            var up = false
+            var i = 0
+            while (i < 60) {
+                if (XrayEngine.state.value.running) { up = true; break }
+                if (XrayEngine.state.value.error.isNotBlank()) break
+                kotlinx.coroutines.delay(200)
+                i++
+            }
+            if (!up) {
+                if (xrayWanted) nextXray()
+                return@launch
+            }
+            val ms = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                ExtraServers.socksProbe()
+            }
+            if (!xrayWanted) return@launch
+            if (ms < 0) {
+                app.store.updateExtra { l -> l.map { if (it.id == id) it.copy(note = "✗ نفق") else it } }
+                toast("السيرفر لا يمرر بيانات — تبديل تلقائي")
+                nextXray()
+            } else {
+                app.store.updateExtra { l -> l.map { if (it.id == id) it.copy(note = "✓ نفق") else it } }
+                // مرحلة 2: النفق الكامل بعد إثبات أن البيانات تمر
+                xrayTestPhase = false
+                XrayEngine.start(this@MainActivity, s, test = false)
+                toast("✓ يعمل ويمرر البيانات (${ms}ms)")
+                xrayHandler.removeCallbacks(xrayWatchdog)
+                xrayHandler.postDelayed(xrayWatchdog, 20_000)
+            }
+        }
     }
 
     private fun nextXray() {
+        verifyJob?.cancel()
+        xrayTestPhase = false
         xrayHandler.removeCallbacks(xrayWatchdog)
         if (!xrayWanted) return
         xrayTries++
@@ -195,6 +240,8 @@ class MainActivity : ComponentActivity() {
 
     private fun cancelXrayAuto() {
         xrayWanted = false
+        xrayTestPhase = false
+        verifyJob?.cancel()
         xrayHandler.removeCallbacks(xrayWatchdog)
     }
 
@@ -208,10 +255,10 @@ class MainActivity : ComponentActivity() {
                 error = i.getStringExtra(XrayEngine.EXTRA_ERROR).orEmpty()
             )
             val st = XrayEngine.state.value
-            if (st.running) {
+            if (st.running && !xrayTestPhase) {
                 xrayWanted = false
                 xrayHandler.removeCallbacks(xrayWatchdog)
-            } else if (st.error.isNotBlank() && xrayWanted) {
+            } else if (st.error.isNotBlank() && xrayWanted && !xrayTestPhase) {
                 xrayHandler.removeCallbacks(xrayWatchdog)
                 nextXray()
             }
@@ -620,8 +667,8 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     var expanded by remember { mutableStateOf(false) }
     // معيار «الأفضل»: يعمل ← فقد أقل ← تذبذب أقل ← زمن أقل
     val rank = compareBy<ExtraServer>(
-        { if (it.lat < 0) 1 else 0 }, { it.loss }, { it.jitter },
-        { if (it.lat < 0) Int.MAX_VALUE else it.lat }
+        { if (it.lat < 0) 1 else 0 }, { if (it.note.startsWith("✗")) 1 else 0 },
+        { it.loss }, { it.jitter }, { if (it.lat < 0) Int.MAX_VALUE else it.lat }
     )
 
     fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_LONG).show()
@@ -792,21 +839,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     }
 
     /** طلب HTTPS حقيقي عبر النفق للتأكد من عمل السيرفر فعلًا (لا مجرد TCP). */
-    fun tunnelProbe(): Int = try {
-        val t0 = System.currentTimeMillis()
-        val c = (java.net.URL("https://1.1.1.1/cdn-cgi/trace").openConnection()
-                as javax.net.ssl.HttpsURLConnection).apply {
-            connectTimeout = 7000
-            readTimeout = 7000
-            instanceFollowRedirects = true
-        }
-        val code = c.responseCode
-        c.inputStream.use { it.readBytes() }
-        c.disconnect()
-        if (code in 200..399) (System.currentTimeMillis() - t0).toInt() else -1
-    } catch (e: Exception) {
-        -1
-    }
+    fun tunnelProbe(): Int = ExtraServers.socksProbe()
 
     /** فحص عميق: يفتح نفقًا فعليًا لأفضل 5 مرشحين ويرسل طلباً حقيقياً عبره. */
     fun deepCheck() {
@@ -1099,8 +1132,11 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                             }
                             Text(
                                 s.host + ":" + s.port + when {
-                                    s.lat >= 0 -> " • ${s.lat}ms • ±${s.jitter}ms • فقد ${s.loss}%" +
-                                        if (s.note == "✓ نفق") " • ✓" else ""
+                                    s.lat >= 0 -> " • ${s.lat}ms • ±${s.jitter}ms • فقد ${s.loss}%" + when {
+                                        s.note == "✓ نفق" -> " • ✓ بيانات"
+                                        s.note.startsWith("✗") -> " • ✗ لا يمرر بيانات"
+                                        else -> ""
+                                    }
                                     s.testedAt > 0 -> " • ❌ غير متاح الآن"
                                     else -> " • لم يُفحص"
                                 },
