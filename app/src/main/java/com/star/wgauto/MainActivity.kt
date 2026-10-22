@@ -102,6 +102,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -616,6 +617,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     var probing by remember { mutableStateOf(false) }
     var auto by remember { mutableStateOf(app.store.prefGet("extraAuto") != "0") }
     var autoPickOn by remember { mutableStateOf(app.store.prefGet("extraAutoConnect") != "0") }
+    var expanded by remember { mutableStateOf(false) }
 
     fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_LONG).show()
 
@@ -867,101 +869,126 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     }
 
     Column(Modifier.fillMaxSize()) {
-        Card(Modifier.fillMaxWidth().padding(12.dp)) {
-            Column(Modifier.padding(12.dp)) {
-                Text("سيرفرات إضافية", fontWeight = FontWeight.Bold)
-                Text(
-                    "استورد روابط اشتراك عامة. التشغيل الفعلي: WireGuard و OpenVPN " +
-                        "و vmess و vless و trojan و shadowsocks (محرّك Xray مدمج).",
-                    fontSize = 12.sp
-                )
-                if (updatedAt > 0L) {
-                    Text(
-                        "آخر تحديث: " + SimpleDateFormat("HH:mm", Locale.US).format(Date(updatedAt)) +
-                            " • " + list.count { it.lat >= 0 } + " يعمل من " + list.size,
-                        fontSize = 11.sp
-                    )
-                }
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { refreshAll() }, enabled = busy.isEmpty()) {
-                        Text(if (busy.isEmpty()) "تحديث تلقائي" else busy, maxLines = 1)
-                    }
-                    OutlinedButton(
-                        onClick = { probeAll() },
-                        enabled = busy.isEmpty() && list.any { it.connectable }
-                    ) { Text("فحص الكل") }
-                    OutlinedButton(onClick = { showAdd = true }, enabled = busy.isEmpty()) {
-                        Text("إضافة")
-                    }
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(
-                        checked = autoPickOn,
-                        onCheckedChange = {
-                            autoPickOn = it
-                            app.store.prefPut("extraAutoConnect", if (it) "1" else "0")
-                        }
-                    )
-                    Text("اتصال تلقائي بأفضل سيرفر يعمل", fontSize = 12.sp)
-                }
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    FilterChip(
-                        selected = !auto, onClick = { setAuto(false) },
-                        label = { Text("اختيار يدوي", maxLines = 1) }
-                    )
-                    FilterChip(
-                        selected = auto, onClick = { setAuto(true) },
-                        label = { Text("تلقائي: الأسرع", maxLines = 1) }
-                    )
-                }
-                Spacer(Modifier.height(6.dp))
-                if (auto) {
-                    Button(
-                        onClick = { connectFastest() },
-                        enabled = busy.isEmpty() && list.any { it.connectable }
-                    ) { Text("اتصل بالأسرع الآن") }
-                }
-                if (sources.isNotEmpty()) {
-                    Spacer(Modifier.height(6.dp))
-                    Text("الروابط: ${sources.size}", fontSize = 11.sp)
-                }
-            }
-        }
-
+        // شريط Xray رفيع — لا يأكل مساحة القائمة
         if (xr.running || xr.connecting || xr.error.isNotBlank()) {
-            Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text(
-                        when {
-                            xr.running -> "🟢 متصل عبر Xray" + (if (xr.title.isNotBlank()) " • ${xr.title}" else "")
-                            xr.connecting -> "🟡 جارٍ الاتصال عبر Xray…"
-                            else -> "🔴 فشل Xray"
-                        },
-                        fontWeight = FontWeight.Bold
-                    )
-                    if (xr.error.isNotBlank()) Text(xr.error, fontSize = 12.sp)
-                    if (xr.running || xr.connecting) {
-                        OutlinedButton(onClick = { XrayEngine.stop(ctx) }) { Text("فصل ⏻") }
-                    }
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    when {
+                        xr.running -> "🟢 Xray • " + xr.title
+                        xr.connecting -> "🟡 جارٍ الاتصال عبر Xray…"
+                        else -> "🔴 Xray: " + xr.error
+                    },
+                    fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                if (xr.running || xr.connecting) {
+                    TextButton(onClick = { XrayEngine.stop(ctx) }) { Text("فصل") }
                 }
             }
         }
 
-        if (list.isEmpty()) {
-            Box(Modifier.fillMaxWidth().weight(1f).padding(24.dp), contentAlignment = Alignment.Center) {
-                Text(
-                    if (busy.isNotEmpty()) busy
-                    else "لا سيرفرات بعد — يُجلب تلقائياً عند أول فتح مع إنترنت",
-                    fontSize = 13.sp
-                )
+        // الرأس داخل القائمة نفسها: يتحرك ويختفي مع السيرفرات (ديناميكي)
+        LazyColumn(
+            Modifier.fillMaxWidth().weight(1f),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                start = 12.dp, end = 12.dp, bottom = 12.dp
+            )
+        ) {
+            item(key = "header") {
+                Card(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                    Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("سيرفرات مجانية", fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1)
+                                Text(
+                                    (if (updatedAt > 0L) "تحديث " + SimpleDateFormat("HH:mm", Locale.US).format(Date(updatedAt)) else "لم يُحدَّث") +
+                                        " • " + list.count { it.lat >= 0 } + " يعمل من " + list.size,
+                                    fontSize = 11.sp, maxLines = 1
+                                )
+                            }
+                            if (busy.isNotEmpty()) {
+                                Text(busy, fontSize = 11.sp, maxLines = 1)
+                            } else {
+                                TextButton(onClick = { refreshAll() }) { Text("تحديث") }
+                            }
+                            TextButton(onClick = { expanded = !expanded }) {
+                                Text(if (expanded) "إخفاء" else "خيارات")
+                            }
+                        }
+                        if (busy.isNotEmpty()) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 4.dp))
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (auto) {
+                                Button(
+                                    onClick = { connectFastest() },
+                                    enabled = busy.isEmpty() && list.any { it.connectable },
+                                    modifier = Modifier.weight(1f).height(40.dp)
+                                ) { Text("⚡ اتصال بالأسرع", maxLines = 1) }
+                            } else {
+                                OutlinedButton(
+                                    onClick = { probeAll() },
+                                    enabled = busy.isEmpty() && list.any { it.connectable },
+                                    modifier = Modifier.weight(1f).height(40.dp)
+                                ) { Text("فحص الكل", maxLines = 1) }
+                            }
+                            OutlinedButton(
+                                onClick = { showAdd = true },
+                                enabled = busy.isEmpty(),
+                                modifier = Modifier.height(40.dp)
+                            ) { Text("+ اشتراك") }
+                        }
+                        if (expanded) {
+                            Spacer(Modifier.height(4.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Switch(
+                                    checked = autoPickOn,
+                                    onCheckedChange = {
+                                        autoPickOn = it
+                                        app.store.prefPut("extraAutoConnect", if (it) "1" else "0")
+                                    }
+                                )
+                                Text("اتصال تلقائي بأفضل سيرفر", fontSize = 12.sp)
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                FilterChip(
+                                    selected = !auto, onClick = { setAuto(false) },
+                                    label = { Text("يدوي", maxLines = 1) }
+                                )
+                                FilterChip(
+                                    selected = auto, onClick = { setAuto(true) },
+                                    label = { Text("تلقائي: الأسرع", maxLines = 1) }
+                                )
+                                if (auto) {
+                                    OutlinedButton(onClick = { probeAll() }, enabled = busy.isEmpty()) {
+                                        Text("فحص الكل", maxLines = 1)
+                                    }
+                                }
+                            }
+                            Text(
+                                "المصادر تُحدَّث تلقائياً • " + sources.size + " روابط • " +
+                                    "يدعم wg/ovpn/vmess/vless/trojan/ss عبر Xray",
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                }
             }
-        } else {
-            LazyColumn(Modifier.fillMaxWidth().weight(1f), contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp)) {
+
+            if (list.isEmpty()) {
+                item(key = "empty") {
+                    Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
+                        Text(
+                            if (busy.isNotEmpty()) busy
+                            else "لا سيرفرات بعد — يُجلب تلقائياً عند أول فتح مع إنترنت",
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+            } else {
                 items(
                     list.sortedWith(compareBy({ if (it.lat < 0) 1 else 0 }, { it.lat })),
                     key = { it.id }
@@ -974,11 +1001,15 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                                     fontSize = 11.sp, fontWeight = FontWeight.Bold,
                                     modifier = Modifier.padding(end = 8.dp)
                                 )
-                                Text(s.title, fontWeight = FontWeight.Bold, maxLines = 1)
+                                Text(
+                                    s.title, fontWeight = FontWeight.Bold, maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
                                 Spacer(Modifier.width(6.dp))
                                 Text(
-                                    if (s.country.isNotBlank()) Country.label(s.country) else "🏳️ جارٍ تحديد الدولة",
-                                    fontSize = 12.sp
+                                    if (s.country.isNotBlank()) Country.label(s.country) else "🏳️",
+                                    fontSize = 12.sp, maxLines = 1
                                 )
                             }
                             Text(
@@ -987,7 +1018,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                                     s.testedAt > 0 -> " • ❌ غير متاح الآن"
                                     else -> " • لم يُفحص"
                                 },
-                                fontSize = 12.sp
+                                fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
                             if (!s.connectable) {
                                 Text("بروتوكول غير مدعوم للتشغيل", fontSize = 11.sp)
