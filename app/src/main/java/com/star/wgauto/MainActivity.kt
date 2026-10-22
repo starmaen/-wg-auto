@@ -618,6 +618,11 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     var auto by remember { mutableStateOf(app.store.prefGet("extraAuto") != "0") }
     var autoPickOn by remember { mutableStateOf(app.store.prefGet("extraAutoConnect") != "0") }
     var expanded by remember { mutableStateOf(false) }
+    // معيار «الأفضل»: يعمل ← فقد أقل ← تذبذب أقل ← زمن أقل
+    val rank = compareBy<ExtraServer>(
+        { if (it.lat < 0) 1 else 0 }, { it.loss }, { it.jitter },
+        { if (it.lat < 0) Int.MAX_VALUE else it.lat }
+    )
 
     fun toast(m: String) = Toast.makeText(ctx, m, Toast.LENGTH_LONG).show()
 
@@ -716,13 +721,19 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
         busy = "جارٍ فحص ${candidates.size} سيرفر لاختيار الأسرع…"
         scope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val results = candidates.map { s ->
-                async { s to ExtraServers.tcpTest(s.host, s.port) }
+                async { s to ExtraServers.tcpSamples(s.host, s.port) }
             }.map { it.await() }
-            val alive = results.filter { it.second >= 0 }.sortedBy { it.second }
+            val alive = results.filter { it.second.first >= 0 && it.second.third < 100 }
+                .sortedWith(compareBy({ it.second.third }, { it.second.second }, { it.second.first }))
             withContext(kotlinx.coroutines.Dispatchers.Main) {
                 app.store.updateExtra { l ->
                     l.map { cur ->
-                        results.firstOrNull { it.first.id == cur.id }?.let { cur.copy(lat = it.second) } ?: cur
+                        results.firstOrNull { it.first.id == cur.id }?.let {
+                            cur.copy(
+                                lat = it.second.first, jitter = it.second.second,
+                                loss = it.second.third, testedAt = System.currentTimeMillis()
+                            )
+                        } ?: cur
                     }
                 }
                 busy = ""
@@ -730,7 +741,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                 if (best == null) {
                     toast("كل السيرفرات غير متاحة الآن — حدّث الاشتراك أو أضف غيره")
                 } else {
-                    toast("الأسرع: ${best.first.title} (${best.second}ms) — جارٍ الاتصال")
+                    toast("الأفضل: ${best.first.title} (${best.second.first}ms • فقد ${best.second.third}%) — جارٍ الاتصال")
                     connect(best.first)
                 }
             }
@@ -746,7 +757,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
         if (System.currentTimeMillis() - last < 10L * 60 * 1000) return
         val best = app.store.extra.value
             .filter { it.protocol in setOf("vmess", "vless", "trojan", "ss") && it.lat >= 0 }
-            .minByOrNull { it.lat } ?: return
+            .sortedWith(rank).firstOrNull() ?: return
         app.store.prefPut("extraAutoPickAt", System.currentTimeMillis().toString())
         toast("اتصال تلقائي بأفضل سيرفر: ${best.title} (${best.lat}ms)")
         connect(best)
@@ -760,21 +771,99 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
         probing = true
         busy = "فحص ${targets.size} سيرفر…"
         scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            val res = targets.map { s -> async { s.id to ExtraServers.tcpTest(s.host, s.port, 3500) } }
+            val res = targets.map { s -> async { s.id to ExtraServers.tcpSamples(s.host, s.port) } }
                 .map { it.await() }
             withContext(kotlinx.coroutines.Dispatchers.Main) {
                 val now = System.currentTimeMillis()
                 app.store.updateExtra { l ->
                     l.map { cur ->
-                        res.firstOrNull { it.first == cur.id }?.let {
-                            cur.copy(lat = it.second, testedAt = now)
+                        res.firstOrNull { it.first == cur.id }?.let { hit ->
+                            val t = hit.second
+                            cur.copy(lat = t.first, jitter = t.second, loss = t.third, testedAt = now)
                         } ?: cur
                     }
                 }
                 probing = false
                 busy = ""
-                toast("فحص ${res.size} سيرفر — ${res.count { it.second >= 0 }} يعمل")
+                toast("فحص ${res.size} سيرفر — ${res.count { it.second.third < 100 }} يعمل")
                 autoPick()
+            }
+        }
+    }
+
+    /** طلب HTTPS حقيقي عبر النفق للتأكد من عمل السيرفر فعلًا (لا مجرد TCP). */
+    fun tunnelProbe(): Int = try {
+        val t0 = System.currentTimeMillis()
+        val c = (java.net.URL("https://1.1.1.1/cdn-cgi/trace").openConnection()
+                as javax.net.ssl.HttpsURLConnection).apply {
+            connectTimeout = 7000
+            readTimeout = 7000
+            instanceFollowRedirects = true
+        }
+        val code = c.responseCode
+        c.inputStream.use { it.readBytes() }
+        c.disconnect()
+        if (code in 200..399) (System.currentTimeMillis() - t0).toInt() else -1
+    } catch (e: Exception) {
+        -1
+    }
+
+    /** فحص عميق: يفتح نفقًا فعليًا لأفضل 5 مرشحين ويرسل طلباً حقيقياً عبره. */
+    fun deepCheck() {
+        if (probing || busy.isNotEmpty()) return
+        if (app.engine.status.value.running || app.ovpn.isUp() || XrayEngine.isUp()) {
+            toast("افصل النفق الحالي أولاً"); return
+        }
+        if (android.net.VpnService.prepare(ctx) != null) {
+            toast("امنح إذن VPN أولاً"); return
+        }
+        val cands = app.store.extra.value
+            .filter { it.protocol in setOf("vmess", "vless", "trojan", "ss") && it.lat >= 0 }
+            .sortedWith(rank).take(5)
+        if (cands.isEmpty()) {
+            toast("اضغط «فحص الكل» أولاً"); return
+        }
+        probing = true
+        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            var best: ExtraServer? = null
+            var bestMs = Int.MAX_VALUE
+            var tried = 0
+            for (s in cands) {
+                tried++
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    busy = "فحص نفق $tried/${cands.size}…"
+                }
+                XrayEngine.start(ctx, s, test = true)
+                var up = false
+                var i = 0
+                while (i < 40) {
+                    if (XrayEngine.state.value.running) { up = true; break }
+                    if (XrayEngine.state.value.error.isNotBlank()) break
+                    kotlinx.coroutines.delay(150)
+                    i++
+                }
+                if (up) {
+                    val ms = tunnelProbe()
+                    if (ms >= 0) {
+                        app.store.updateExtra { l ->
+                            l.map { if (it.id == s.id) it.copy(note = "✓ نفق") else it }
+                        }
+                        if (ms < bestMs) { bestMs = ms; best = s }
+                    }
+                }
+                XrayEngine.stop(ctx)
+                if (bestMs <= 500) break
+            }
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                probing = false
+                busy = ""
+                val b = best
+                if (b == null) {
+                    toast("لا سيرفر نجح في فحص النفق — جرّب تحديث الاشتراكات")
+                } else {
+                    toast("أفضل نفق: ${b.title} • ${bestMs}ms — جارٍ الاتصال")
+                    if (autoPickOn) connect(b)
+                }
             }
         }
     }
@@ -962,11 +1051,10 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                                     selected = auto, onClick = { setAuto(true) },
                                     label = { Text("تلقائي: الأسرع", maxLines = 1) }
                                 )
-                                if (auto) {
-                                    OutlinedButton(onClick = { probeAll() }, enabled = busy.isEmpty()) {
-                                        Text("فحص الكل", maxLines = 1)
-                                    }
-                                }
+                                OutlinedButton(
+                                    onClick = { deepCheck() },
+                                    enabled = busy.isEmpty() && list.any { it.lat >= 0 }
+                                ) { Text("فحص عميق", maxLines = 1) }
                             }
                             Text(
                                 "المصادر تُحدَّث تلقائياً • " + sources.size + " روابط • " +
@@ -989,10 +1077,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                     }
                 }
             } else {
-                items(
-                    list.sortedWith(compareBy({ if (it.lat < 0) 1 else 0 }, { it.lat })),
-                    key = { it.id }
-                ) { s ->
+                items(list.sortedWith(rank), key = { it.id }) { s ->
                     Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
                         Column(Modifier.padding(12.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1014,7 +1099,8 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                             }
                             Text(
                                 s.host + ":" + s.port + when {
-                                    s.lat >= 0 -> " • ${s.lat}ms"
+                                    s.lat >= 0 -> " • ${s.lat}ms • ±${s.jitter}ms • فقد ${s.loss}%" +
+                                        if (s.note == "✓ نفق") " • ✓" else ""
                                     s.testedAt > 0 -> " • ❌ غير متاح الآن"
                                     else -> " • لم يُفحص"
                                 },

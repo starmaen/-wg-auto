@@ -28,7 +28,7 @@ object XrayEngine {
     val state = MutableStateFlow(XrayState())
 
     /** يجهّز الإعداد ويشغّل الخدمة. يعيد رسالة خطأ أو نصاً فارغاً عند النجاح. */
-    fun start(ctx: Context, s: ExtraServer): String {
+    fun start(ctx: Context, s: ExtraServer, test: Boolean = false): String {
         val cfg = try {
             XrayConfig.build(s)
         } catch (e: Exception) {
@@ -42,6 +42,7 @@ object XrayEngine {
                 action = XrayVpnService.ACTION_START
                 putExtra(XrayVpnService.EXTRA_CONFIG, cfg)
                 putExtra(XrayVpnService.EXTRA_TITLE, s.title)
+                putExtra(XrayVpnService.EXTRA_TEST, test)
             }
             ContextCompat.startForegroundService(ctx, i)
             ""

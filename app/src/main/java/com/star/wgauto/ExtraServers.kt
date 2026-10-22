@@ -25,6 +25,8 @@ data class ExtraServer(
     val raw: String = "",
     val source: String = "",
     val lat: Int = -1,
+    val jitter: Int = 0,
+    val loss: Int = 0,
     val note: String = "",
     val testedAt: Long = 0,
     val addedAt: Long = System.currentTimeMillis()
@@ -129,6 +131,27 @@ object ExtraServers {
         } catch (e: Exception) {
             -1
         }
+    }
+
+    /**
+     * فحص بثلاث عينات: يعيد (زمن وسيط, تذبذب, نسبة الفقد).
+     * يتوقف مبكراً عند فشلين حتى لا يبطؤ الفحص على السيرفرات الميتة.
+     */
+    fun tcpSamples(host: String, port: Int, n: Int = 3, timeoutMs: Int = 1500): Triple<Int, Int, Int> {
+        if (host.isBlank() || port <= 0) return Triple(-1, 0, 100)
+        val ok = ArrayList<Int>(n)
+        var fail = 0
+        for (i in 0 until n) {
+            val ms = tcpTest(host, port, timeoutMs)
+            if (ms >= 0) ok.add(ms) else fail++
+            if (fail >= 2) break
+        }
+        if (ok.isEmpty()) return Triple(-1, 0, 100)
+        ok.sort()
+        val med = ok[ok.size / 2]
+        val jit = (ok.last() - ok.first()).coerceAtLeast(0)
+        val loss = fail * 100 / (ok.size + fail)
+        return Triple(med, jit, loss)
     }
 
     // ---------- Base64 ----------
@@ -361,6 +384,7 @@ object ExtraServers {
         .put("id", s.id).put("name", s.name).put("protocol", s.protocol)
         .put("host", s.host).put("port", s.port).put("country", s.country)
         .put("raw", s.raw).put("source", s.source).put("lat", s.lat)
+        .put("jitter", s.jitter).put("loss", s.loss)
         .put("note", s.note).put("testedAt", s.testedAt).put("addedAt", s.addedAt)
 
     fun fromJson(o: JSONObject): ExtraServer? = try {
@@ -370,6 +394,7 @@ object ExtraServers {
             host = o.optString("host", ""), port = o.optInt("port", 0),
             country = o.optString("country", ""), raw = o.optString("raw", ""),
             source = o.optString("source", ""), lat = o.optInt("lat", -1),
+            jitter = o.optInt("jitter", 0), loss = o.optInt("loss", 0),
             note = o.optString("note", ""), testedAt = o.optLong("testedAt", 0L),
             addedAt = o.optLong("addedAt", System.currentTimeMillis())
         )

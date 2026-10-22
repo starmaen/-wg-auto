@@ -28,6 +28,7 @@ class XrayVpnService : VpnService() {
         const val ACTION_STOP = "com.star.wgauto.XRAY_STOP"
         const val EXTRA_CONFIG = "xray_config"
         const val EXTRA_TITLE = "xray_title"
+        const val EXTRA_TEST = "xray_test"
 
         private const val CHANNEL = "wgauto_xray"
         private const val NOTIF_ID = 21
@@ -48,6 +49,7 @@ class XrayVpnService : VpnService() {
             }
             ACTION_START -> {
                 val cfg = intent.getStringExtra(EXTRA_CONFIG).orEmpty()
+                val test = intent.getBooleanExtra(EXTRA_TEST, false)
                 lastTitle = intent.getStringExtra(EXTRA_TITLE)?.ifBlank { "Xray" } ?: "Xray"
                 ensureChannel()
                 promote(lastTitle, "جارٍ الاتصال…")
@@ -55,7 +57,7 @@ class XrayVpnService : VpnService() {
                     fail("إعداد فارغ")
                     return START_NOT_STICKY
                 }
-                return if (startCore(cfg)) START_STICKY else START_NOT_STICKY
+                return if (startCore(cfg, test)) START_STICKY else START_NOT_STICKY
             }
             else -> return START_NOT_STICKY
         }
@@ -71,7 +73,7 @@ class XrayVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startCore(cfg: String): Boolean {
+    private fun startCore(cfg: String, test: Boolean = false): Boolean {
         // تبديل سيرفر: أوقف النواة السابقة وأعد استخدام الخدمة نفسها
         if (running) {
             try { core?.stopLoop() } catch (e: Exception) { }
@@ -81,7 +83,7 @@ class XrayVpnService : VpnService() {
             running = false
         }
         return try {
-            val pfd = buildTun() ?: run {
+            val pfd = buildTun(test) ?: run {
                 fail("تعذّر إنشاء واجهة VPN (تحقق من الإذن)")
                 return false
             }
@@ -115,18 +117,28 @@ class XrayVpnService : VpnService() {
         }
     }
 
-    private fun buildTun(): ParcelFileDescriptor? {
+    private fun buildTun(test: Boolean = false): ParcelFileDescriptor? {
         val b = Builder()
-            .setSession("WG Auto — Xray")
+            .setSession(if (test) "WG Auto — فحص" else "WG Auto — Xray")
             .setMtu(1500)
             .addAddress(ADDR4, 30)
-            .addRoute("0.0.0.0", 0)
-            .addAddress(ADDR6, 126)
-            .addRoute("::", 0)
-            .addDnsServer("1.1.1.1")
-        try {
-            b.addDisallowedApplication(packageName)
-        } catch (e: Exception) {
+        if (test) {
+            // فحص عميق: نوجّه عنوان الفحص فقط (1.1.1.1) داخل النفق
+            // مع السماح للتطبيق — كي تخرج حزم النواة إلى السيرفر مباشرة (بلا حلقة)
+            b.addRoute("1.1.1.1", 32)
+            try {
+                b.addAllowedApplication(packageName)
+            } catch (e: Exception) {
+            }
+        } else {
+            b.addRoute("0.0.0.0", 0)
+                .addAddress(ADDR6, 126)
+                .addRoute("::", 0)
+                .addDnsServer("1.1.1.1")
+            try {
+                b.addDisallowedApplication(packageName)
+            } catch (e: Exception) {
+            }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             b.setMetered(false)
