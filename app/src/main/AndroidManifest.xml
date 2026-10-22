@@ -47,6 +47,21 @@
             </intent-filter>
         </receiver>
 
+        <!-- نفق Xray (vmess/vless/trojan/ss) في عملية منفصلة: WireGuard يجلب Go runtime آخر -->
+        <service
+            android:name=".XrayVpnService"
+            android:exported="false"
+            android:process=":xray"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn_xray_tunnel" />
+        </service>
+
         <!-- خدمة WireGuard الفعلية من المكتبة: بدونها لا تُنشأ واجهة tun أبداً -->
         <service
             android:name="com.wireguard.android.backend.GoBackend$VpnService"

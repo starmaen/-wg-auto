@@ -13,8 +13,7 @@ import java.util.UUID
 /**
  * سيرفر «إضافي» مستورد من رابط اشتراك عام.
  * البروتوكولات المدعومة للاستيراد: wireguard (wg) و openvpn (ovpn) و vmess/vless/trojan/ss.
- * التشغيل الفعلي في هذه المرحلة: wg و ovpn فقط (المحركان الموجودان في التطبيق)،
- * والباقي يُحفظ ويُعرض جاهزاً لمحرّك Xray في مرحلة لاحقة — بلا أزرار وهمية.
+ * التشغيل: wg و ovpn عبر محركيهما، و vmess/vless/trojan/ss عبر محرّك Xray المدمج.
  */
 data class ExtraServer(
     val id: String = UUID.randomUUID().toString(),
@@ -29,7 +28,9 @@ data class ExtraServer(
     val note: String = "",
     val addedAt: Long = System.currentTimeMillis()
 ) {
-    val connectable: Boolean get() = protocol == "wg" || protocol == "ovpn"
+    val connectable: Boolean
+        get() = protocol == "wg" || protocol == "ovpn" ||
+            protocol == "vmess" || protocol == "vless" || protocol == "trojan" || protocol == "ss"
     val key: String get() = protocol + "|" + host.lowercase() + "|" + port
     val title: String get() = name.ifBlank { host }
 }

@@ -12,8 +12,8 @@ android {
         applicationId = "com.star.wgauto"
         minSdk = 26
         targetSdk = 34
-        versionCode = 55
-        versionName = "1.54"
+        versionCode = 56
+        versionName = "1.55"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
@@ -52,6 +52,9 @@ android {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
         jniLibs {
             useLegacyPackaging = false
+            // vpnLib تحمل libgojni.so لمعماريتَي x86 فقط، وlibv2ray تحمل نسختها؛
+            // التطبيق يدعم ARM فقط، فاستبعاد x86 يمنع التعارض ويصغّر الحزمة.
+            excludes += setOf("lib/x86/**", "lib/x86_64/**")
         }
     }
 }
@@ -62,6 +65,8 @@ dependencies {
     implementation("com.wireguard.android:tunnel:1.0.20260102")
     // OpenVPN مدمج داخل التطبيق (نواة ics-openvpn المفتوحة GPLv2 — بلا تطبيق خارجي وبلا NDK)
     implementation(project(":vpnLib"))
+    // نواة Xray لجوال (GPLv3): تُنزَّل في CI إلى app/libs قبل البناء
+    implementation(files("libs/libv2ray.aar"))
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
 
     implementation("androidx.core:core-ktx:1.13.1")

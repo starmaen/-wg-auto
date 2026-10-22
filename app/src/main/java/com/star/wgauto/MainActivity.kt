@@ -1,7 +1,10 @@
 package com.star.wgauto
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -118,12 +121,25 @@ class Actions(
     val openVpnSettings: () -> Unit,
     val activateConfig: (String) -> Unit,
     val startOvpn: (OvpnServer) -> Unit,
-    val startExtraOvpn: (ExtraServer) -> Unit
+    val startExtraOvpn: (ExtraServer) -> Unit,
+    val startExtraXray: (ExtraServer) -> Unit
 )
 
 class MainActivity : ComponentActivity() {
     private val app get() = application as WgApp
     private var pendingAfterPerm: (() -> Unit)? = null
+
+    private val xrayReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            if (i == null) return
+            XrayEngine.apply(
+                running = i.getBooleanExtra(XrayEngine.EXTRA_RUNNING, false),
+                connecting = i.getBooleanExtra(XrayEngine.EXTRA_CONNECTING, false),
+                title = i.getStringExtra(XrayEngine.EXTRA_TITLE).orEmpty(),
+                error = i.getStringExtra(XrayEngine.EXTRA_ERROR).orEmpty()
+            )
+        }
+    }
 
     private val vpnPermLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
@@ -160,6 +176,13 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            ContextCompat.registerReceiver(
+                this, xrayReceiver, IntentFilter(XrayEngine.ACTION_STATE),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        } catch (e: Exception) {
+        }
         if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         val actions = Actions(
             toggle = { onToggle() },
@@ -170,6 +193,7 @@ class MainActivity : ComponentActivity() {
             syncService = { syncService() },
             restoreSystem = { app.engine.restoreSystemDns() },
             shutdownAll = {
+                XrayEngine.stop(this)
                 app.engine.shutdownAll {
                     stopService(Intent(this, AutoService::class.java))
                     toast("أُغلق التطبيق بالكامل — لن يعمل شيء حتى تشغّله يدوياً")
@@ -185,6 +209,7 @@ class MainActivity : ComponentActivity() {
             activateConfig = { id ->
                 app.store.updateSettings { it.copy(autoConfig = false, selConfigId = id) }
                 app.ovpn.stop()
+                XrayEngine.stop(this)
                 withVpnPermission {
                     ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
                     app.engine.connectManual(id)
@@ -193,6 +218,7 @@ class MainActivity : ComponentActivity() {
             // إذن VPN من النظام (مرة واحدة) ثم تشغيل OpenVPN الداخلي — بدونه يفشل establish بصمت
             startOvpn = { s ->
                 withVpnPermission {
+                    XrayEngine.stop(this)
                     val st = app.store
                     // كلمة سر VPNBook تتغير أسبوعياً: جلب طازج قبل كل اتصال يمنع AUTH_FAILED من أول ضغطة
                     if (s.key.startsWith("vbk-")) {
@@ -216,6 +242,7 @@ class MainActivity : ComponentActivity() {
             // سيرفر مستورد من اشتراك عام: نفق واحد فقط — نوقف WireGuard ثم نشغّل الكونفيج كما هو
             startExtraOvpn = { s ->
                 withVpnPermission {
+                    XrayEngine.stop(this)
                     if (app.engine.status.value.running) app.engine.stop()
                     if (app.ovpn.isUp()) app.ovpn.stop()
                     val server = OvpnServer(
@@ -223,6 +250,16 @@ class MainActivity : ComponentActivity() {
                         country = s.country, lastSeen = System.currentTimeMillis()
                     )
                     toast(app.ovpn.start(server, s.raw, null, null))
+                }
+            },
+            // نفق Xray: يوقف أي نفق آخر أولاً (نفق واحد فقط)
+            startExtraXray = { s ->
+                withVpnPermission {
+                    if (app.engine.status.value.running) app.engine.stop()
+                    if (app.ovpn.isUp()) app.ovpn.stop()
+                    val err = XrayEngine.start(this, s)
+                    if (err.isNotBlank()) toast("تعذّر تجهيز Xray: $err")
+                    else toast("جارٍ الاتصال عبر Xray: ${s.title}")
                 }
             }
         )
@@ -238,6 +275,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        try { unregisterReceiver(xrayReceiver) } catch (e: Exception) { }
+        super.onDestroy()
     }
 
     override fun onResume() {
@@ -282,6 +324,7 @@ class MainActivity : ComponentActivity() {
 
     private fun startVpn() {
         app.ovpn.stop() // نفق واحد فقط: فصل OpenVPN الداخلي قبل تشغيل WireGuard
+        XrayEngine.stop(this)
         ContextCompat.startForegroundService(this, Intent(this, AutoService::class.java))
         app.engine.start()
     }
@@ -454,7 +497,7 @@ fun LicenseGate(app: WgApp, content: @Composable () -> Unit) {
 @Composable
 fun Root(app: WgApp, a: Actions) {
     var tab by remember { mutableIntStateOf(0) }
-    val titles = listOf("الرئيسية", "الكونفيجات", "VPN 🌍", "DNS", "الإعدادات")
+    val titles = listOf("الرئيسية", "الكونفيجات", "VPN 🌍", "سيرفرات", "DNS", "الإعدادات")
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().systemBarsPadding()) {
             TabRow(selectedTabIndex = tab) {
@@ -465,39 +508,15 @@ fun Root(app: WgApp, a: Actions) {
             when (tab) {
                 0 -> HomeTab(app, a)
                 1 -> ConfigsTab(app, a)
-                2 -> VpnHub(app, a)
-                3 -> DnsTab(app)
+                2 -> OvpnTab(app, a)
+                3 -> ExtraServersTab(app, a)
+                4 -> DnsTab(app)
                 else -> SettingsTab(app, a)
             }
         }
     }
 }
 
-/**
- * تبويب VPN = مركز واحد بخدمتين مستقلتين:
- * 1) OpenVPN المدمج (القائم كما هو).
- * 2) سيرفرات إضافية من اشتراكات عامة — قسم مستقل لا يمس أي خدمة أخرى.
- */
-@Composable
-fun VpnHub(app: WgApp, a: Actions) {
-    var sub by remember { mutableIntStateOf(0) }
-    Column(Modifier.fillMaxSize()) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp).horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            FilterChip(
-                selected = sub == 0, onClick = { sub = 0 },
-                label = { Text("OpenVPN المدمج", maxLines = 1) }
-            )
-            FilterChip(
-                selected = sub == 1, onClick = { sub = 1 },
-                label = { Text("سيرفرات إضافية", maxLines = 1) }
-            )
-        }
-        if (sub == 0) OvpnTab(app, a) else ExtraServersTab(app, a)
-    }
-}
 
 /** قسم السيرفرات الإضافية: استيراد اشتراكات عامة وتشغيل wg/ovpn منها. */
 @Composable
@@ -506,6 +525,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     val scope = rememberCoroutineScope()
     val list by app.store.extra.collectAsState()
     val sources by app.store.extraSourcesFlow.collectAsState()
+    val xr by XrayEngine.state.collectAsState()
     val updatedAt by app.store.extraUpdatedAt.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf("") }
@@ -615,13 +635,19 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     }
 
     fun connect(s: ExtraServer) {
-        if (s.protocol == "wg") {
-            val cfg = WgConfig(name = "Extra • " + s.title, text = s.raw)
-            app.store.updateConfigs { it + cfg }
-            a.activateConfig(cfg.id)
-            toast("يُتصل عبر WireGuard: ${s.title}")
-        } else if (s.protocol == "ovpn") {
-            a.startExtraOvpn(s)
+        when (s.protocol) {
+            "wg" -> {
+                XrayEngine.stop(ctx)
+                val cfg = WgConfig(name = "Extra • " + s.title, text = s.raw)
+                app.store.updateConfigs { it + cfg }
+                a.activateConfig(cfg.id)
+                toast("يُتصل عبر WireGuard: ${s.title}")
+            }
+            "ovpn" -> {
+                XrayEngine.stop(ctx)
+                a.startExtraOvpn(s)
+            }
+            else -> a.startExtraXray(s)
         }
     }
 
@@ -629,7 +655,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
     fun connectFastest() {
         val candidates = list.filter { it.connectable }
         if (candidates.isEmpty()) {
-            toast("لا سيرفرات قابلة للتشغيل — أضف WireGuard أو OpenVPN")
+            toast("لا سيرفرات قابلة للتشغيل — أضف اشتراكاً صالحاً")
             return
         }
         if (busy.isNotEmpty()) return
@@ -696,8 +722,8 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
             Column(Modifier.padding(12.dp)) {
                 Text("سيرفرات إضافية", fontWeight = FontWeight.Bold)
                 Text(
-                    "استورد روابط اشتراك عامة. يعمل الآن: WireGuard و OpenVPN. " +
-                        "بقية البروتوكولات (vmess/vless/trojan/ss) تُحفظ وتُعرض ويأتي تشغيلها مع محرّك Xray.",
+                    "استورد روابط اشتراك عامة. التشغيل الفعلي: WireGuard و OpenVPN " +
+                        "و vmess و vless و trojan و shadowsocks (محرّك Xray مدمج).",
                     fontSize = 12.sp
                 )
                 if (updatedAt > 0L) {
@@ -743,6 +769,25 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
             }
         }
 
+        if (xr.running || xr.connecting || xr.error.isNotBlank()) {
+            Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        when {
+                            xr.running -> "🟢 متصل عبر Xray" + (if (xr.title.isNotBlank()) " • ${xr.title}" else "")
+                            xr.connecting -> "🟡 جارٍ الاتصال عبر Xray…"
+                            else -> "🔴 فشل Xray"
+                        },
+                        fontWeight = FontWeight.Bold
+                    )
+                    if (xr.error.isNotBlank()) Text(xr.error, fontSize = 12.sp)
+                    if (xr.running || xr.connecting) {
+                        OutlinedButton(onClick = { XrayEngine.stop(ctx) }) { Text("فصل ⏻") }
+                    }
+                }
+            }
+        }
+
         if (list.isEmpty()) {
             Box(Modifier.fillMaxWidth().weight(1f).padding(24.dp), contentAlignment = Alignment.Center) {
                 Text("لا سيرفرات بعد — أضف رابط اشتراك أو الصق كونفيجاً", fontSize = 13.sp)
@@ -771,7 +816,7 @@ fun ExtraServersTab(app: WgApp, a: Actions) {
                                 fontSize = 12.sp
                             )
                             if (!s.connectable) {
-                                Text("يتطلب محرّك Xray (مرحلة لاحقة) — محفوظ للعرض فقط", fontSize = 11.sp)
+                                Text("بروتوكول غير مدعوم للتشغيل", fontSize = 11.sp)
                             }
                             Spacer(Modifier.height(6.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
