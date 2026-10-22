@@ -52,6 +52,9 @@ android {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
         jniLibs {
             useLegacyPackaging = false
+            // vpnLib تحمل libgojni.so لمعماريتَي x86 فقط، وlibv2ray تحمل نسختها؛
+            // التطبيق يدعم ARM فقط، فاستبعاد x86 يمنع التعارض ويصغّر الحزمة.
+            excludes += setOf("lib/x86/**", "lib/x86_64/**")
         }
     }
 }
